@@ -102,6 +102,12 @@ def main() -> int:
             return ns, r.trace.payload_bytes, r.trace, gc_count
         return f
 
+    # Bytes come from the untimed oracle-gate pass above; timed repetitions run with
+    # byte counting off so instrumentation never sits inside a latency (ISSUE-024).
+    gate_bytes = {(g["variables"]["t"], arm): r for g in gate for arm, r in g["arms"].items()}
+    for e in (a1, a4):
+        for ad in e.adapters.values():
+            ad.count_bytes = False
     arms = {"A1": eng_arm(a1), "A4": eng_arm(a4), "A2": ArmA2(s.pg_cons_dsn), "A3": ArmA3(s)}
     rng = random.Random(a.seed)
     run = new_run_dir("pilot-W5")
@@ -127,10 +133,11 @@ def main() -> int:
                     row.update({f"span_{k}_ms": round(x / 1e6, 4) for k, x in tr.spans_ns.items()})
                     row["k"] = tr.driving_rows
                     if rep == 0:
-                        byte_rows.append({"template": "W5", "t": t, "arm": arm, "k": tr.driving_rows,
-                                          "payload_bytes": tr.payload_bytes,
-                                          "rows_transferred": sum(f.bytes.rows for f in tr.fragments),
-                                          "statements": sum(f.bytes.statements for f in tr.fragments)})
+                        g = gate_bytes[(t, arm)]
+                        byte_rows.append({"template": "W5", "t": t, "arm": arm, "k": g["k"],
+                                          "payload_bytes": g["payload_bytes"],
+                                          "rows_transferred": g["rows_transferred"],
+                                          "statements": g["statements"]})
                 elif arm == "A2" and rep == 0:
                     byte_rows.append({"template": "W5", "t": t, "arm": "A2", "k": None,
                                       "payload_bytes": payload, "rows_transferred": 1, "statements": 1})

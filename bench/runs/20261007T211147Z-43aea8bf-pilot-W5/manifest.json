@@ -1,0 +1,281 @@
+{
+  "run": "20261007T211147Z-43aea8bf-pilot-W5",
+  "template": "W5",
+  "points": [
+    10,
+    100,
+    1000
+  ],
+  "warmup": 3,
+  "reps": 7,
+  "arm_order_seed": 20261011,
+  "bind_batch": 1000,
+  "dataset": {
+    "seed": 1,
+    "scale": 0.1,
+    "counts": {
+      "customer": 1000,
+      "feedback": 5000,
+      "order": 10000,
+      "product": 500,
+      "vendor": 20
+    },
+    "zipf_exponent": 1.0,
+    "ratios_status": "provisional"
+  },
+  "dataset_sha256": {
+    "customer": "09df56a608fed16ea3dc237b6cd2023c94004750dc723cb5f67b4a9f2c511c40",
+    "feedback": "779c35efa8f2e8f09e510399d50e14f90a71b85747b56712e30751a3df1f9df0",
+    "order": "4e7392a9db72e029d8ddd47cc5c742ab19b550f8d272d76316388ecb93a88cda",
+    "product": "e18d319f864eb24a964724458be0a4d2a945c1f9cd505a14a2310c0751ce430f",
+    "vendor": "0021676e5d5146c62ff4620cf033ef58a288217da8a2316cd0440f6f8312d1b5"
+  },
+  "validation": {
+    "schema": {
+      "status": "PASS",
+      "errors": [],
+      "records": {
+        "customer": 1000,
+        "vendor": 20,
+        "product": 500,
+        "order": 10000,
+        "feedback": 5000
+      }
+    },
+    "referential": {
+      "status": "PASS",
+      "orphans": {
+        "order.customerId": 0,
+        "order.lines.productId": 0,
+        "feedback.customerId": 0,
+        "feedback.productId": 0,
+        "product.vendorId": 0
+      }
+    },
+    "sel_uniformity": {
+      "status": "PASS",
+      "p_value": 0.0659,
+      "bins": 100
+    },
+    "zipf_fanout": {
+      "status": "PASS",
+      "configured": 1.0,
+      "estimated": 1.0081,
+      "rel_error": 0.0081
+    },
+    "overall": "PASS"
+  },
+  "equivalence": {
+    "entities": {
+      "customer": {
+        "generated": {
+          "count": 1000,
+          "sha256": "beace5968bf704d2781a6abd386ab61268d5ae602ebe884b910f484eefe9dd43"
+        },
+        "federated": {
+          "count": 1000,
+          "sha256": "beace5968bf704d2781a6abd386ab61268d5ae602ebe884b910f484eefe9dd43"
+        },
+        "consolidated": {
+          "count": 1000,
+          "sha256": "beace5968bf704d2781a6abd386ab61268d5ae602ebe884b910f484eefe9dd43"
+        },
+        "status": "PASS"
+      },
+      "vendor": {
+        "generated": {
+          "count": 20,
+          "sha256": "67583ab10fb697ab3fe7ba942a10704ae84fe966cc795cce57cf675409494d5b"
+        },
+        "federated": {
+          "count": 20,
+          "sha256": "67583ab10fb697ab3fe7ba942a10704ae84fe966cc795cce57cf675409494d5b"
+        },
+        "consolidated": {
+          "count": 20,
+          "sha256": "67583ab10fb697ab3fe7ba942a10704ae84fe966cc795cce57cf675409494d5b"
+        },
+        "status": "PASS"
+      },
+      "product": {
+        "generated": {
+          "count": 500,
+          "sha256": "d673a5dd1a2f238e6c1df8c3ae3747b8098cba3193dbee5d4d974db4bd933f7f"
+        },
+        "federated": {
+          "count": 500,
+          "sha256": "d673a5dd1a2f238e6c1df8c3ae3747b8098cba3193dbee5d4d974db4bd933f7f"
+        },
+        "consolidated": {
+          "count": 500,
+          "sha256": "d673a5dd1a2f238e6c1df8c3ae3747b8098cba3193dbee5d4d974db4bd933f7f"
+        },
+        "status": "PASS"
+      },
+      "order": {
+        "generated": {
+          "count": 10000,
+          "sha256": "4c17cc2fe2ef8bf43d04fe3022b23bd2fc0ecdde73c870ab78543b60d2e7324a"
+        },
+        "federated": {
+          "count": 10000,
+          "sha256": "4c17cc2fe2ef8bf43d04fe3022b23bd2fc0ecdde73c870ab78543b60d2e7324a"
+        },
+        "consolidated": {
+          "count": 10000,
+          "sha256": "4c17cc2fe2ef8bf43d04fe3022b23bd2fc0ecdde73c870ab78543b60d2e7324a"
+        },
+        "status": "PASS"
+      },
+      "feedback": {
+        "generated": {
+          "count": 5000,
+          "sha256": "cd7bb585979c8fc5644ef2b5168b8bd623d709c8557013f7bd0118342e5bde8a"
+        },
+        "federated": {
+          "count": 5000,
+          "sha256": "cd7bb585979c8fc5644ef2b5168b8bd623d709c8557013f7bd0118342e5bde8a"
+        },
+        "consolidated": {
+          "count": 5000,
+          "sha256": "cd7bb585979c8fc5644ef2b5168b8bd623d709c8557013f7bd0118342e5bde8a"
+        },
+        "status": "PASS"
+      }
+    },
+    "overall": "PASS"
+  },
+  "oracle_gate": [
+    {
+      "t": 10,
+      "verdict": "match"
+    },
+    {
+      "t": 100,
+      "verdict": "match"
+    },
+    {
+      "t": 1000,
+      "verdict": "match"
+    }
+  ],
+  "environment": {
+    "captured_utc": "2026-10-07T21:11:47Z",
+    "setup": "sandbox-native (FerretDB stand-in; timings NOT reportable)",
+    "git": {
+      "sha": "43aea8bf6c3ced7ad1203473c10ec4efcc959b0e",
+      "dirty": false
+    },
+    "uv_lock_sha256": "bbb7d3fcaf76282db9aa8a6ffd7c8afcd33f2d543aeba36595c24252de585846",
+    "config_sha256": {
+      "schema.graphql": "3e0543eb20ee8f1997948cb290fd7d9919b6e63d2eac1b584a5fb8d662c47596",
+      "backends.toml": "a56b24fe2ffc58e0bb3b57837f9409611ffafb9c04e7e704908b43c9ea19909d",
+      "compose.yaml": "989ee103a770d69ee6d7af985c1d5939952f1f12521467b2562998b05a4327c4",
+      "pyproject.toml": "0093181f70cb5e78264d74c9b2ea0784819c6557faf2204720157908b4290562",
+      "bench/data/ratios.json": "01feacce5e0bfe52a3db962d24b0c4e27e2a0d89252380bf3a03e45aaf792516",
+      "Makefile": "373afe3626714f489500242bf6e7872b8c09eef36c0e1312db19887a7a7962a7"
+    },
+    "servers": {
+      "pg": "PostgreSQL 160015",
+      "mongo": "FerretDB v1.24.0 (MongoDB 7.0.42 wire)"
+    },
+    "image_ids": {},
+    "hardware": {
+      "cpu_model": "Intel(R) Xeon(R) Processor @ 2.80GHz",
+      "logical_cpus": 2,
+      "ram_gb": 7.8,
+      "os": "Ubuntu 24.04.5 LTS",
+      "kernel": "6.18.44-fc-v77",
+      "wsl": false,
+      "python": "3.12.13",
+      "docker": null,
+      "compose": "5.5.1"
+    }
+  },
+  "summary": [
+    {
+      "t": 10,
+      "arm": "A1",
+      "median_ms": 4.37,
+      "iqr_ms": 0.269,
+      "n": 7
+    },
+    {
+      "t": 10,
+      "arm": "A2",
+      "median_ms": 1.047,
+      "iqr_ms": 0.411,
+      "n": 7
+    },
+    {
+      "t": 10,
+      "arm": "A3",
+      "median_ms": 2089.778,
+      "iqr_ms": 102.808,
+      "n": 7
+    },
+    {
+      "t": 10,
+      "arm": "A4",
+      "median_ms": 2386.572,
+      "iqr_ms": 96.904,
+      "n": 7
+    },
+    {
+      "t": 100,
+      "arm": "A1",
+      "median_ms": 1576.008,
+      "iqr_ms": 126.114,
+      "n": 7
+    },
+    {
+      "t": 100,
+      "arm": "A2",
+      "median_ms": 1.127,
+      "iqr_ms": 0.136,
+      "n": 7
+    },
+    {
+      "t": 100,
+      "arm": "A3",
+      "median_ms": 2149.581,
+      "iqr_ms": 85.856,
+      "n": 7
+    },
+    {
+      "t": 100,
+      "arm": "A4",
+      "median_ms": 2374.047,
+      "iqr_ms": 57.595,
+      "n": 7
+    },
+    {
+      "t": 1000,
+      "arm": "A1",
+      "median_ms": 1580.727,
+      "iqr_ms": 114.73,
+      "n": 7
+    },
+    {
+      "t": 1000,
+      "arm": "A2",
+      "median_ms": 4.348,
+      "iqr_ms": 1.051,
+      "n": 7
+    },
+    {
+      "t": 1000,
+      "arm": "A3",
+      "median_ms": 2074.727,
+      "iqr_ms": 128.404,
+      "n": 7
+    },
+    {
+      "t": 1000,
+      "arm": "A4",
+      "median_ms": 2207.426,
+      "iqr_ms": 266.515,
+      "n": 7
+    }
+  ]
+}

@@ -73,6 +73,7 @@ def build_sql(frag: ScanFragment) -> tuple[sql.Composed, list]:
 
 class PostgresAdapter:
     kind = "postgres"
+    count_bytes = True   # the bench turns this off for timed repetitions (ISSUE-024)
 
     def __init__(self, name: str, dsn: str, timeout_s: float = 5.0):
         self.name = name
@@ -97,7 +98,7 @@ class PostgresAdapter:
                 rows = [dict(zip(names, r)) for r in raw]
                 t2 = time.perf_counter_ns()
                 # Instrumentation, outside the timed spans: text-format payload bytes.
-                for i in range(res.ntuples):
+                for i in range(res.ntuples if self.count_bytes else 0):
                     for j in range(res.nfields):
                         v = res.get_value(i, j)
                         bc.payload_bytes += 0 if v is None else len(v)

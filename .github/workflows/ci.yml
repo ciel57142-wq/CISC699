@@ -1,0 +1,34 @@
+# HS2 §8.4: unit, conformance and oracle tests at S = 0.01 on every push. No timing runs in CI.
+# NOTE (ISSUE-012): written at HS3 but not yet observed running on GitHub; first push will tell.
+name: ci
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    services:
+      pg-fed:
+        image: postgres:16
+        env: {POSTGRES_USER: polystore, POSTGRES_PASSWORD: polystore, POSTGRES_DB: fed}
+        ports: ["5432:5432"]
+        options: --health-cmd "pg_isready -U polystore" --health-interval 3s --health-retries 20
+      pg-cons:
+        image: postgres:16
+        env: {POSTGRES_USER: polystore, POSTGRES_PASSWORD: polystore, POSTGRES_DB: cons}
+        ports: ["5433:5432"]
+        options: --health-cmd "pg_isready -U polystore" --health-interval 3s --health-retries 20
+      mongo-fed:
+        image: mongo:7.0
+        ports: ["27017:27017"]
+    env:
+      PROPERTY_EXAMPLES: "500"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - run: uv python install 3.12
+      - run: cp .env.example .env
+      - run: make sync
+      - run: make data load equiv SEED=1 SCALE=0.01
+      - run: make test-unit
+      - run: make test-db
+      - run: make oracle SCALE=0.01
