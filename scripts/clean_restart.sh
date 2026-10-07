@@ -11,7 +11,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"; cd "$ROOT"
 OUT="evidence/$LABEL"; mkdir -p "$OUT"
 LOG="$OUT/run.log"; : > "$LOG"
 step() { echo; echo "=== $(date -u +%H:%M:%SZ) $*" | tee -a "$LOG"; }
-run()  { "$@" 2>&1 | grep -v UV_NATIVE_TLS | tee -a "$LOG"; return "${PIPESTATUS[0]}"; }
+run()  { "$@" 2>&1 | sed "/UV_NATIVE_TLS/d" | tee -a "$LOG"; return "${PIPESTATUS[0]}"; }
 
 step "wipe: databases, venv, generated data"
 if [ "$MODE" = native ]; then run scripts/native_up.sh wipe; else run docker compose down -v; fi
@@ -22,16 +22,18 @@ step "databases up ($MODE)"
 if [ "$MODE" = native ]; then run scripts/native_up.sh start; else run docker compose up -d --wait; fi
 [ -f .env ] || cp .env.example .env
 
+step "unit tests + coverage (no DB)"
+run make test-unit
 for SCALE in 0.01 0.1; do
   step "S=$SCALE: generate twice (T-D1), validate, load, equivalence (T-D2)"
   run make data validate load equiv SEED=1 SCALE=$SCALE
   step "S=$SCALE: oracle (T-O1), arms A1 and A4"
   run make oracle SEED=1 SCALE=$SCALE
+  if [ "$SCALE" = 0.01 ]; then
+    step "S=0.01: DB tests incl. 500 Hypothesis examples (T-C1, T-P1), as in CI"
+    PROPERTY_EXAMPLES=500 run make test-db
+  fi
 done
-step "unit tests + coverage (no DB)"
-run make test-unit
-step "DB tests at S=0.1 incl. 500 Hypothesis examples (T-C1, T-P1)"
-PROPERTY_EXAMPLES=500 run make test-db
 step "pilot benchmark at S=0.1"
 run make pilot SEED=1 SCALE=0.1
 step "environment snapshot"
