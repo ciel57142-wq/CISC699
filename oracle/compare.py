@@ -13,10 +13,21 @@ import math
 REL_TOL = 1e-9
 
 
+def _num(x: float):
+    """Sort-key form of a float: 9 significant digits, and integral values as int.
+    PostgreSQL renders an integral float8 (avg = 415482) as the JSON integer 415482 while
+    the engine holds 415482.0; without this the two sides sort differently and the oracle
+    pairs the wrong rows (ISSUE-011). Only the sort key is rounded; diff() still compares
+    the original values with REL_TOL. Known limit: two values within 1e-9 that straddle a
+    9th-digit rounding boundary would sort apart; diff() would then report it."""
+    r = float(f"{x:.9g}")
+    return int(r) if r.is_integer() else r
+
+
 def _sort_key(v) -> str:
     def norm(x):
         if isinstance(x, float):
-            return float(f"{x:.6g}")
+            return _num(x)
         if isinstance(x, dict):
             return {k: norm(y) for k, y in x.items()}
         if isinstance(x, list):

@@ -66,3 +66,12 @@ def test_compare_float_tolerance_only_for_floats():
     assert compare([{"avg": 1.001}], [{"avg": 1.0}], False) != []
     assert compare([{"n": 1}], [{"n": "1"}], False) != []          # type matters
     assert compare([{"n": 1}], [{"m": 1}], False) != []            # missing field
+
+
+def test_compare_integral_float_vs_int_regression():
+    """ISSUE-011 regression: PG emits avg 415482 as an int, the engine has 415482.0. Rows
+    with near-equal averages must still pair by group key, whatever the input order."""
+    engine = [{"key": {"c": 27}, "avg": 415482.0}, {"key": {"c": 300}, "avg": 415481.6666666667}]
+    ref = [{"key": {"c": 300}, "avg": 415481.6666666667}, {"key": {"c": 27}, "avg": 415482}]
+    assert compare(engine, ref, ordered=False) == []
+    assert compare(list(reversed(engine)), ref, ordered=False) == []
