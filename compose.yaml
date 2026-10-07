@@ -1,0 +1,53 @@
+# Three database containers with identical limits (HS2 §8.3, resource parity).
+# All three share one cpuset so the federated pair never gets twice the hardware.
+#
+# Image tags are pinned to minor versions here. HS2 §8.1 requires @sha256 digests:
+# run `make lock-digests` on your machine once, which rewrites the image lines below
+# with the digests Docker actually pulled and records them in docs/ENVIRONMENT.md.
+#
+# DB_CPUSET defaults to "2,3" (HS2 §8.3). On a 4-thread machine set DB_CPUSET=2,3;
+# on fewer cores see docs/ENVIRONMENT.md.
+
+x-db-limits: &db-limits
+  cpuset: "${DB_CPUSET:-2,3}"
+  cpus: ${DB_CPUS:-2}
+  mem_limit: ${DB_MEM:-3g}
+
+services:
+  pg-fed:
+    image: postgres:16
+    <<: *db-limits
+    environment:
+      POSTGRES_USER: polystore
+      POSTGRES_PASSWORD: ${PG_PASSWORD:-polystore}
+      POSTGRES_DB: fed
+    command: ["postgres", "-c", "shared_buffers=768MB"]
+    ports: ["${PG_FED_PORT:-5432}:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U polystore -d fed"]
+      interval: 3s
+      retries: 20
+
+  pg-cons:
+    image: postgres:16
+    <<: *db-limits
+    environment:
+      POSTGRES_USER: polystore
+      POSTGRES_PASSWORD: ${PG_PASSWORD:-polystore}
+      POSTGRES_DB: cons
+    command: ["postgres", "-c", "shared_buffers=768MB"]
+    ports: ["${PG_CONS_PORT:-5433}:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U polystore -d cons"]
+      interval: 3s
+      retries: 20
+
+  mongo-fed:
+    image: mongo:7.0
+    <<: *db-limits
+    command: ["mongod", "--wiredTigerCacheSizeGB", "0.75"]
+    ports: ["${MONGO_PORT:-27017}:27017"]
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 3s
+      retries: 20

@@ -1,0 +1,61 @@
+# The project schema (HS2 §5.2, ADR-0003).
+#
+# Placement lives on the type: @store(backend:, collection:). A field crosses a process
+# boundary exactly when its target type's backend differs from its owner's; the engine
+# computes that, and a reader can see it by comparing the two @store lines.
+# Join keys are declared with @ref(localKey:, remoteKey:).
+# There is no Query type here: root fields and where/orderBy inputs are derived (ADR-0004).
+# Connection details live in backends.toml, never in this file.
+
+type Customer @store(backend: "pg", collection: "customer") {
+  id: ID!
+  email: String!
+  country: String!
+  sel: Int!
+  createdAt: DateTime!
+  orders: [Order!]! @ref(localKey: "id", remoteKey: "customerId")
+  feedback: [Feedback!]! @ref(localKey: "id", remoteKey: "customerId")
+}
+
+type Vendor @store(backend: "pg", collection: "vendor") {
+  id: ID!
+  name: String!
+  country: String!
+  products: [Product!]! @ref(localKey: "id", remoteKey: "vendorId")
+}
+
+type Product @store(backend: "pg", collection: "product") {
+  id: ID!
+  vendorId: Int!
+  title: String!
+  priceCents: Int!
+  vendor: Vendor! @ref(localKey: "vendorId", remoteKey: "id")
+  feedback: [Feedback!]! @ref(localKey: "id", remoteKey: "productId")
+}
+
+type Order @store(backend: "mongo", collection: "orders") {
+  id: ID!
+  customerId: Int!
+  orderedAt: DateTime!
+  totalCents: Int!
+  lines: [OrderLine!]!
+  customer: Customer! @ref(localKey: "customerId", remoteKey: "id")
+}
+
+# Embedded in Order documents. No @store: it has no placement of its own.
+type OrderLine {
+  lineNo: Int!
+  productId: Int!
+  quantity: Int!
+  priceCents: Int!
+}
+
+type Feedback @store(backend: "mongo", collection: "feedback") {
+  id: ID!
+  customerId: Int!
+  productId: Int!
+  rating: Int!
+  text: String!
+  postedAt: DateTime!
+  product: Product! @ref(localKey: "productId", remoteKey: "id")
+}

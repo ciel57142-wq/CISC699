@@ -1,0 +1,12 @@
+# Backend names used by @store(backend: ...) in schema.graphql.
+# Values are names of environment variables, so no credential is ever committed.
+# Counted in the SC-6 configuration-effort study (HS2 §10.4).
+
+[backends.pg]
+kind = "postgres"
+dsn_env = "PG_FED_DSN"
+
+[backends.mongo]
+kind = "mongodb"
+uri_env = "MONGO_URI"
+db_env = "MONGO_DB"

@@ -1,0 +1,15 @@
+{
+  "_status": "PROVISIONAL. HS2 §5.3 says these ratios come from UniBench SF1 row counts. Those counts have not been taken yet (HS2 §12.3, ISSUE-006). Until then these are round numbers chosen so S=1 fits comfortably in 3 GB per container. Replace the per_scale_1 values, keep the keys, and record the change in docs/ISSUE_LOG.md.",
+  "per_scale_1": {
+    "customer": 10000,
+    "vendor": 200,
+    "product": 5000,
+    "order": 100000,
+    "feedback": 50000
+  },
+  "order_lines": {"min": 1, "max": 5},
+  "zipf_exponent": 1.0,
+  "countries": ["AT", "BE", "BR", "CA", "CH", "CN", "DE", "DK", "ES", "FI",
+                "FR", "GB", "IE", "IN", "IT", "JP", "NL", "NO", "SE", "US"],
+  "time_window_utc": ["2024-01-01T00:00:00.000Z", "2026-01-01T00:00:00.000Z"]
+}
