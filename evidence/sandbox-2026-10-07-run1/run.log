@@ -1,0 +1,150 @@
+=== 21:28:06Z wipe: databases, venv, generated data
+=== 21:28:08Z environment: locked install
+Using CPython 3.12.13
+Creating virtual environment at: .venv
+Installed 32 packages in 60ms
+ + contourpy==1.4.0
+ + coverage==7.16.2
+ + cycler==0.12.1
+ + dnspython==2.8.0
+ + fonttools==4.66.1
+ + graphql-core==3.2.13
+ + hypothesis==6.168.5
+ + iniconfig==2.3.1
+ + kiwisolver==1.5.1
+ + matplotlib==3.11.2
+ + numpy==2.5.3
+ + packaging==26.3
+ + pandas==2.3.3
+ + pillow==12.3.0
+ + pluggy==1.6.0
+ + polystore==0.3.0 (from file:///home/claude/CISC699)
+ + psycopg==3.3.6
+ + psycopg-binary==3.3.6
+ + pygments==2.21.0
+ + pymongo==4.18.2
+ + pyparsing==3.3.3
+ + pytest==8.4.2
+ + pytest-cov==6.3.0
+ + python-dateutil==2.9.0.post0
+ + python-dotenv==1.2.4
+ + pytz==2026.5
+ + ruff==0.16.10
+ + scipy==1.18.1
+ + six==1.17.0
+ + sortedcontainers==2.4.0
+ + typing-extensions==4.16.0
+ + tzdata==2026.5
+=== 21:28:08Z databases up (native)
+pg-fed :5432  pg-cons :5433  mongo-fed (FerretDB) :27017
+=== 21:28:13Z unit tests + coverage (no DB)
+uv run pytest tests/unit --cov --cov-report=term-missing:skip-covered
+============================= test session starts ==============================
+platform linux -- Python 3.12.13, pytest-8.4.2, pluggy-1.6.0
+rootdir: /home/claude/CISC699
+configfile: pyproject.toml
+plugins: hypothesis-6.168.5, cov-6.3.0
+collected 70 items
+
+tests/unit/test_data_and_compare.py ..........                           [ 14%]
+tests/unit/test_plan_and_rules.py ..............................         [ 57%]
+tests/unit/test_resolver.py ..............................               [100%]
+
+================================ tests coverage ================================
+_______________ coverage: platform linux, python 3.12.13-final-0 _______________
+
+Name                         Stmts   Miss  Cover   Missing
+----------------------------------------------------------
+engine/adapters/mongo.py        99     77    22%   29-58, 65-80, 83-119, 122, 125
+engine/adapters/pg.py           93     75    19%   23-24, 28-71, 79-85, 88-114, 117-119, 122
+engine/api.py                   60     22    63%   31, 43-48, 59-72, 75-76
+engine/config.py                16      1    94%   28
+engine/errors.py                23      2    91%   20, 37
+engine/exec/executor.py        162    122    25%   40, 44, 47, 55-62, 66-68, 72-76, 80-101, 111-119, 122-137, 140-163, 167-187, 190-200, 204-210
+engine/naming.py                15      6    60%   18, 22, 27-30
+engine/parse/validator.py       32      1    97%   51
+engine/plan/builder.py         135      6    96%   44-45, 61, 82, 112, 165
+engine/plan/logical.py          72     19    74%   90-92, 97-116
+engine/rewrite/physical.py     104     27    74%   66-68, 106, 110-133
+engine/rewrite/rules.py         91      1    99%   115
+engine/schema/resolver.py      226     12    95%   129, 139, 142, 161, 217, 222, 311-317
+----------------------------------------------------------
+TOTAL                         1147    371    68%
+
+8 files skipped due to complete coverage.
+============================== 70 passed in 8.49s ==============================
+=== 21:28:23Z S=0.01: generate twice (T-D1), validate, load, equivalence (T-D2)
+uv run python -m bench.data.gen --seed 1 --scale 0.01 --out bench/data/out/seed1_s0.01
+{
+ "out": "bench/data/out/seed1_s0.01",
+ "counts": {
+  "customer": 100,
+  "vendor": 2,
+  "product": 50,
+  "order": 1000,
+  "feedback": 500
+ },
+ "sha256": {
+  "customer": "cfb17e1b730e28c7b19d272762acb4a33f350cfcdb7b76b98c7f1288a5dad991",
+  "vendor": "09d6c80c9c48683ad9a5a509dc8e4b7695e30f746dd5abf9fe42d15d1917bfa3",
+  "product": "3560abdf4afc10ae26d91e45a4a495abfb9a5966ffd8b107f706321795a5fccc",
+  "order": "0c64063d4c11d72bb551e344972950b1eaf93b0dba30007befe6c554ed5eef72",
+  "feedback": "c62fa3c0e14cb30337e1ff729ac4096b819ede7e1df03879a24e00408073e241"
+ }
+}
+uv run python -m bench.data.gen --seed 1 --scale 0.01 --out bench/data/out/seed1_s0.01.again
+{
+ "out": "bench/data/out/seed1_s0.01.again",
+ "counts": {
+  "customer": 100,
+  "vendor": 2,
+  "product": 50,
+  "order": 1000,
+  "feedback": 500
+ },
+ "sha256": {
+  "customer": "cfb17e1b730e28c7b19d272762acb4a33f350cfcdb7b76b98c7f1288a5dad991",
+  "vendor": "09d6c80c9c48683ad9a5a509dc8e4b7695e30f746dd5abf9fe42d15d1917bfa3",
+  "product": "3560abdf4afc10ae26d91e45a4a495abfb9a5966ffd8b107f706321795a5fccc",
+  "order": "0c64063d4c11d72bb551e344972950b1eaf93b0dba30007befe6c554ed5eef72",
+  "feedback": "c62fa3c0e14cb30337e1ff729ac4096b819ede7e1df03879a24e00408073e241"
+ }
+}
+uv run python -m bench.data.determinism bench/data/out/seed1_s0.01 bench/data/out/seed1_s0.01.again
+T-D1 customer  cfb17e1b730e28c7  cfb17e1b730e28c7  identical
+T-D1 vendor    09d6c80c9c48683a  09d6c80c9c48683a  identical
+T-D1 product   3560abdf4afc10ae  3560abdf4afc10ae  identical
+T-D1 order     0c64063d4c11d72b  0c64063d4c11d72b  identical
+T-D1 feedback  c62fa3c0e14cb303  c62fa3c0e14cb303  identical
+T-D1 PASS
+rm -rf bench/data/out/seed1_s0.01.again
+uv run python -m bench.data.validate bench/data/out/seed1_s0.01
+schema          PASS     {"records": {"customer": 100, "vendor": 2, "product": 50, "order": 1000, "feedback": 500}}
+referential     PASS     {"orphans": {"order.customerId": 0, "order.lines.productId": 0, "feedback.customerId": 0, "feedback.productId": 0, "product.vendorId": 0}}
+sel_uniformity  SKIPPED  {"reason": "n=100 < 500"}
+zipf_fanout     SKIPPED  {"reason": "customers=100 < 500"}
+validation PASS
+uv run python -m bench.data.load bench/data/out/seed1_s0.01
+{"federated": {"seconds": 0.37}, "consolidated": {"seconds": 0.13}}
+load done: {'customer': 100, 'vendor': 2, 'product': 50, 'order': 1000, 'feedback': 500}
+uv run python -m bench.data.equivalence bench/data/out/seed1_s0.01
+T-D2 customer  n=    100  gen=f8b3457f4d8e fed=f8b3457f4d8e cons=f8b3457f4d8e  PASS
+T-D2 vendor    n=      2  gen=9c57241a2973 fed=9c57241a2973 cons=9c57241a2973  PASS
+T-D2 product   n=     50  gen=c9e24e965a3c fed=c9e24e965a3c cons=c9e24e965a3c  PASS
+T-D2 order     n=   1000  gen=8407e0cedae2 fed=8407e0cedae2 cons=8407e0cedae2  PASS
+T-D2 feedback  n=    500  gen=aa04a78c3900 fed=aa04a78c3900 cons=aa04a78c3900  PASS
+T-D2 PASS
+=== 21:28:29Z S=0.01: oracle (T-O1), arms A1 and A4
+uv run python -m oracle.run --out bench/data/out/seed1_s0.01
+T-O1 W1   PG           rows=     4  A1=match   A4=match   bytes A1=230 A4=5773 reduction= 96.0%
+T-O1 W2   Mongo        rows=   173  A1=match   A4=match   bytes A1=11245 A4=266605 reduction= 95.8%
+T-O1 W3   Mongo        rows=    82  A1=match   A4=match   bytes A1=130035 A4=266605 reduction= 51.2%
+T-O1 W4   PG           rows=     2  A1=match   A4=match   bytes A1=58 A4=1164 reduction= 95.0%
+T-O1 W5   PG -> Mongo  rows=     9  A1=match   A4=match   bytes A1=3158 A4=272378 reduction= 98.8%
+T-O1 W6   Mongo -> PG  rows=     8  A1=match   A4=match   bytes A1=535 A4=272378 reduction= 99.8%
+T-O1 W7   PG -> Mongo  rows=    13  A1=match   A4=match   bytes A1=8047 A4=83438 reduction= 90.4%  (held out)
+T-O1 W8   PG           rows=     2  A1=match   A4=match   bytes A1=1190 A4=1194 reduction=  0.3%
+T-O1 W9   PG -> Mongo  rows=     5  A1=match   A4=match   bytes A1=1450 A4=272378 reduction= 99.5%
+T-O1 W10  PG -> Mongo  rows=     4  A1=match   A4=match   bytes A1=3711 A4=272378 reduction= 98.6%  (held out)
+T-O1 PASS (10/10 templates agree on both arms)
+=== 21:28:32Z S=0.01: DB tests incl. 500 Hypothesis examples (T-C1, T-P1), as in CI
