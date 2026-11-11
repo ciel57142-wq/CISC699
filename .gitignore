@@ -1,0 +1,20 @@
+# build output
+target/
+# database directories created by running polydb
+polydb-data/
+mydata/
+*-data/
+data.wal
+data.snap
+data.snap.tmp
+# Python environment for the driver checks
+.venv/
+__pycache__/
+*.py[cod]
+# local configuration (copy of config/polydb.env.example)
+config/polydb.env
+.env
+# editor and OS files
+.DS_Store
+.idea/
+.vscode/

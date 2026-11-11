@@ -1,0 +1,39 @@
+-- polydb smoke script: one pass through all three data models.
+-- Run with:  polydb --memory < tests/fixtures/smoke.commands
+-- Expected output is in tests/fixtures/smoke.expected (no timestamps, no generated ids).
+CREATE TABLE users (id INT PRIMARY KEY, name TEXT NOT NULL, age INT, city TEXT)
+INSERT INTO users VALUES (1, 'Ada', 36, 'London'), (2, 'Linus', 54, 'Portland'), (3, 'Grace', 85, 'NYC')
+CREATE INDEX users_city ON users (city)
+SELECT name, age FROM users WHERE age > 40 ORDER BY age DESC
+SELECT city, COUNT(*) FROM users GROUP BY city ORDER BY city
+UPDATE users SET age = age + 1 WHERE id = 1
+SELECT age FROM users WHERE id = 1
+db.events.insert({_id: 1, user: 1, type: 'login', tags: ['web']})
+db.events.insert({_id: 2, user: 2, type: 'signup'})
+db.events.find({type: 'login'})
+db.events.count({})
+SET session:42 abc
+GET session:42
+INCR visits 5
+INCR visits
+KEYS session:
+BEGIN
+INSERT INTO users VALUES (4, 'Alan', 41, 'London')
+db.events.insert({_id: 3, user: 4, type: 'signup'})
+SET last_user 4
+ROLLBACK
+SELECT COUNT(*) FROM users
+db.events.count({})
+GET last_user
+BEGIN
+INSERT INTO users VALUES (4, 'Alan', 41, 'London')
+db.events.insert({_id: 3, user: 4, type: 'signup'})
+SET last_user 4
+COMMIT
+SELECT COUNT(*) FROM users
+db.events.count({})
+GET last_user
+SELEKT 1
+INSERT INTO users VALUES (1, 'dup', 1, 'x')
+SHOW TABLES
+SHOW COLLECTIONS

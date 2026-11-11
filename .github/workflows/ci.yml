@@ -1,0 +1,25 @@
+# Smoke-test workflow: the same steps as the README quick start.
+# Not yet executed on a hosted runner (the package has no remote repository);
+# see docs/REPRODUCIBILITY.md, "What was not verified".
+name: ci
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust 1.97.0
+        run: rustup toolchain install 1.97.0 --profile minimal && rustup default 1.97.0
+      - name: Environment
+        run: bash scripts/check_env.sh
+      - name: Build
+        run: cargo build --release --locked
+      - name: Rust tests
+        run: cargo test --release --locked
+      - name: Smoke test
+        run: bash scripts/smoke.sh
+      - name: Driver check
+        run: bash scripts/driver_checks.sh

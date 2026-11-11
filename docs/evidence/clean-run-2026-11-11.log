@@ -1,0 +1,252 @@
+polydb clean-run log
+started (UTC): 2026-11-11T20:36:03Z
+source package: /home/claude/work/repo/polydb
+fresh copy:     /tmp/tmp.75F4Q53OOS/polydb
+
+### 0. Fresh copy contains no build output
+$ test ! -e target -a ! -e .venv
+--> ok (0 s)
+
+### 1. Check prerequisites (README: Prerequisites)
+$ bash scripts/check_env.sh
+== required ==
+rustc   1.97.0
+cargo   1.97.0
+== optional: driver check (make drivers) ==
+python3 3.13.18
+== optional: command-line clients ==
+redis-cli: redis-cli 7.0.15
+psql: psql (PostgreSQL) 16.15 (Ubuntu 16.15-0ubuntu0.24.04.1)
+mongosh: not installed (not needed)
+docker: Docker version 29.9.3, build 5457199
+nc: installed
+== machine ==
+os      Linux 6.18.44-fc-v378 x86_64
+distro  Ubuntu 24.04.5 LTS
+cpus    2
+memory  7.8Gi
+--> ok (0 s)
+
+### 2. Build (README: Quick start, step 2)
+$ cargo build --release --locked
+   Compiling polydb v0.2.0 (/tmp/tmp.75F4Q53OOS/polydb)
+    Finished `release` profile [optimized] target(s) in 9.03s
+--> ok (10 s)
+
+### 3. Run the test suite (README: Quick start, step 3)
+$ cargo test --release --locked
+   Compiling polydb v0.2.0 (/tmp/tmp.75F4Q53OOS/polydb)
+    Finished `release` profile [optimized] target(s) in 3.48s
+     Running unittests src/lib.rs (target/release/deps/polydb-0b3855de992186fd)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/release/deps/polydb-d5ee841fcc4cb55a)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/hardening.rs (target/release/deps/hardening-b1da4b0b9d687d18)
+
+running 23 tests
+test acknowledged_writes_survive_killing_the_server ... ok
+test cli_client_reports_unreachable_server ... ok
+test cli_database_path_that_is_a_file_is_a_clean_error ... ok
+test cli_errors_do_not_stop_a_piped_script ... ok
+test cli_help_prints_usage_and_exits_zero ... ok
+test cli_rejects_bad_server_options_with_a_message ... ok
+test cli_scripted_run_matches_golden_output ... ok
+test corrupt_snapshot_is_refused_rather_than_half_loaded ... ok
+test damage_in_the_middle_of_the_log_keeps_everything_before_it ... ok
+test a_client_that_disconnects_mid_transaction_leaves_nothing_behind ... ok
+test disabled_listeners_are_not_opened ... ok
+test division_by_zero_and_integer_overflow_do_not_panic ... ok
+test extremely_nested_json_does_not_crash_the_process ... ok
+test extremely_nested_sql_does_not_crash_the_process ... ok
+test garbage_log_file_opens_as_empty_database ... ok
+test garbage_on_every_port_leaves_the_server_running ... ok
+test invalid_statements_return_typed_errors_and_change_nothing ... ok
+test moderately_nested_input_is_handled ... ok
+test native_protocol_reports_errors_as_json_and_keeps_the_connection ... ok
+test deeply_nested_input_over_the_network_does_not_stop_the_server ... ok
+test port_already_in_use_is_a_clean_error ... ok
+test updates_cannot_create_documents_too_deep_to_read_back ... ok
+test nesting_limits_are_enforced_at_their_documented_values ... ok
+
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.74s
+
+     Running tests/integration.rs (target/release/deps/integration-8be77fb449373a6d)
+
+running 22 tests
+test checkpoint_then_more_writes_then_reopen ... ok
+test conflicting_transaction_is_rejected ... ok
+test data_survives_reopen ... ok
+test doc_index_stays_correct ... ok
+test doc_insert_find_filters ... ok
+test doc_typed_api ... ok
+test doc_update_delete_generated_ids ... ok
+test json_round_trip ... ok
+test kv_commands ... ok
+test models_are_isolated_from_each_other ... ok
+test native_protocol_over_tcp ... ok
+test sql_aggregates_and_grouping ... ok
+test sql_constraints_and_types ... ok
+test sql_joins ... ok
+test sql_primary_key_lookup_and_star ... ok
+test sql_secondary_index_stays_correct ... ok
+test sql_select_filter_order_limit ... ok
+test sql_table_without_primary_key ... ok
+test sql_update_delete ... ok
+test torn_wal_tail_is_discarded ... ok
+test transaction_spans_all_models_and_rolls_back ... ok
+test concurrent_sessions_lose_no_updates ... ok
+
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+   Doc-tests polydb
+
+running 1 test
+test src/lib.rs - (line 15) - compile ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+--> ok (4 s)
+
+### 4. Smoke test against golden output (README: Quick start, step 4)
+$ bash scripts/smoke.sh
+    Finished `release` profile [optimized] target(s) in 0.01s
+SMOKE OK: output matches tests/fixtures/smoke.expected (64 lines)
+--> ok (0 s)
+
+### 5. Driver check through redis-py, psycopg2, pymongo (README: Driver check)
+$ bash scripts/driver_checks.sh
+ok   redis ping
+ok   redis get
+ok   redis binary value
+ok   redis missing key
+ok   redis incr
+ok   redis mget
+ok   redis keys glob
+ok   redis exists/del
+ok   redis setnx
+ok   redis unsupported command is a clean error
+ok   redis 8 clients x 200 INCR
+ok   postgres typed rows
+ok   postgres column names
+ok   postgres aggregate
+ok   postgres rowcount
+ok   postgres rollback
+ok   postgres duplicate key raises UniqueViolation
+ok   postgres missing table raises UndefinedTable
+ok   postgres conflicting commit raises SerializationFailure
+ok   postgres stock never oversold
+ok   mongo ping
+ok   mongo insert_one returns ObjectId
+ok   mongo find by ObjectId
+ok   mongo count_documents
+ok   mongo sort/limit
+ok   mongo nested + array filters
+ok   mongo projection
+ok   mongo float round trip
+ok   mongo update_one
+ok   mongo update_many
+ok   mongo upsert
+ok   mongo distinct
+ok   mongo indexed lookup
+ok   mongo duplicate _id raises DuplicateKeyError
+ok   mongo delete_one / delete_many
+ok   mongo list collections
+ok   document written by pymongo, read through postgres
+ok   key written by redis, read through postgres
+ok   one transaction, visible from redis and mongo
+
+all driver checks passed
+--> ok (5 s)
+
+### 6. Same tests in an unoptimised build (larger stack frames; guards the DEFECT-01 fix)
+$ cargo test --locked
+   Compiling polydb v0.2.0 (/tmp/tmp.75F4Q53OOS/polydb)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.92s
+     Running unittests src/lib.rs (target/debug/deps/polydb-4becafe97796d448)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/polydb-f05ed84327e2a6e4)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/hardening.rs (target/debug/deps/hardening-62d2209533482aa0)
+
+running 23 tests
+test acknowledged_writes_survive_killing_the_server ... ok
+test cli_client_reports_unreachable_server ... ok
+test cli_database_path_that_is_a_file_is_a_clean_error ... ok
+test cli_errors_do_not_stop_a_piped_script ... ok
+test cli_help_prints_usage_and_exits_zero ... ok
+test cli_rejects_bad_server_options_with_a_message ... ok
+test cli_scripted_run_matches_golden_output ... ok
+test corrupt_snapshot_is_refused_rather_than_half_loaded ... ok
+test damage_in_the_middle_of_the_log_keeps_everything_before_it ... ok
+test a_client_that_disconnects_mid_transaction_leaves_nothing_behind ... ok
+test disabled_listeners_are_not_opened ... ok
+test division_by_zero_and_integer_overflow_do_not_panic ... ok
+test extremely_nested_json_does_not_crash_the_process ... ok
+test deeply_nested_input_over_the_network_does_not_stop_the_server ... ok
+test garbage_log_file_opens_as_empty_database ... ok
+test garbage_on_every_port_leaves_the_server_running ... ok
+test invalid_statements_return_typed_errors_and_change_nothing ... ok
+test moderately_nested_input_is_handled ... ok
+test native_protocol_reports_errors_as_json_and_keeps_the_connection ... ok
+test extremely_nested_sql_does_not_crash_the_process ... ok
+test port_already_in_use_is_a_clean_error ... ok
+test updates_cannot_create_documents_too_deep_to_read_back ... ok
+test nesting_limits_are_enforced_at_their_documented_values ... ok
+
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.17s
+
+     Running tests/integration.rs (target/debug/deps/integration-02548a56ef2ccaac)
+
+running 22 tests
+test checkpoint_then_more_writes_then_reopen ... ok
+test conflicting_transaction_is_rejected ... ok
+test data_survives_reopen ... ok
+test doc_index_stays_correct ... ok
+test doc_insert_find_filters ... ok
+test doc_typed_api ... ok
+test doc_update_delete_generated_ids ... ok
+test json_round_trip ... ok
+test kv_commands ... ok
+test models_are_isolated_from_each_other ... ok
+test native_protocol_over_tcp ... ok
+test sql_aggregates_and_grouping ... ok
+test sql_constraints_and_types ... ok
+test sql_joins ... ok
+test sql_primary_key_lookup_and_star ... ok
+test sql_secondary_index_stays_correct ... ok
+test sql_select_filter_order_limit ... ok
+test sql_table_without_primary_key ... ok
+test sql_update_delete ... ok
+test torn_wal_tail_is_discarded ... ok
+test transaction_spans_all_models_and_rolls_back ... ok
+test concurrent_sessions_lose_no_updates ... ok
+
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+   Doc-tests polydb
+
+running 1 test
+test src/lib.rs - (line 15) - compile ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+--> ok (7 s)
+
+finished (UTC): 2026-11-11T20:36:29Z
+RESULT: CLEAN RUN PASSED

@@ -1,0 +1,20 @@
+[package]
+name = "polydb"
+version = "0.2.0"
+edition = "2021"
+description = "A multi-model database engine: relational (SQL), document (NoSQL) and key-value on one transactional storage core"
+license = "MIT"
+
+[lib]
+name = "polydb"
+path = "src/lib.rs"
+
+[[bin]]
+name = "polydb"
+path = "src/main.rs"
+
+# No dependencies: storage, WAL, CRC, JSON and SQL parsing are all implemented in this crate.
+[dependencies]
+
+[profile.release]
+opt-level = 3
