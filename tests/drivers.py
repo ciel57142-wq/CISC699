@@ -172,4 +172,26 @@ check("PBSQL over postgres reads documents written by pymongo", cur.fetchone(), 
 cur.execute("EXPLAIN SELECT name FROM users WHERE id = 1")
 check("EXPLAIN over postgres", any("PrimaryKeyLookup" in r[0] for r in cur.fetchall()), True)
 
+# ------------------------------------- document indexes and key expiry
+import time
+idx = mongo.app.idx
+idx.drop()
+idx.insert_many([{"_id": i, "a": i % 5, "b": i, "email": f"u{i}@x"} for i in range(50)])
+idx.create_index([("a", 1), ("b", -1)], name="a_b")
+idx.create_index("email", unique=True)
+check("pymongo index_information", sorted(idx.index_information().keys()), ["_id_", "a_b", "email_1"])
+try:
+    idx.insert_one({"_id": 999, "email": "u1@x"})
+    check("pymongo unique index", "no error", "error")
+except pymongo.errors.DuplicateKeyError:
+    print("ok   pymongo unique index raises DuplicateKeyError")
+check("pymongo compound sort through the index", [d["b"] for d in idx.find({"a": 2}).sort([("b", -1)]).limit(3)], [47, 42, 37])
+idx.drop_index("a_b")
+check("pymongo drop_index", sorted(idx.index_information().keys()), ["_id_", "email_1"])
+r.set("ttl:key", "v", px=150)
+check("redis-py SET PX + PTTL", 0 < r.pttl("ttl:key") <= 150, True)
+time.sleep(0.3)
+check("redis-py key expired", r.get("ttl:key"), None)
+check("redis-py SET NX / XX", (r.set("nx:key", "1", nx=True), r.set("nx:key", "2", nx=True), r.set("missing:key", "x", xx=True)), (True, None, None))
+
 print("\nall driver checks passed")

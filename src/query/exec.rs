@@ -307,7 +307,7 @@ impl<'f> Sorter<'f> {
             let mut best: Option<usize> = None;
             for (i, h) in heads.iter().enumerate() {
                 if let Some((k, _)) = h {
-                    if best.map_or(true, |b| {
+                    if best.is_none_or(|b| {
                         cmp(k, &heads[b].as_ref().expect("head").0) == Ordering::Less
                     }) {
                         best = Some(i);
@@ -372,15 +372,13 @@ impl Acc {
                 *n += 1;
             }
             Acc::Min(m) => {
-                if m.as_ref()
-                    .map_or(true, |c| v.total_cmp(c) == Ordering::Less)
-                {
+                if m.as_ref().is_none_or(|c| v.total_cmp(c) == Ordering::Less) {
                     *m = Some(v.clone());
                 }
             }
             Acc::Max(m) => {
                 if m.as_ref()
-                    .map_or(true, |c| v.total_cmp(c) == Ordering::Greater)
+                    .is_none_or(|c| v.total_cmp(c) == Ordering::Greater)
                 {
                     *m = Some(v.clone());
                 }
@@ -405,15 +403,13 @@ impl Acc {
                 *n += m;
             }
             (Acc::Min(a), Acc::Min(Some(b))) => {
-                if a.as_ref()
-                    .map_or(true, |c| b.total_cmp(c) == Ordering::Less)
-                {
+                if a.as_ref().is_none_or(|c| b.total_cmp(c) == Ordering::Less) {
                     *a = Some(b);
                 }
             }
             (Acc::Max(a), Acc::Max(Some(b))) => {
                 if a.as_ref()
-                    .map_or(true, |c| b.total_cmp(c) == Ordering::Greater)
+                    .is_none_or(|c| b.total_cmp(c) == Ordering::Greater)
                 {
                     *a = Some(b);
                 }
@@ -735,7 +731,8 @@ impl<'p, 'c, 'a> Executor<'p, 'c, 'a> {
                 let rnode: &'e Node = right;
                 let mut right_it: Option<RowIter<'e>> = None;
                 let mut left_it = Some(l);
-                let chained = std::iter::from_fn(move || loop {
+                // the right input is opened only once the left one is exhausted
+                let chained = std::iter::from_fn(move || {
                     if let Some(l) = &mut left_it {
                         match l.next() {
                             Some(r) => return Some(r),
@@ -748,7 +745,7 @@ impl<'p, 'c, 'a> Executor<'p, 'c, 'a> {
                             Err(e) => return Some(Err(e)),
                         }
                     }
-                    return right_it.as_mut()?.next();
+                    right_it.as_mut()?.next()
                 });
                 if *all {
                     Box::new(chained)

@@ -38,3 +38,4 @@ done
 port_open 27018 || { echo "server did not open its ports within 10 s:" >&2; cat "$log" >&2; exit 1; }
 
 .venv/bin/python tests/drivers.py
+.venv/bin/python tests/clients/pg_extended.py

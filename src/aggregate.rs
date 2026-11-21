@@ -526,7 +526,7 @@ fn group(docs: Vec<Value>, arg: &Value) -> Result<Vec<Value>> {
 
 fn extreme(m: &mut Option<Value>, v: Option<Value>, want: Ordering) {
     if let Some(x) = v.filter(|x| !x.is_null()) {
-        if m.as_ref().map_or(true, |cur| x.total_cmp(cur) == want) {
+        if m.as_ref().is_none_or(|cur| x.total_cmp(cur) == want) {
             *m = Some(x);
         }
     }
