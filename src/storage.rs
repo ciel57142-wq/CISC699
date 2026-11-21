@@ -196,6 +196,18 @@ pub struct Store {
     pub checkpoint_bytes: u64,
 }
 
+impl Drop for Store {
+    fn drop(&mut self) {
+        // Release the directory lock explicitly. Closing the descriptor is not
+        // enough: a child process forked by another thread at that moment
+        // briefly shares the open file description (until its exec closes it),
+        // and an flock lives as long as any descriptor of it does.
+        if let Some(l) = &self._lock {
+            let _ = l.unlock();
+        }
+    }
+}
+
 impl Store {
     /// A volatile store with no files behind it.
     pub fn memory() -> Store {
