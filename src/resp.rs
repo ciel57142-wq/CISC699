@@ -1,9 +1,10 @@
 //! Redis protocol (RESP2 and RESP3) front end for the key-value model.
 //!
 //! Supported: PING ECHO GET SET MGET MSET DEL EXISTS INCR DECR INCRBY DECRBY
-//! KEYS DBSIZE STRLEN APPEND GETSET SETNX TTL SELECT INFO COMMAND CLIENT
-//! HELLO QUIT. Values are binary-safe. Expiry, hashes, lists, sets,
-//! pub/sub and MULTI are not implemented and answer with an error.
+//! KEYS DBSIZE STRLEN APPEND GETSET SETNX TTL PTTL EXPIRE PEXPIRE PERSIST
+//! SELECT INFO COMMAND CLIENT HELLO QUIT, and SET with EX/PX/NX/XX/KEEPTTL.
+//! Values are binary-safe. Hashes, lists, sets, pub/sub and MULTI are not
+//! implemented and answer with an error.
 
 use crate::error::Error;
 use crate::server::Limits;
@@ -185,16 +186,102 @@ fn exec(
             out,
             db.kv_get(&key(&args[1]))?.map_or(0, |v| v.len() as i64),
         ),
-        "SET" => {
-            if args.len() != 3 {
-                err(
-                    out,
-                    "only plain 'SET key value' is supported (no EX/PX/NX/XX options)",
-                );
-            } else {
-                db.kv_set(&key(&args[1]), &args[2])?;
-                out.extend_from_slice(b"+OK\r\n");
+        "SET" if args.len() >= 3 => {
+            // SET key value [EX s | PX ms] [NX | XX] [KEEPTTL]
+            let (mut ttl, mut nx, mut xx, mut keep) = (None, false, false, false);
+            let mut i = 3;
+            let mut bad = None;
+            while i < args.len() {
+                let opt = String::from_utf8_lossy(&args[i]).to_ascii_uppercase();
+                match opt.as_str() {
+                    "EX" | "PX" => {
+                        let n = args
+                            .get(i + 1)
+                            .and_then(|v| std::str::from_utf8(v).ok())
+                            .and_then(|v| v.parse::<i64>().ok());
+                        match n {
+                            Some(n) if n > 0 => {
+                                ttl = Some(if opt == "EX" {
+                                    n.saturating_mul(1000)
+                                } else {
+                                    n
+                                })
+                            }
+                            _ => bad = Some("invalid expire time in 'set' command"),
+                        }
+                        i += 2;
+                    }
+                    "NX" => {
+                        nx = true;
+                        i += 1;
+                    }
+                    "XX" => {
+                        xx = true;
+                        i += 1;
+                    }
+                    "KEEPTTL" => {
+                        keep = true;
+                        i += 1;
+                    }
+                    _ => {
+                        bad = Some("syntax error");
+                        i += 1;
+                    }
+                }
             }
+            if let Some(m) = bad.or((nx && xx).then_some("syntax error")) {
+                err(out, m);
+            } else {
+                let k = key(&args[1]);
+                loop {
+                    db.begin()?;
+                    let exists = db.kv_get(&k)?.is_some();
+                    let write = !(nx && exists || xx && !exists);
+                    if write {
+                        let ttl = if keep && ttl.is_none() {
+                            db.kv_ttl(&k)?.filter(|t| *t >= 0)
+                        } else {
+                            ttl
+                        };
+                        db.kv_set_ttl(&k, &args[2], ttl)?;
+                    }
+                    match db.commit() {
+                        Err(Error::Conflict(_)) => continue,
+                        Err(e) => return Err(e),
+                        Ok(()) => {}
+                    }
+                    if write {
+                        out.extend_from_slice(b"+OK\r\n");
+                    } else {
+                        bulk(out, *proto, None);
+                    }
+                    break;
+                }
+            }
+        }
+        "EXPIRE" | "PEXPIRE" if argc(2, out) => {
+            match std::str::from_utf8(&args[2])
+                .ok()
+                .and_then(|v| v.parse::<i64>().ok())
+            {
+                Some(n) => {
+                    let ms = if name == "EXPIRE" {
+                        n.saturating_mul(1000)
+                    } else {
+                        n
+                    };
+                    int(out, db.kv_expire(&key(&args[1]), Some(ms))? as i64)
+                }
+                None => err(out, "value is not an integer or out of range"),
+            }
+        }
+        "PERSIST" if argc(1, out) => {
+            let k = key(&args[1]);
+            let had = db.kv_ttl(&k)?.is_some_and(|t| t >= 0);
+            if had {
+                db.kv_expire(&k, None)?;
+            }
+            int(out, had as i64)
         }
         "SETNX" | "GETSET" | "APPEND" if argc(2, out) => {
             // read-modify-write: do it in a transaction so it cannot interleave
@@ -284,10 +371,11 @@ fn exec(
         "DBSIZE" => int(out, db.kv_keys("")?.len() as i64),
         "TTL" | "PTTL" if argc(1, out) => int(
             out,
-            if db.kv_get(&key(&args[1]))?.is_some() {
-                -1
-            } else {
-                -2
+            match db.kv_ttl(&key(&args[1]))? {
+                None => -2,
+                Some(-1) => -1,
+                Some(ms) if name == "TTL" => (ms + 999) / 1000,
+                Some(ms) => ms,
             },
         ),
         // the `if argc(..)` guards above fall through to here after writing their own error

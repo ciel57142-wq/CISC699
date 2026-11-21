@@ -1033,3 +1033,77 @@ fn pbsql_errors_are_typed() {
         Error::Schema(_)
     ));
 }
+
+#[test]
+fn key_value_ttl_expires_everywhere() {
+    use std::io::{BufRead, BufReader, Write};
+    let mut db = Database::in_memory();
+    ok(&mut db, "SET KV 'tmp' = 'x' TTL 0.15");
+    ok(&mut db, "SET KV 'keep' = 'y'");
+    assert_eq!(ok(&mut db, "GET FROM KV 'tmp'"), Output::Scalar(t("x")));
+    assert!(db
+        .kv_ttl("tmp")
+        .unwrap()
+        .is_some_and(|ms| ms > 0 && ms <= 150));
+    assert_eq!(db.kv_ttl("keep").unwrap(), Some(-1));
+    std::thread::sleep(std::time::Duration::from_millis(250));
+    assert_eq!(
+        ok(&mut db, "GET FROM KV 'tmp'"),
+        Output::Scalar(Value::Null)
+    );
+    assert_eq!(ok(&mut db, "GET tmp"), Output::Scalar(Value::Null));
+    assert_eq!(
+        ok(&mut db, "EXISTS KV 'tmp'"),
+        Output::Scalar(Value::Bool(false))
+    );
+    assert_eq!(
+        rows(&mut db, "SELECT key FROM KV ORDER BY key"),
+        vec![vec![t("keep")]]
+    );
+    assert_eq!(db.kv_keys("").unwrap(), vec!["keep".to_string()]);
+    assert_eq!(db.kv_ttl("tmp").unwrap(), None);
+    // writing again makes it live and persistent; INCREMENT on an expired key starts at 0
+    ok(&mut db, "SET KV 'tmp' = '5'");
+    assert_eq!(db.kv_ttl("tmp").unwrap(), Some(-1));
+    db.kv_set_ttl("n", b"41", Some(100)).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    assert_eq!(ok(&mut db, "INCREMENT KV 'n'"), Output::Scalar(i(1)));
+
+    // the Redis protocol: SET EX/PX/NX, EXPIRE, TTL, PERSIST
+    let cfg = polydb::server::Config {
+        host: "127.0.0.1".into(),
+        native: None,
+        redis: Some(0),
+        postgres: None,
+        mongo: None,
+    };
+    let r = polydb::server::start(&db, &cfg).unwrap();
+    let s = std::net::TcpStream::connect(r.redis.unwrap()).unwrap();
+    let mut w = s.try_clone().unwrap();
+    let mut rd = BufReader::new(s);
+    let mut ask = |cmd: &str| -> String {
+        w.write_all(format!("{cmd}\r\n").as_bytes()).unwrap();
+        let mut line = String::new();
+        rd.read_line(&mut line).unwrap();
+        if line.starts_with('$') && !line.starts_with("$-1") {
+            let mut v = String::new();
+            rd.read_line(&mut v).unwrap();
+            return v.trim().to_string();
+        }
+        line.trim().to_string()
+    };
+    assert_eq!(ask("SET a 1 PX 100"), "+OK");
+    assert_eq!(ask("SET a 2 NX"), "$-1");
+    let ttl: i64 = ask("PTTL a").trim_start_matches(':').parse().unwrap();
+    assert!(ttl > 0 && ttl <= 100, "{ttl}");
+    assert_eq!(ask("TTL keep"), ":-1");
+    assert_eq!(ask("TTL nope"), ":-2");
+    assert_eq!(ask("EXPIRE keep 100"), ":1");
+    assert_eq!(ask("PERSIST keep"), ":1");
+    assert_eq!(ask("TTL keep"), ":-1");
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    assert_eq!(ask("GET a"), "$-1");
+    assert_eq!(ask("SET a 3 XX"), "$-1");
+    assert_eq!(ask("SET a 3 EX 10"), "+OK");
+    assert_eq!(ask("GET a"), "3");
+}

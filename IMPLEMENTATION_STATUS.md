@@ -41,22 +41,23 @@ EXPLAIN, PBSQL, document aggregation, Mongo cursors/namespaces, CLI.
 - Mongo cursors (getMore/killCursors, batchSize, 10 min expiry, per-connection cap),
   database isolation (`--mongo-default-db`, `db.coll` storage names), listDatabases, dropDatabase.
 - CLI: multiline statements (`;` interactively, visibly-incomplete lines when piped), `.timing`.
+- KV TTL: `SET KV 'k' = v TTL s`, Redis SET EX/PX/NX/XX/KEEPTTL, EXPIRE, PEXPIRE, TTL, PTTL, PERSIST;
+  expired entries hidden from all reads, removed on next write.
 - Real-driver checks (`tests/drivers.py`, redis-py/psycopg2/pymongo) pass, incl. new cursor/aggregate/PBSQL checks.
 
 ## Remaining / next tasks
-1. KV TTL (not implemented; Redis `EX/PX` still refused).
-2. Composite / unique document indexes; use document indexes for `$lookup`.
-3. Streaming (non-materialising) executor; simple statistics for join ordering.
-4. Extended PostgreSQL protocol (prepared statements) is still unsupported.
+1. Composite / unique document indexes; use document indexes for `$lookup`.
+2. Streaming (non-materialising) executor; simple statistics for join ordering.
+3. Extended PostgreSQL protocol (prepared statements) is still unsupported.
 
 ## Known limitations
 - Cross-model atomicity holds because all models share one WAL/transaction.
-- Document indexes: single field, non-unique. KV has no TTL.
+- Document indexes: single field, non-unique. Expired KV entries stay in storage until the key is rewritten.
 - Planner is rule-based (no statistics / cost model).
 - Executor materialises intermediate results per operator (limit pushdown into scans only).
 - Ordering comparisons between different types (number vs text) evaluate to NULL.
 
 ## Tests
-`cargo test` – hardening (26), integration (22), engine (19), documents (4), cli (1), doctest (1): all passing.
+`cargo test` – hardening (26), integration (22), engine (20), documents (4), cli (1), doctest (1): all passing.
 `python3 tests/drivers.py` against `polydb serve --memory --port off --mongo-default-db app`: all passing.
-`cargo fmt --check` was already failing on the base branch (pre-existing formatting).
+`cargo fmt --all -- --check` passes (whole crate formatted in a4257d9). Clippy: only minor style warnings.

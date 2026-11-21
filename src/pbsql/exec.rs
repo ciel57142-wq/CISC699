@@ -7,6 +7,7 @@ use super::parser;
 use crate::doc;
 use crate::error::{Error, Result};
 use crate::keys;
+use crate::kv;
 use crate::query::eval::{coerce_type, eval, is_true, Env, NoSubs, SubRunner};
 use crate::query::exec::{explain, run, run_analyze, Executor, Row};
 use crate::query::plan::{
@@ -75,7 +76,7 @@ pub fn run_stmt(ctx: &mut Ctx, st: Stmt) -> Result<Output> {
         } => delete(ctx, target, alias, filter),
         Stmt::KvGet { ns, key } => {
             let k = kv_key(&constant(&key)?)?;
-            Ok(Output::Scalar(match ctx.get(&keys::kv_ns(&ns, &k)) {
+            Ok(Output::Scalar(match kv::live(ctx, &keys::kv_ns(&ns, &k)) {
                 Some(v) => Value::Text(String::from_utf8_lossy(&v).into_owned()),
                 None => Value::Null,
             }))
@@ -83,42 +84,45 @@ pub fn run_stmt(ctx: &mut Ctx, st: Stmt) -> Result<Output> {
         Stmt::KvExists { ns, key } => {
             let k = kv_key(&constant(&key)?)?;
             Ok(Output::Scalar(Value::Bool(
-                ctx.get(&keys::kv_ns(&ns, &k)).is_some(),
+                kv::live(ctx, &keys::kv_ns(&ns, &k)).is_some(),
             )))
         }
-        Stmt::KvSet { ns, key, value } => {
+        Stmt::KvSet {
+            ns,
+            key,
+            value,
+            ttl,
+        } => {
             let k = kv_key(&constant(&key)?)?;
-            ctx.put(
+            let ttl_ms = match ttl {
+                None => None,
+                Some(e) => match constant(&e)?.as_f64() {
+                    Some(secs) if secs > 0.0 => Some((secs * 1000.0) as i64),
+                    _ => {
+                        return Err(Error::Type(
+                            "TTL must be a positive number of seconds".into(),
+                        ))
+                    }
+                },
+            };
+            kv::put(
+                ctx,
                 keys::kv_ns(&ns, &k),
                 kv_value(constant(&value)?).into_bytes(),
+                ttl_ms,
             );
             Ok(Output::Done("OK".into()))
         }
         Stmt::KvDel { ns, key } => {
             let k = keys::kv_ns(&ns, &kv_key(&constant(&key)?)?);
-            let existed = ctx.get(&k).is_some();
-            if existed {
-                ctx.delete(k);
-            }
-            Ok(Output::Scalar(Value::Int(existed as i64)))
+            Ok(Output::Scalar(Value::Int(kv::remove(ctx, k) as i64)))
         }
         Stmt::KvIncr { ns, key, by } => {
             let k = kv_key(&constant(&key)?)?;
             let by = constant(&by)?
                 .as_i64()
                 .ok_or_else(|| Error::Type("INCREMENT ... BY needs an integer".into()))?;
-            let full = keys::kv_ns(&ns, &k);
-            let cur = match ctx.get(&full) {
-                Some(raw) => std::str::from_utf8(&raw)
-                    .ok()
-                    .and_then(|s| s.trim().parse::<i64>().ok())
-                    .ok_or_else(|| Error::Type(format!("value at '{k}' is not an integer")))?,
-                None => 0,
-            };
-            let next = cur
-                .checked_add(by)
-                .ok_or_else(|| Error::Type("integer overflow".into()))?;
-            ctx.put(full, next.to_string().into_bytes());
+            let next = kv::incr_full(ctx, keys::kv_ns(&ns, &k), &k, by)?;
             Ok(Output::Scalar(Value::Int(next)))
         }
     }
@@ -1023,9 +1027,11 @@ fn insert(
                     ));
                 }
                 let k = kv_key(vals[ki].as_ref().unwrap_or(&Value::Null))?;
-                ctx.put(
+                kv::put(
+                    ctx,
                     keys::kv_ns(&target.name, &k),
                     kv_value(vals[vi].clone().unwrap_or(Value::Null)).into_bytes(),
+                    None,
                 );
             }
             Ok(Output::Done(format!("{n} key(s) set")))
@@ -1153,8 +1159,10 @@ fn update(
                         }
                     }
                 }
-                ctx.delete(key);
-                ctx.put(keys::kv_ns(&ns, &k), kv_value(v).into_bytes());
+                // an UPDATE keeps the entry's remaining time-to-live
+                let left = kv::ttl_left(ctx, &key).filter(|ms| *ms >= 0);
+                kv::remove(ctx, key);
+                kv::put(ctx, keys::kv_ns(&ns, &k), kv_value(v).into_bytes(), left);
             }
             Ok(Output::Done(format!("{n} key(s) updated")))
         }
@@ -1190,7 +1198,7 @@ fn delete(
         }
         SourceKind::Kv(_) => {
             for (key, _) in hits {
-                ctx.delete(key);
+                kv::remove(ctx, key);
                 n += 1;
             }
             Ok(Output::Done(format!("{n} key(s) deleted")))

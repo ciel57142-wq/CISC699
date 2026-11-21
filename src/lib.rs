@@ -371,6 +371,24 @@ impl Database {
         })
     }
 
+    /// Set a key with an optional time-to-live in milliseconds.
+    pub fn kv_set_ttl(&mut self, key: &str, value: &[u8], ttl_ms: Option<i64>) -> Result<()> {
+        self.run(true, |ctx| {
+            kv::set_with_ttl(ctx, key, value, ttl_ms);
+            Ok(())
+        })
+    }
+
+    /// Give an existing key a time-to-live (`None` removes it); returns whether the key exists.
+    pub fn kv_expire(&mut self, key: &str, ttl_ms: Option<i64>) -> Result<bool> {
+        self.run(true, |ctx| Ok(kv::set_ttl(ctx, &keys::kv(key), ttl_ms)))
+    }
+
+    /// Remaining time-to-live in ms: `None` if the key does not exist, `Some(-1)` if it has none.
+    pub fn kv_ttl(&mut self, key: &str) -> Result<Option<i64>> {
+        self.run(false, |ctx| Ok(kv::ttl_left(ctx, &keys::kv(key))))
+    }
+
     pub fn kv_get(&mut self, key: &str) -> Result<Option<Vec<u8>>> {
         self.run(false, |ctx| Ok(kv::get(ctx, key)))
     }

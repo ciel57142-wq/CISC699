@@ -405,10 +405,17 @@ impl Parser {
             let ns = self.kv_name()?;
             let key = self.add_expr_top()?;
             self.expect_sym("=")?;
+            let value = self.expr()?;
+            let ttl = if self.kw("ttl") {
+                Some(self.expr()?)
+            } else {
+                None
+            };
             return Ok(Stmt::KvSet {
                 ns,
                 key,
-                value: self.expr()?,
+                value,
+                ttl,
             });
         }
         if self.peek_kw("exists") && Self::word_is(self.peek_at(1), "kv") {

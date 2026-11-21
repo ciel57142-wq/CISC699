@@ -354,6 +354,8 @@ pub enum Stmt {
         ns: String,
         key: Expr,
         value: Expr,
+        /// Time-to-live in seconds.
+        ttl: Option<Expr>,
     },
     KvExists {
         ns: String,

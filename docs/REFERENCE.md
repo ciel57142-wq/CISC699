@@ -50,7 +50,7 @@ INSERT INTO DOCUMENT.users (name, age) VALUES ('Bob', 25)
 UPDATE DOCUMENT.users SET profile.city = 'Paris' WHERE name = 'Alice'
 DELETE FROM DOCUMENT.users WHERE age < 18
 CREATE INDEX users_age ON DOCUMENT.users (age)
-SET KV[.ns] 'key' = value        GET FROM KV[.ns] 'key'        EXISTS KV[.ns] 'key'
+SET KV[.ns] 'key' = value [TTL seconds]   GET FROM KV[.ns] 'key'        EXISTS KV[.ns] 'key'
 INCREMENT KV[.ns] 'key' [BY n]   SELECT key, value FROM KV WHERE key LIKE 'user:%'
 DELETE FROM KV WHERE key = 'k'   INSERT INTO KV (key, value) VALUES ('k', 'v')
 ```
@@ -144,7 +144,7 @@ The native protocol replies look like this:
 
 **What "compatible" means here.** The wire protocols are real, so drivers connect, authenticate nothing, and exchange data in their native formats. The *languages* are polydb's subsets, not the full products:
 
-- **Redis:** strings only: `GET SET MGET MSET DEL EXISTS INCR DECR INCRBY DECRBY KEYS DBSIZE STRLEN APPEND GETSET SETNX TTL PING ECHO`. No expiry, lists, hashes, sets, pub/sub or `MULTI`.
+- **Redis:** strings only: `GET SET MGET MSET DEL EXISTS INCR DECR INCRBY DECRBY KEYS DBSIZE STRLEN APPEND GETSET SETNX TTL PTTL EXPIRE PEXPIRE PERSIST PING ECHO`, and `SET` with `EX PX NX XX KEEPTTL`. Expired keys are invisible to every front end. No lists, hashes, sets, pub/sub or `MULTI`.
 - **PostgreSQL:** the simple-query flow that psql, libpq and psycopg2 use. No server-side prepared statements (the extended protocol used by default in JDBC, asyncpg, node-postgres with parameters), no `COPY`, no `pg_catalog`, and the SQL is the subset listed below. Every polydb command works on this port, including `db.coll.find(...)` and `GET key`.
 - **MongoDB:** `insert find getMore killCursors update delete count distinct drop dropDatabase createIndexes listCollections listDatabases` and `aggregate` with `$match $project $addFields $set $unset $sort $skip $limit $group $unwind $count $lookup $replaceRoot` (accumulators `$sum $avg $min $max $count $first $last $push $addToSet`). Results come in batches through server-side cursors (idle cursors expire after 10 minutes). Databases are isolated; the default database (`--mongo-default-db`, `test` unless set) holds the collections the native `db.<coll>` API sees, and database `d` is visible natively as `db.d.<coll>` / `DOCUMENT.d.coll`. No change streams. `mongosh` has not been tested.
 - **No authentication or TLS on any port.** The server binds to 127.0.0.1 by default; only expose it on a network you trust.

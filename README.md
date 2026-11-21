@@ -192,7 +192,7 @@ polydb ships with **no dataset** and downloads none. Every test creates its own 
 - **Log damage:** a torn final record (the normal crash case) is dropped. Damage *followed by more log data* is reported as a `corrupt` error instead of silently dropping later commits; `Database::open_with(dir, &OpenOptions { salvage: true })` keeps the intact prefix (and saves the damaged log as `data.wal.corrupt`).
 - Commits wait for their own `fsync`, so write throughput is bounded by the disk.
 - The planner is rule-based (no statistics); intermediate results of an operator are materialised.
-- Document indexes are single-field; key-value entries have no TTL.
+- Document indexes are single-field. Expired key-value entries are hidden at once but only removed from storage when the key is next written.
 - A database directory is locked (`LOCK` file): a second process opening it gets an error.
 - Object keys in documents are stored sorted, not in insertion order.
 

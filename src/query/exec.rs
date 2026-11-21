@@ -551,6 +551,9 @@ impl<'p, 'c, 'a> Executor<'p, 'c, 'a> {
                     KvPath::FullScan => self.ctx.scan(&base),
                 };
                 for (k, v) in entries {
+                    if crate::kv::is_expired(self.ctx, &k) {
+                        continue;
+                    }
                     let r = row(&k, v);
                     if !feed(k, r, examined)? {
                         break;
