@@ -283,7 +283,9 @@ fn sort_index(
             if p != sp {
                 return None;
             }
-            let r = (*d < 0) != *desc;
+            // entries are stored ascending whatever the declared direction
+            let _ = d;
+            let r = *desc;
             if rev.is_some_and(|x| x != r) {
                 return None;
             }

@@ -331,8 +331,11 @@ impl Store {
         &'a self,
         lo: Bound<&'a [u8]>,
         hi: Bound<&'a [u8]>,
-    ) -> impl Iterator<Item = (&'a Vec<u8>, &'a Vec<u8>)> + 'a {
-        self.map.range::<[u8], _>((lo, hi))
+    ) -> Box<dyn Iterator<Item = (&'a Vec<u8>, &'a Vec<u8>)> + 'a> {
+        if !range_is_valid(&lo, &hi) {
+            return Box::new(std::iter::empty());
+        }
+        Box::new(self.map.range::<[u8], _>((lo, hi)))
     }
 
     pub fn len(&self) -> usize {
@@ -508,6 +511,9 @@ impl<'a> Ctx<'a> {
     /// transaction the whole range is recorded, so a concurrent insert into
     /// it (a phantom) makes the commit fail.
     pub fn range(&self, lo: Bound<&[u8]>, hi: Bound<&[u8]>) -> Vec<(Vec<u8>, Vec<u8>)> {
+        if !range_is_valid(&lo, &hi) {
+            return Vec::new();
+        }
         if let Some(r) = &self.reads {
             r.borrow_mut()
                 .ranges
@@ -544,6 +550,22 @@ impl<'a> Ctx<'a> {
         if let Some(r) = &self.reads {
             r.borrow_mut().ranges.push((lo.clone(), hi.clone()));
         }
+        let (lo, hi) = if range_is_valid(&lo, &hi) {
+            (lo, hi)
+        } else {
+            (Bound::Excluded(Vec::new()), Bound::Excluded(Vec::new()))
+        };
+        if lo == Bound::Excluded(Vec::new()) && hi == Bound::Excluded(Vec::new()) {
+            let empty: Box<dyn Iterator<Item = (&'c Vec<u8>, &'c Vec<u8>)> + 'c> =
+                Box::new(std::iter::empty());
+            let empty_w: Box<dyn Iterator<Item = (&'c Vec<u8>, &'c Option<Vec<u8>>)> + 'c> =
+                Box::new(std::iter::empty());
+            return MergeIter {
+                store: empty.peekable(),
+                writes: empty_w.peekable(),
+                rev,
+            };
+        }
         let r = (lo, hi);
         let store: Box<dyn Iterator<Item = (&'c Vec<u8>, &'c Vec<u8>)> + 'c> = if rev {
             Box::new(self.store.map.range::<Vec<u8>, _>(r.clone()).rev())
@@ -566,6 +588,19 @@ impl<'a> Ctx<'a> {
     pub fn iter_prefix<'c>(&'c self, prefix: &[u8], rev: bool) -> MergeIter<'c> {
         let hi = prefix_successor(prefix).map_or(Bound::Unbounded, Bound::Excluded);
         self.iter_range(Bound::Included(prefix.to_vec()), hi, rev)
+    }
+}
+
+/// Whether a key range can contain anything. `BTreeMap::range` panics on an
+/// inverted range (e.g. from `x BETWEEN 10 AND 5`), so callers check first.
+pub fn range_is_valid<T: AsRef<[u8]>>(lo: &Bound<T>, hi: &Bound<T>) -> bool {
+    match (lo, hi) {
+        (Bound::Included(a), Bound::Included(b)) => a.as_ref() <= b.as_ref(),
+        (Bound::Included(a), Bound::Excluded(b)) | (Bound::Excluded(a), Bound::Included(b)) => {
+            a.as_ref() < b.as_ref()
+        }
+        (Bound::Excluded(a), Bound::Excluded(b)) => a.as_ref() < b.as_ref(),
+        _ => true,
     }
 }
 

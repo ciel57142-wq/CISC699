@@ -1698,7 +1698,7 @@ impl<'p, 'c, 'a> Executor<'p, 'c, 'a> {
                 let cols: Vec<usize> = ix.cols.iter().filter_map(|c| s.find_col(c)).collect();
                 for (e, ci) in eq.iter().zip(&cols) {
                     let v = ev(e)?;
-                    let v = if ix.enc == Enc::Exact {
+                    let v = if ix.enc.exact() {
                         typed(*ci, v)
                     } else {
                         Some(v).filter(|v| !v.is_null())
@@ -1711,7 +1711,7 @@ impl<'p, 'c, 'a> Executor<'p, 'c, 'a> {
                 let next = cols.get(eq.len()).copied();
                 let enc_bound = |v: Value| -> Option<Vec<u8>> {
                     let v = match (ix.enc, next) {
-                        (Enc::Exact, Some(ci)) => typed(ci, v)?,
+                        (e, Some(ci)) if e.exact() => typed(ci, v)?,
                         _ => v,
                     };
                     rel::encode_with(ix.enc, &v)
@@ -1728,7 +1728,7 @@ impl<'p, 'c, 'a> Executor<'p, 'c, 'a> {
                 for e in vals {
                     let v = ev(e)?;
                     let v = match (ix.enc, ci) {
-                        (Enc::Exact, Some(ci)) => typed(ci, v),
+                        (e, Some(ci)) if e.exact() => typed(ci, v),
                         _ => Some(v).filter(|v| !v.is_null()),
                     };
                     let Some(enc) = v.and_then(|v| rel::encode_with(ix.enc, &v)) else {

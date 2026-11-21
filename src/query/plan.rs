@@ -1496,7 +1496,7 @@ fn table_path(s: &Schema, filters: &[Expr]) -> TablePath {
     }
     // 2. a unique index fully pinned, then the index with the longest equality prefix
     let mut best: Option<(usize, TablePath)> = None;
-    for ix in &s.indexes {
+    for ix in s.indexes.iter().filter(|i| i.enc != crate::rel::Enc::Exact) {
         let cols: Vec<usize> = ix.cols.iter().filter_map(|c| s.find_col(c)).collect();
         if cols.len() != ix.cols.len() {
             continue;
@@ -1925,7 +1925,7 @@ fn natural_order(access: &Access, keys: &[(Expr, bool)]) -> Option<bool> {
                 TablePath::PkRange { eq, .. } => (by(&pk[eq.len()..]), true),
                 TablePath::PkPoints(_) => (by(&pk), false),
                 TablePath::Index { ix, eq, .. } => {
-                    if ix.enc != crate::rel::Enc::Exact {
+                    if ix.enc != crate::rel::Enc::ExactNull {
                         return None; // the original encoding merges large integers
                     }
                     let cs: Vec<usize> =
@@ -1947,7 +1947,8 @@ fn natural_order(access: &Access, keys: &[(Expr, bool)]) -> Option<bool> {
                 }
                 let o = c.index.fields[c.eq.len()..]
                     .iter()
-                    .map(|(p, d)| (0, p.split('.').map(String::from).collect(), *d < 0))
+                    // entries are stored ascending whatever the declared direction
+                    .map(|(p, _)| (0, p.split('.').map(String::from).collect(), false))
                     .collect();
                 (o, true)
             }

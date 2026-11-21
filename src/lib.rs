@@ -221,6 +221,7 @@ impl Database {
                 exec: Default::default(),
             };
             kv::index_untracked_expiries(&mut ctx);
+            let _ = rel::upgrade_indexes(&mut ctx);
             while kv::purge_expired(&mut ctx, kv::now_ms(), 10_000) > 0 {}
             let ws = ctx.writes;
             let _ = g.commit(ws);

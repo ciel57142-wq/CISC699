@@ -36,7 +36,18 @@ pub struct Column {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Enc {
     Legacy,
+    /// Exact encoding as first released on this branch: rows with a NULL in
+    /// an indexed column had no entry, so such an index is incomplete and is
+    /// rebuilt as `ExactNull` when the database is opened.
     Exact,
+    /// Exact encoding with NULL indexed (sorting first): every row has an entry.
+    ExactNull,
+}
+
+impl Enc {
+    pub fn exact(self) -> bool {
+        matches!(self, Enc::Exact | Enc::ExactNull)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -94,6 +105,8 @@ pub fn encode_with(enc: Enc, v: &Value) -> Option<Vec<u8>> {
     match enc {
         Enc::Legacy => keys::encode_index_value(v),
         Enc::Exact => encode_exact(v),
+        Enc::ExactNull if v.is_null() => Some(vec![0]),
+        Enc::ExactNull => encode_exact(v),
     }
 }
 
@@ -164,10 +177,10 @@ impl Schema {
                 o.insert("field".to_string(), s(&i.field));
                 o.insert(
                     "enc".to_string(),
-                    s(if i.enc == Enc::Exact {
-                        "exact"
-                    } else {
-                        "legacy"
+                    s(match i.enc {
+                        Enc::Exact => "exact",
+                        Enc::ExactNull => "exact2",
+                        Enc::Legacy => "legacy",
                     }),
                 );
                 Value::Object(o)
@@ -288,10 +301,10 @@ impl Schema {
                             .and_then(Value::as_str)
                             .ok_or_else(bad)?
                             .to_string(),
-                        enc: if ix.get("enc").and_then(Value::as_str) == Some("exact") {
-                            Enc::Exact
-                        } else {
-                            Enc::Legacy
+                        enc: match ix.get("enc").and_then(Value::as_str) {
+                            Some("exact2") => Enc::ExactNull,
+                            Some("exact") => Enc::Exact,
+                            _ => Enc::Legacy,
                         },
                     }),
                     _ => return Err(bad()),
@@ -944,4 +957,30 @@ pub fn drop_table_data(ctx: &mut Ctx, name: &str) {
     }
     ctx.delete(keys::table_meta(name));
     ctx.delete(keys::seq(&format!("t:{name}")));
+}
+
+/// Rebuild indexes left incomplete by the first exact encoding (rows with a
+/// NULL in an indexed column had no entry). Returns how many were rebuilt.
+pub fn upgrade_indexes(ctx: &mut Ctx) -> Result<usize> {
+    let mut n = 0;
+    for mut s in all_schemas(ctx)? {
+        let stale: Vec<usize> = (0..s.indexes.len())
+            .filter(|i| s.indexes[*i].enc == Enc::Exact)
+            .collect();
+        if stale.is_empty() {
+            continue;
+        }
+        for i in stale {
+            let old = s.indexes[i].clone();
+            for (k, _) in ctx.scan(&keys::index_prefix(&owner(&s.name), &old.field)) {
+                ctx.delete(k);
+            }
+            s.indexes[i].enc = Enc::ExactNull;
+            let ix = s.indexes[i].clone();
+            build_index(ctx, &s, &ix)?;
+            n += 1;
+        }
+        s.save(ctx);
+    }
+    Ok(n)
 }

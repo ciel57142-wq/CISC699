@@ -376,7 +376,7 @@ fn fresh_index(s: &Schema, base: &str, cols: &[String], unique: bool) -> Index {
         name,
         cols: cols.to_vec(),
         unique,
-        enc: Enc::Exact,
+        enc: Enc::ExactNull,
     }
 }
 
@@ -694,7 +694,7 @@ fn create_index(
         name: name.clone(),
         cols: cols.clone(),
         unique,
-        enc: Enc::Exact,
+        enc: Enc::ExactNull,
     };
     let shared = schema.indexes.iter().any(|i| i.field == ix.field);
     if !shared {
