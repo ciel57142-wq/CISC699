@@ -673,7 +673,13 @@ impl Database {
                 .to_ascii_lowercase();
             let read = matches!(
                 method.trim(),
-                "find" | "findone" | "count" | "countdocuments" | "aggregate"
+                "find"
+                    | "findone"
+                    | "count"
+                    | "countdocuments"
+                    | "aggregate"
+                    | "getindexes"
+                    | "validate"
             );
             return self.run(!read, |ctx| doc_command(ctx, s));
         }

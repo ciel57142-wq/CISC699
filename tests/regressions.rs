@@ -92,3 +92,25 @@ fn descending_document_index_sorts_correctly() {
         ]
     );
 }
+
+/// `o.items.0.qty` lexed `0.` as a float, so array positions inside a dotted
+/// path were a parse error.
+#[test]
+fn array_positions_in_dotted_paths() {
+    let mut db = Database::in_memory();
+    ok(
+        &mut db,
+        "db.o.insert({_id: 1, items: [{qty: 4, tags: ['a', 'b']}, {qty: 1}]})",
+    );
+    assert_eq!(
+        rows(
+            &mut db,
+            "SELECT o.items.0.qty, items.1.qty, items.0.tags.1 FROM DOCUMENT.o o"
+        ),
+        vec![vec![Value::Int(4), Value::Int(1), Value::Text("b".into())]]
+    );
+    assert_eq!(
+        rows(&mut db, "SELECT 1.5 + 2, .25"),
+        vec![vec![Value::Float(3.5), Value::Float(0.25)]]
+    );
+}
