@@ -15,6 +15,7 @@
 use crate::doc::{self, FindOptions};
 use crate::error::Error;
 use crate::value::Value;
+use crate::server::Limits;
 use crate::Database;
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
@@ -621,7 +622,7 @@ fn send(s: &mut TcpStream, request_id: i32, response_to: i32, opcode: i32, body:
     s.write_all(&out)
 }
 
-fn session(s: &mut TcpStream, db: &mut Database) -> io::Result<()> {
+fn session(s: &mut TcpStream, db: &mut Database, limits: &Limits) -> io::Result<()> {
     let conn_id = s.peer_addr().map(|a| a.port() as i64).unwrap_or(0);
     let mut reply_id = 0i32;
     loop {
@@ -632,7 +633,7 @@ fn session(s: &mut TcpStream, db: &mut Database) -> io::Result<()> {
         let len = rd_i32(&hdr, 0)? as usize;
         let request_id = rd_i32(&hdr, 4)?;
         let opcode = rd_i32(&hdr, 12)?;
-        if !(16..=48_000_000).contains(&len) {
+        if !(16..=limits.max_request_bytes.min(48_000_000).max(16)).contains(&len) {
             return Ok(());
         }
         let mut body = vec![0u8; len - 16];
@@ -709,6 +710,10 @@ fn session(s: &mut TcpStream, db: &mut Database) -> io::Result<()> {
     }
 }
 
-pub fn handle(mut stream: TcpStream, mut db: Database) {
-    let _ = session(&mut stream, &mut db);
+pub fn handle(stream: TcpStream, db: Database) {
+    handle_with(stream, db, &Limits::default())
+}
+
+pub fn handle_with(mut stream: TcpStream, mut db: Database, limits: &Limits) {
+    let _ = session(&mut stream, &mut db, limits);
 }

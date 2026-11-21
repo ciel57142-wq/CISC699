@@ -180,6 +180,11 @@ impl Database {
         Ok(Database::from_store(Store::open(path)?))
     }
 
+    /// Open with explicit options, e.g. salvaging a log with interior corruption.
+    pub fn open_with(path: impl AsRef<Path>, opts: &storage::OpenOptions) -> Result<Database> {
+        Ok(Database::from_store(Store::open_with(path, opts)?))
+    }
+
     /// A database that lives only in memory.
     pub fn in_memory() -> Database {
         Database::from_store(Store::memory())

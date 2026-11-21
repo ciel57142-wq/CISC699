@@ -16,7 +16,10 @@ use crate::value::Value;
 use crate::{Database, Output};
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
+
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::Arc;
 use std::thread;
 
 #[derive(Debug, Clone)]
@@ -35,6 +38,25 @@ impl Default for Config {
     }
 }
 
+/// Resource limits applied to every network connection.
+#[derive(Debug, Clone, Copy)]
+pub struct Limits {
+    /// Largest single request (command line, RESP command, PostgreSQL
+    /// message or MongoDB message) accepted from a client, in bytes.
+    pub max_request_bytes: usize,
+    /// Most arguments in one RESP command.
+    pub max_args: usize,
+    /// Most simultaneous connections per listener; further clients are
+    /// disconnected immediately.
+    pub max_connections: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Limits { max_request_bytes: 64 << 20, max_args: 1 << 20, max_connections: 1024 }
+    }
+}
+
 /// Addresses the server is actually listening on.
 #[derive(Debug, Clone, Default)]
 pub struct Running {
@@ -44,7 +66,9 @@ pub struct Running {
     pub mongo: Option<SocketAddr>,
 }
 
-fn listen(db: &Database, host: &str, port: Option<u16>, handler: fn(TcpStream, Database)) -> Result<Option<SocketAddr>> {
+type Handler = fn(TcpStream, Database, &Limits);
+
+fn listen(db: &Database, host: &str, port: Option<u16>, limits: Limits, handler: Handler) -> Result<Option<SocketAddr>> {
     let Some(port) = port else {
         return Ok(None);
     };
@@ -52,11 +76,21 @@ fn listen(db: &Database, host: &str, port: Option<u16>, handler: fn(TcpStream, D
         .map_err(|e| Error::Io(std::io::Error::new(e.kind(), format!("cannot listen on {host}:{port}: {e}"))))?;
     let addr = listener.local_addr()?;
     let db = db.session();
+    let open = Arc::new(AtomicUsize::new(0));
     thread::spawn(move || {
         for stream in listener.incoming().flatten() {
+            if open.load(AtomicOrdering::SeqCst) >= limits.max_connections {
+                drop(stream); // over the limit: refuse by closing
+                continue;
+            }
             let _ = stream.set_nodelay(true);
             let session = db.session();
-            thread::spawn(move || handler(stream, session));
+            let open = open.clone();
+            open.fetch_add(1, AtomicOrdering::SeqCst);
+            thread::spawn(move || {
+                handler(stream, session, &limits);
+                open.fetch_sub(1, AtomicOrdering::SeqCst);
+            });
         }
     });
     Ok(Some(addr))
@@ -64,17 +98,26 @@ fn listen(db: &Database, host: &str, port: Option<u16>, handler: fn(TcpStream, D
 
 /// Start the listeners on background threads and return their addresses.
 pub fn start(db: &Database, cfg: &Config) -> Result<Running> {
+    start_with_limits(db, cfg, Limits::default())
+}
+
+/// [`start`] with explicit per-connection resource limits.
+pub fn start_with_limits(db: &Database, cfg: &Config, limits: Limits) -> Result<Running> {
     Ok(Running {
-        native: listen(db, &cfg.host, cfg.native, handle_native)?,
-        redis: listen(db, &cfg.host, cfg.redis, crate::resp::handle)?,
-        postgres: listen(db, &cfg.host, cfg.postgres, crate::pgwire::handle)?,
-        mongo: listen(db, &cfg.host, cfg.mongo, crate::mongo::handle)?,
+        native: listen(db, &cfg.host, cfg.native, limits, handle_native)?,
+        redis: listen(db, &cfg.host, cfg.redis, limits, crate::resp::handle_with)?,
+        postgres: listen(db, &cfg.host, cfg.postgres, limits, crate::pgwire::handle_with)?,
+        mongo: listen(db, &cfg.host, cfg.mongo, limits, crate::mongo::handle_with)?,
     })
 }
 
 /// Start the listeners and serve until the process is stopped.
 pub fn serve(db: &Database, cfg: &Config) -> Result<()> {
-    let r = start(db, cfg)?;
+    serve_with_limits(db, cfg, Limits::default())
+}
+
+pub fn serve_with_limits(db: &Database, cfg: &Config, limits: Limits) -> Result<()> {
+    let r = start_with_limits(db, cfg, limits)?;
     for (name, addr) in [("native", r.native), ("redis", r.redis), ("postgres", r.postgres), ("mongodb", r.mongo)] {
         if let Some(a) = addr {
             println!("{name:<9} listening on {a}");
@@ -149,20 +192,34 @@ pub fn result_from_json(line: &str) -> std::result::Result<Output, String> {
     })
 }
 
-fn handle_native(stream: TcpStream, mut db: Database) {
+fn handle_native(stream: TcpStream, mut db: Database, limits: &Limits) {
     let Ok(mut writer) = stream.try_clone() else {
         return;
     };
     let mut reader = BufReader::new(stream);
-    let mut line = String::new();
+    let mut line = Vec::new();
     loop {
         line.clear();
-        // Cap a single command at 64 MB so a client cannot exhaust memory.
-        match (&mut reader).take(64 << 20).read_line(&mut line) {
+        // Cap a single command so a client cannot exhaust memory.
+        let cap = limits.max_request_bytes as u64 + 1;
+        match (&mut reader).take(cap).read_until(b'\n', &mut line) {
             Ok(0) | Err(_) => return,
             Ok(_) => {}
         }
-        let cmd = line.trim();
+        if line.last() != Some(&b'\n') && line.len() as u64 >= cap {
+            // Never execute the truncated front of an oversized command.
+            let e = Error::Parse(format!("request exceeds the {} byte limit; closing connection", limits.max_request_bytes));
+            let _ = writer.write_all(format!("{}\n", result_to_json(&Err(e))).as_bytes());
+            return;
+        }
+        let Ok(text) = std::str::from_utf8(&line) else {
+            let e = Error::Parse("request is not valid UTF-8".into());
+            if writer.write_all(format!("{}\n", result_to_json(&Err(e))).as_bytes()).is_err() {
+                return;
+            }
+            continue;
+        };
+        let cmd = text.trim();
         if cmd.is_empty() {
             continue;
         }

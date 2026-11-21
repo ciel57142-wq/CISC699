@@ -6,14 +6,24 @@
 //! pub/sub and MULTI are not implemented and answer with an error.
 
 use crate::error::Error;
+use crate::server::Limits;
 use crate::Database;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 
+fn invalid(msg: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, msg.to_string())
+}
+
+const MAX_LINE: u64 = 1 << 20;
+
 fn read_line(r: &mut impl BufRead) -> io::Result<Option<Vec<u8>>> {
     let mut line = Vec::new();
-    if r.take(1 << 20).read_until(b'\n', &mut line)? == 0 {
+    if r.take(MAX_LINE).read_until(b'\n', &mut line)? == 0 {
         return Ok(None);
+    }
+    if line.last() != Some(&b'\n') && line.len() as u64 >= MAX_LINE {
+        return Err(invalid("RESP line too long"));
     }
     while matches!(line.last(), Some(b'\n' | b'\r')) {
         line.pop();
@@ -21,15 +31,15 @@ fn read_line(r: &mut impl BufRead) -> io::Result<Option<Vec<u8>>> {
     Ok(Some(line))
 }
 
-fn parse_len(b: &[u8]) -> io::Result<usize> {
+fn parse_len(b: &[u8], max: usize) -> io::Result<usize> {
     std::str::from_utf8(b)
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
-        .filter(|n| *n <= 512 << 20)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad RESP length"))
+        .filter(|n| *n <= max)
+        .ok_or_else(|| invalid("bad or oversized RESP length"))
 }
 
-fn read_command(r: &mut impl BufRead) -> io::Result<Option<Vec<Vec<u8>>>> {
+fn read_command(r: &mut impl BufRead, limits: &Limits) -> io::Result<Option<Vec<Vec<u8>>>> {
     let Some(line) = read_line(r)? else {
         return Ok(None);
     };
@@ -37,8 +47,9 @@ fn read_command(r: &mut impl BufRead) -> io::Result<Option<Vec<Vec<u8>>>> {
         // inline command, as typed into telnet
         return Ok(Some(line.split(|b| b.is_ascii_whitespace()).filter(|p| !p.is_empty()).map(<[u8]>::to_vec).collect()));
     }
-    let n = parse_len(&line[1..])?;
+    let n = parse_len(&line[1..], limits.max_args)?;
     let mut args = Vec::with_capacity(n.min(1024));
+    let mut total = 0usize;
     for _ in 0..n {
         let Some(h) = read_line(r)? else {
             return Ok(None);
@@ -46,7 +57,12 @@ fn read_command(r: &mut impl BufRead) -> io::Result<Option<Vec<Vec<u8>>>> {
         if h.first() != Some(&b'$') {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "expected bulk string"));
         }
-        let mut buf = vec![0u8; parse_len(&h[1..])? + 2];
+        let len = parse_len(&h[1..], limits.max_request_bytes)?;
+        total += len;
+        if total > limits.max_request_bytes {
+            return Err(invalid("RESP command exceeds the request size limit"));
+        }
+        let mut buf = vec![0u8; len + 2];
         r.read_exact(&mut buf)?;
         buf.truncate(buf.len() - 2);
         args.push(buf);
@@ -221,14 +237,18 @@ fn exec(db: &mut Database, args: &[Vec<u8>], proto: &mut u8, out: &mut Vec<u8>) 
     Ok(true)
 }
 
-pub fn handle(stream: TcpStream, mut db: Database) {
+pub fn handle(stream: TcpStream, db: Database) {
+    handle_with(stream, db, &Limits::default())
+}
+
+pub fn handle_with(stream: TcpStream, mut db: Database, limits: &Limits) {
     let Ok(mut writer) = stream.try_clone() else {
         return;
     };
     let mut reader = BufReader::new(stream);
     let mut proto = 2u8;
     loop {
-        let args = match read_command(&mut reader) {
+        let args = match read_command(&mut reader, limits) {
             Ok(Some(a)) => a,
             _ => return,
         };

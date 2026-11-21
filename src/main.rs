@@ -45,7 +45,9 @@ OTHER
 SERVER
   polydb serve [DIRECTORY] [--memory] [--host ADDR]
                [--port N] [--redis-port N] [--pg-port N] [--mongo-port N]
+               [--max-request-bytes N] [--max-connections N]
   Defaults: host 127.0.0.1, native 7878, Redis 6380, PostgreSQL 5433, MongoDB 27018.
+  Requests larger than --max-request-bytes (default 64 MiB) close the connection.
   A port of 'off' disables that listener. There is no authentication:
   only use --host 0.0.0.0 on a network you trust.
 ";
@@ -106,6 +108,7 @@ fn main() {
 
     if first == Some("serve") {
         let mut cfg = Config::default();
+        let mut limits = server::Limits::default();
         let mut dir = None;
         let mut memory = false;
         let mut it = args[1..].iter();
@@ -125,13 +128,23 @@ fn main() {
                 "--redis-port" => cfg.redis = port(value("--redis-port")),
                 "--pg-port" => cfg.postgres = port(value("--pg-port")),
                 "--mongo-port" => cfg.mongo = port(value("--mongo-port")),
+                "--max-request-bytes" => {
+                    let v = value("--max-request-bytes");
+                    limits.max_request_bytes =
+                        v.parse().ok().filter(|n| *n >= 1024).unwrap_or_else(|| die(&format!("'{v}' is not a byte count >= 1024")));
+                }
+                "--max-connections" => {
+                    let v = value("--max-connections");
+                    limits.max_connections =
+                        v.parse().ok().filter(|n| *n >= 1).unwrap_or_else(|| die(&format!("'{v}' is not a positive number")));
+                }
                 other if other.starts_with("--") => die(&format!("unknown option {other}; see polydb --help")),
                 other => dir = Some(other.to_string()),
             }
         }
         let db = open(dir.as_deref(), memory);
         println!("polydb {} serving {}", env!("CARGO_PKG_VERSION"), if memory { "an in-memory database".into() } else { format!("'{}'", dir.as_deref().unwrap_or("polydb-data")) });
-        if let Err(e) = server::serve(&db, &cfg) {
+        if let Err(e) = server::serve_with_limits(&db, &cfg, limits) {
             die(&format!("{e}"));
         }
         return;

@@ -11,6 +11,7 @@
 
 use crate::error::Error;
 use crate::value::Value;
+use crate::server::Limits;
 use crate::{Database, Output};
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
@@ -199,7 +200,7 @@ fn run_statement(db: &mut Database, stmt: &str, out: &mut Vec<u8>) -> bool {
     }
 }
 
-fn session(s: &mut TcpStream, db: &mut Database) -> io::Result<()> {
+fn session(s: &mut TcpStream, db: &mut Database, limits: &Limits) -> io::Result<()> {
     // Startup: the client may first probe for TLS / GSS encryption, which we decline.
     loop {
         let mut len = [0u8; 4];
@@ -245,7 +246,10 @@ fn session(s: &mut TcpStream, db: &mut Database) -> io::Result<()> {
             return Ok(());
         }
         let len = i32::from_be_bytes([hdr[1], hdr[2], hdr[3], hdr[4]]) as usize;
-        if !(4..=256 << 20).contains(&len) {
+        if !(4..=limits.max_request_bytes.saturating_add(4)).contains(&len) {
+            let mut out = Vec::new();
+            error(&mut out, "54000", "message exceeds the request size limit");
+            let _ = s.write_all(&out);
             return Ok(());
         }
         let mut body = vec![0u8; len - 4];
@@ -287,6 +291,10 @@ fn session(s: &mut TcpStream, db: &mut Database) -> io::Result<()> {
     }
 }
 
-pub fn handle(mut stream: TcpStream, mut db: Database) {
-    let _ = session(&mut stream, &mut db);
+pub fn handle(stream: TcpStream, db: Database) {
+    handle_with(stream, db, &Limits::default())
+}
+
+pub fn handle_with(mut stream: TcpStream, mut db: Database, limits: &Limits) {
+    let _ = session(&mut stream, &mut db, limits);
 }

@@ -373,11 +373,11 @@ fn garbage_log_file_opens_as_empty_database() {
     fs::remove_dir_all(&dir).unwrap();
 }
 
-/// Documents a known limit rather than a guarantee: recovery stops at the
-/// first record that fails its checksum, so damage in the *middle* of the log
-/// also drops every commit after it. Earlier commits must survive intact.
+/// Damage in the *middle* of the log is not a torn tail: opening refuses
+/// with a Corrupt error instead of silently dropping every later commit.
+/// Opening with `salvage` keeps everything before the damage intact.
 #[test]
-fn damage_in_the_middle_of_the_log_keeps_everything_before_it() {
+fn damage_in_the_middle_of_the_log_is_reported_and_can_be_salvaged() {
     let dir = tmp("mid-wal");
     let first_commit_len;
     {
@@ -391,11 +391,101 @@ fn damage_in_the_middle_of_the_log_keeps_everything_before_it() {
     let mut bytes = fs::read(&wal).unwrap();
     bytes[first_commit_len + 9] ^= 0xff; // inside the second record's payload
     fs::write(&wal, &bytes).unwrap();
-    let mut db = Database::open(&dir).unwrap();
+    match Database::open(&dir) {
+        Err(Error::Corrupt(msg)) => assert!(msg.contains("checksum"), "{msg}"),
+        Err(other) => panic!("expected Corrupt, got {other:?}"),
+        Ok(_) => panic!("interior corruption was silently treated as the end of the log"),
+    }
+    let opts = polydb::storage::OpenOptions { salvage: true };
+    let mut db = Database::open_with(&dir, &opts).unwrap();
     assert_eq!(db.execute("GET first").unwrap(), Output::Scalar(t("1")));
     assert_eq!(db.execute("GET second").unwrap(), Output::Scalar(Value::Null));
     assert_eq!(db.execute("GET third").unwrap(), Output::Scalar(Value::Null));
+    assert!(dir.join("data.wal.corrupt").exists(), "salvage keeps a copy of the damaged log");
+    drop(db);
     fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn torn_final_record_is_dropped_and_earlier_commits_survive() {
+    let dir = tmp("torn-wal");
+    {
+        let mut db = Database::open(&dir).unwrap();
+        db.execute("SET a 1").unwrap();
+        db.execute("SET b 2").unwrap();
+    }
+    let wal = dir.join("data.wal");
+    let bytes = fs::read(&wal).unwrap();
+    // cut the last record in half, as a crash during its write would
+    fs::write(&wal, &bytes[..bytes.len() - 5]).unwrap();
+    let mut db = Database::open(&dir).unwrap();
+    assert_eq!(db.execute("GET a").unwrap(), Output::Scalar(t("1")));
+    assert_eq!(db.execute("GET b").unwrap(), Output::Scalar(Value::Null));
+    drop(db);
+    // a damaged (bit-flipped) final record is also a torn tail
+    let mut db = Database::open(&dir).unwrap();
+    db.execute("SET c 3").unwrap();
+    drop(db);
+    let mut bytes = fs::read(&wal).unwrap();
+    let n = bytes.len();
+    bytes[n - 1] ^= 0xff;
+    fs::write(&wal, &bytes).unwrap();
+    let mut db = Database::open(&dir).unwrap();
+    assert_eq!(db.execute("GET a").unwrap(), Output::Scalar(t("1")));
+    assert_eq!(db.execute("GET c").unwrap(), Output::Scalar(Value::Null));
+    drop(db);
+    // a zero-filled tail (file extended but data never written)
+    let mut bytes = fs::read(&wal).unwrap();
+    bytes.extend_from_slice(&[0u8; 64]);
+    fs::write(&wal, &bytes).unwrap();
+    let mut db = Database::open(&dir).unwrap();
+    assert_eq!(db.execute("GET a").unwrap(), Output::Scalar(t("1")));
+    drop(db);
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_database_directory_cannot_be_opened_twice() {
+    let dir = tmp("lock");
+    let db = Database::open(&dir).unwrap();
+    match Database::open(&dir) {
+        Err(Error::Io(e)) => assert!(e.to_string().contains("locked"), "{e}"),
+        Err(other) => panic!("expected a lock error, got {other:?}"),
+        Ok(_) => panic!("two handles opened the same directory"),
+    }
+    // the lock is also held against another process
+    let (code, _, err) = run_cli(&[dir.to_str().unwrap()], "SET k v\n");
+    assert_ne!(code, Some(0), "second process should not open a locked directory");
+    assert!(err.contains("locked"), "{err}");
+    drop(db);
+    Database::open(&dir).expect("lock is released when the database is dropped");
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn oversized_native_request_is_refused_not_executed() {
+    let db = Database::in_memory();
+    let cfg = Config { host: "127.0.0.1".into(), native: Some(0), redis: Some(0), postgres: None, mongo: None };
+    let limits = server::Limits { max_request_bytes: 4096, ..Default::default() };
+    let r = server::start_with_limits(&db, &cfg, limits).unwrap();
+    let mut s = TcpStream::connect(r.native.unwrap()).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let big = format!("SET big {}\n", "x".repeat(10_000));
+    let _ = s.write_all(big.as_bytes());
+    let mut reply = String::new();
+    let _ = BufReader::new(&s).read_line(&mut reply);
+    assert!(reply.contains("limit"), "{reply}");
+    let mut db2 = db.session();
+    assert_eq!(db2.execute("GET big").unwrap(), Output::Scalar(Value::Null), "truncated command must not run");
+    // RESP bulk string over the limit closes the connection without allocating it
+    let mut s = TcpStream::connect(r.redis.unwrap()).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let _ = s.write_all(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$999999999\r\n");
+    let mut buf = [0u8; 16];
+    let n = s.read(&mut buf).unwrap_or(0);
+    assert_eq!(n, 0, "server should close the connection");
+    // the server is still alive
+    assert_eq!(ask(r.native.unwrap(), "SET ok 1").get("ok"), Some(&Value::Bool(true)));
 }
 
 // ------------------------------------------------------------------ network

@@ -8,7 +8,7 @@
 use crate::error::{Error, Result};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, OpenOptions as OpenOptions_};
 use std::io::{Read, Write};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
@@ -97,22 +97,49 @@ fn decode_payload(p: &[u8]) -> Option<Vec<(Vec<u8>, Option<Vec<u8>>)>> {
     (pos == p.len()).then_some(ops)
 }
 
-/// Apply every intact record in `buf`; return how many bytes were valid.
-fn replay(buf: &[u8], map: &mut BTreeMap<Vec<u8>, Vec<u8>>) -> usize {
+/// How a log ends after its last intact record.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LogTail {
+    /// Every byte belonged to an intact record.
+    Clean,
+    /// The final record is incomplete or damaged: a commit that was being
+    /// written when the process died. It was never acknowledged, so it is dropped.
+    Torn { valid: usize },
+    /// A damaged record is followed by more data. This is not a crash
+    /// artefact (commits are appended one at a time), so the log is corrupt.
+    Corrupt { valid: usize, reason: String },
+}
+
+/// Apply every intact record in `buf` and classify how the log ends.
+fn replay(buf: &[u8], map: &mut BTreeMap<Vec<u8>, Vec<u8>>) -> LogTail {
     let mut pos = 0;
     loop {
-        let mut p = pos;
-        let (Some(len), Some(crc)) = (read_u32(buf, &mut p), read_u32(buf, &mut p)) else {
-            break;
-        };
-        let Some(payload) = p.checked_add(len as usize).and_then(|end| buf.get(p..end)) else {
-            break;
-        };
-        if crc32(payload) != crc {
-            break;
+        if pos == buf.len() {
+            return LogTail::Clean;
         }
-        let Some(ops) = decode_payload(payload) else {
-            break;
+        let rest = &buf[pos..];
+        if rest.len() < 8 || rest.iter().all(|b| *b == 0) {
+            // A short header, or a zero-filled tail left by a crash mid-extend.
+            return LogTail::Torn { valid: pos };
+        }
+        let mut p = pos;
+        let len = read_u32(buf, &mut p).unwrap_or(0) as usize;
+        let crc = read_u32(buf, &mut p).unwrap_or(0);
+        let Some(end) = p.checked_add(len).filter(|e| *e <= buf.len()) else {
+            // The record claims to extend past the end of the file: torn write.
+            return LogTail::Torn { valid: pos };
+        };
+        let payload = &buf[p..end];
+        let ops = if crc32(payload) == crc { decode_payload(payload) } else { None };
+        let Some(ops) = ops else {
+            if end == buf.len() {
+                return LogTail::Torn { valid: pos };
+            }
+            let why = if crc32(payload) != crc { "checksum mismatch" } else { "invalid record framing" };
+            return LogTail::Corrupt {
+                valid: pos,
+                reason: format!("{why} in the record at byte {pos}, with {} more byte(s) after it", buf.len() - end),
+            };
         };
         for (k, v) in ops {
             match v {
@@ -124,13 +151,26 @@ fn replay(buf: &[u8], map: &mut BTreeMap<Vec<u8>, Vec<u8>>) -> usize {
                 }
             }
         }
-        pos = p + len as usize;
+        pos = end;
     }
-    pos
 }
+
+/// How to open a store directory.
+#[derive(Debug, Clone, Default)]
+pub struct OpenOptions {
+    /// Open a log with interior corruption anyway, keeping only the commits
+    /// before the damage (the damaged file is first copied to `data.wal.corrupt`).
+    /// Off by default: corruption is reported as [`Error::Corrupt`].
+    pub salvage: bool,
+}
+
+const LOCK_FILE: &str = "LOCK";
 
 pub struct Store {
     map: BTreeMap<Vec<u8>, Vec<u8>>,
+    /// Held for the lifetime of the store: an exclusive OS lock on `dir/LOCK`
+    /// so two processes can never write the same database directory.
+    _lock: Option<File>,
     dir: Option<PathBuf>,
     wal: Option<File>,
     wal_len: u64,
@@ -144,34 +184,71 @@ pub struct Store {
 impl Store {
     /// A volatile store with no files behind it.
     pub fn memory() -> Store {
-        Store { map: BTreeMap::new(), dir: None, wal: None, wal_len: 0, sync: true, checkpoint_bytes: 64 << 20 }
+        Store { map: BTreeMap::new(), _lock: None, dir: None, wal: None, wal_len: 0, sync: true, checkpoint_bytes: 64 << 20 }
     }
 
     /// Open (or create) a store in `dir`, recovering from the snapshot and WAL.
     pub fn open(dir: impl AsRef<Path>) -> Result<Store> {
+        Store::open_with(dir, &OpenOptions::default())
+    }
+
+    pub fn open_with(dir: impl AsRef<Path>, opts: &OpenOptions) -> Result<Store> {
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir)?;
+        let lock = OpenOptions_::new().read(true).write(true).create(true).truncate(false).open(dir.join(LOCK_FILE))?;
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(fs::TryLockError::WouldBlock) => {
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    format!("database directory {} is locked by another process", dir.display()),
+                )))
+            }
+            Err(fs::TryLockError::Error(e)) => return Err(e.into()),
+        }
         let mut map = BTreeMap::new();
 
         let snap = dir.join(SNAPSHOT_FILE);
         if snap.exists() {
             let buf = fs::read(&snap)?;
-            if replay(&buf, &mut map) != buf.len() {
+            if replay(&buf, &mut map) != LogTail::Clean {
                 return Err(Error::Corrupt(format!("snapshot {} failed its checksum", snap.display())));
             }
         }
 
-        let mut wal = OpenOptions::new().read(true).append(true).create(true).open(dir.join(WAL_FILE))?;
+        let wal_path = dir.join(WAL_FILE);
+        let mut wal = OpenOptions_::new().read(true).append(true).create(true).open(&wal_path)?;
         let mut buf = Vec::new();
         wal.read_to_end(&mut buf)?;
-        let valid = replay(&buf, &mut map) as u64;
-        if valid < buf.len() as u64 {
+        let valid = match replay(&buf, &mut map) {
+            LogTail::Clean => buf.len(),
             // A torn final record from a crash mid-commit: that commit never
-            // completed, so drop it.
+            // completed (or was never acknowledged), so drop it.
+            LogTail::Torn { valid } => valid,
+            LogTail::Corrupt { valid, reason } => {
+                if !opts.salvage {
+                    return Err(Error::Corrupt(format!(
+                        "write-ahead log {}: {reason}; refusing to open (open with salvage to keep the {valid} intact byte(s) before it)",
+                        wal_path.display()
+                    )));
+                }
+                fs::write(dir.join(format!("{WAL_FILE}.corrupt")), &buf)?;
+                valid
+            }
+        } as u64;
+        if valid < buf.len() as u64 {
             wal.set_len(valid)?;
             wal.sync_all()?;
         }
-        Ok(Store { map, dir: Some(dir), wal: Some(wal), wal_len: valid, sync: true, checkpoint_bytes: 64 << 20 })
+        Ok(Store {
+            map,
+            _lock: Some(lock),
+            dir: Some(dir),
+            wal: Some(wal),
+            wal_len: valid,
+            sync: true,
+            checkpoint_bytes: 64 << 20,
+        })
     }
 
     pub fn get(&self, key: &[u8]) -> Option<&Vec<u8>> {
@@ -182,6 +259,11 @@ impl Store {
         self.map
             .range::<[u8], _>((Bound::Included(prefix), Bound::Unbounded))
             .take_while(move |(k, _)| k.starts_with(prefix))
+    }
+
+    /// Committed entries with keys in `[lo, hi)` style bounds, in key order.
+    pub fn range<'a>(&'a self, lo: Bound<&'a [u8]>, hi: Bound<&'a [u8]>) -> impl Iterator<Item = (&'a Vec<u8>, &'a Vec<u8>)> + 'a {
+        self.map.range::<[u8], _>((lo, hi))
     }
 
     pub fn len(&self) -> usize {
@@ -264,11 +346,28 @@ impl Store {
 pub struct ReadSet {
     keys: BTreeSet<Vec<u8>>,
     prefixes: Vec<Vec<u8>>,
+    ranges: Vec<(Bound<Vec<u8>>, Bound<Vec<u8>>)>,
+}
+
+fn in_range(key: &[u8], lo: &Bound<Vec<u8>>, hi: &Bound<Vec<u8>>) -> bool {
+    let above = match lo {
+        Bound::Included(l) => key >= l.as_slice(),
+        Bound::Excluded(l) => key > l.as_slice(),
+        Bound::Unbounded => true,
+    };
+    let below = match hi {
+        Bound::Included(h) => key <= h.as_slice(),
+        Bound::Excluded(h) => key < h.as_slice(),
+        Bound::Unbounded => true,
+    };
+    above && below
 }
 
 impl ReadSet {
     pub fn touches(&self, key: &[u8]) -> bool {
-        self.keys.contains(key) || self.prefixes.iter().any(|p| key.starts_with(p))
+        self.keys.contains(key)
+            || self.prefixes.iter().any(|p| key.starts_with(p))
+            || self.ranges.iter().any(|(lo, hi)| in_range(key, lo, hi))
     }
 }
 
@@ -314,6 +413,28 @@ impl<'a> Ctx<'a> {
             if !k.starts_with(prefix) {
                 break;
             }
+            match v {
+                Some(v) => {
+                    out.insert(k.clone(), v.clone());
+                }
+                None => {
+                    out.remove(k);
+                }
+            }
+        }
+        out.into_iter().collect()
+    }
+
+    /// All live entries with keys inside the bounds, in key order. Inside a
+    /// transaction the whole range is recorded, so a concurrent insert into
+    /// it (a phantom) makes the commit fail.
+    pub fn range(&self, lo: Bound<&[u8]>, hi: Bound<&[u8]>) -> Vec<(Vec<u8>, Vec<u8>)> {
+        if let Some(r) = &self.reads {
+            r.borrow_mut().ranges.push((lo.map(<[u8]>::to_vec), hi.map(<[u8]>::to_vec)));
+        }
+        let mut out: BTreeMap<Vec<u8>, Vec<u8>> =
+            self.store.range(lo, hi).map(|(k, v)| (k.clone(), v.clone())).collect();
+        for (k, v) in self.writes.range::<[u8], _>((lo, hi)) {
             match v {
                 Some(v) => {
                     out.insert(k.clone(), v.clone());
