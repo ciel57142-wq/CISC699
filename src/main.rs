@@ -121,28 +121,85 @@ fn incomplete(buf: &str) -> bool {
     if t.ends_with(';') {
         return false;
     }
-    let last = t.rsplit(|c: char| c.is_whitespace()).next().unwrap_or("").to_ascii_lowercase();
+    let last = t
+        .rsplit(|c: char| c.is_whitespace())
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
     matches!(
         last.as_str(),
-        "select" | "from" | "where" | "and" | "or" | "not" | "join" | "on" | "by" | "set" | "values" | "into" | "as"
-            | "union" | "all" | "having" | "left" | "inner" | "cross" | "explain" | "analyze" | "then" | "else" | "when"
-            | "case" | "in" | "like" | "between" | "," | "=" | "+" | "-" | "*" | "/" | "||" | "<" | ">" | "<=" | ">="
-            | "<>" | "!="
+        "select"
+            | "from"
+            | "where"
+            | "and"
+            | "or"
+            | "not"
+            | "join"
+            | "on"
+            | "by"
+            | "set"
+            | "values"
+            | "into"
+            | "as"
+            | "union"
+            | "all"
+            | "having"
+            | "left"
+            | "inner"
+            | "cross"
+            | "explain"
+            | "analyze"
+            | "then"
+            | "else"
+            | "when"
+            | "case"
+            | "in"
+            | "like"
+            | "between"
+            | ","
+            | "="
+            | "+"
+            | "-"
+            | "*"
+            | "/"
+            | "||"
+            | "<"
+            | ">"
+            | "<="
+            | ">="
+            | "<>"
+            | "!="
     ) || last.ends_with(',')
 }
 
-const SQL_WORDS: &[&str] =
-    &["select", "insert", "update", "delete", "create", "drop", "alter", "explain", "with", "increment"];
+const SQL_WORDS: &[&str] = &[
+    "select",
+    "insert",
+    "update",
+    "delete",
+    "create",
+    "drop",
+    "alter",
+    "explain",
+    "with",
+    "increment",
+];
 
 /// Read commands from stdin, hand each to `run`, print what comes back.
 ///
 /// Interactively, SQL/PBSQL statements end with `;` and may span lines;
 /// other commands end at the end of the line. In piped input every line is
 /// a command unless it is visibly incomplete (see [`incomplete`]).
-fn repl(prompt: &mut dyn FnMut() -> &'static str, run: &mut dyn FnMut(&str) -> Result<String, String>) {
+fn repl(
+    prompt: &mut dyn FnMut() -> &'static str,
+    run: &mut dyn FnMut(&str) -> Result<String, String>,
+) {
     let interactive = io::stdin().is_terminal();
     if interactive {
-        println!("polydb {} - type .help for commands, .exit to quit", env!("CARGO_PKG_VERSION"));
+        println!(
+            "polydb {} - type .help for commands, .exit to quit",
+            env!("CARGO_PKG_VERSION")
+        );
     }
     let stdin = io::stdin();
     let mut line = String::new();
@@ -162,7 +219,9 @@ fn repl(prompt: &mut dyn FnMut() -> &'static str, run: &mut dyn FnMut(&str) -> R
         if buf.is_empty() && (piece.is_empty() || piece.starts_with("--")) {
             continue;
         }
-        if buf.is_empty() && piece.starts_with('.') || buf.is_empty() && matches!(piece, "exit" | "quit" | "help") {
+        if buf.is_empty() && piece.starts_with('.')
+            || buf.is_empty() && matches!(piece, "exit" | "quit" | "help")
+        {
             match piece {
                 ".exit" | ".quit" | "exit" | "quit" => break,
                 ".help" | "help" => print!("{HELP}"),
@@ -176,9 +235,15 @@ fn repl(prompt: &mut dyn FnMut() -> &'static str, run: &mut dyn FnMut(&str) -> R
             buf.push('\n');
         }
         buf.push_str(piece.strip_suffix('\\').unwrap_or(piece));
-        let first = buf.split(|c: char| !c.is_alphanumeric()).next().unwrap_or("").to_ascii_lowercase();
+        let first = buf
+            .split(|c: char| !c.is_alphanumeric())
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
         let needs_semicolon = interactive && SQL_WORDS.contains(&first.as_str());
-        let done = !incomplete(&buf) && !piece.ends_with('\\') && (!needs_semicolon || buf.trim_end().ends_with(';'));
+        let done = !incomplete(&buf)
+            && !piece.ends_with('\\')
+            && (!needs_semicolon || buf.trim_end().ends_with(';'));
         if !done {
             continue;
         }
@@ -215,12 +280,19 @@ fn main() {
         let mut memory = false;
         let mut it = args[1..].iter();
         while let Some(a) = it.next() {
-            let mut value = |name: &str| it.next().cloned().unwrap_or_else(|| die(&format!("{name} needs a value")));
+            let mut value = |name: &str| {
+                it.next()
+                    .cloned()
+                    .unwrap_or_else(|| die(&format!("{name} needs a value")))
+            };
             let port = |v: String| -> Option<u16> {
                 if v == "off" {
                     None
                 } else {
-                    Some(v.parse().unwrap_or_else(|_| die(&format!("'{v}' is not a port number"))))
+                    Some(
+                        v.parse()
+                            .unwrap_or_else(|_| die(&format!("'{v}' is not a port number"))),
+                    )
                 }
             };
             match a.as_str() {
@@ -232,21 +304,37 @@ fn main() {
                 "--mongo-port" => cfg.mongo = port(value("--mongo-port")),
                 "--max-request-bytes" => {
                     let v = value("--max-request-bytes");
-                    limits.max_request_bytes =
-                        v.parse().ok().filter(|n| *n >= 1024).unwrap_or_else(|| die(&format!("'{v}' is not a byte count >= 1024")));
+                    limits.max_request_bytes = v
+                        .parse()
+                        .ok()
+                        .filter(|n| *n >= 1024)
+                        .unwrap_or_else(|| die(&format!("'{v}' is not a byte count >= 1024")));
                 }
                 "--mongo-default-db" => limits.mongo_default_db = value("--mongo-default-db"),
                 "--max-connections" => {
                     let v = value("--max-connections");
-                    limits.max_connections =
-                        v.parse().ok().filter(|n| *n >= 1).unwrap_or_else(|| die(&format!("'{v}' is not a positive number")));
+                    limits.max_connections = v
+                        .parse()
+                        .ok()
+                        .filter(|n| *n >= 1)
+                        .unwrap_or_else(|| die(&format!("'{v}' is not a positive number")));
                 }
-                other if other.starts_with("--") => die(&format!("unknown option {other}; see polydb --help")),
+                other if other.starts_with("--") => {
+                    die(&format!("unknown option {other}; see polydb --help"))
+                }
                 other => dir = Some(other.to_string()),
             }
         }
         let db = open(dir.as_deref(), memory);
-        println!("polydb {} serving {}", env!("CARGO_PKG_VERSION"), if memory { "an in-memory database".into() } else { format!("'{}'", dir.as_deref().unwrap_or("polydb-data")) });
+        println!(
+            "polydb {} serving {}",
+            env!("CARGO_PKG_VERSION"),
+            if memory {
+                "an in-memory database".into()
+            } else {
+                format!("'{}'", dir.as_deref().unwrap_or("polydb-data"))
+            }
+        );
         if let Err(e) = server::serve_with_limits(&db, &cfg, limits) {
             die(&format!("{e}"));
         }
@@ -255,11 +343,14 @@ fn main() {
 
     if first == Some("client") {
         let addr = args.get(1).map(String::as_str).unwrap_or("127.0.0.1:7878");
-        let stream = TcpStream::connect(addr).unwrap_or_else(|e| die(&format!("cannot connect to {addr}: {e}")));
+        let stream = TcpStream::connect(addr)
+            .unwrap_or_else(|e| die(&format!("cannot connect to {addr}: {e}")));
         let mut writer = stream.try_clone().unwrap_or_else(|e| die(&format!("{e}")));
         let mut reader = BufReader::new(stream);
         repl(&mut || "polydb> ", &mut |cmd| {
-            writer.write_all(format!("{cmd}\n").as_bytes()).map_err(|e| e.to_string())?;
+            writer
+                .write_all(format!("{cmd}\n").as_bytes())
+                .map_err(|e| e.to_string())?;
             let mut reply = String::new();
             match reader.read_line(&mut reply) {
                 Ok(0) => Err("server closed the connection".into()),
@@ -270,10 +361,25 @@ fn main() {
         return;
     }
 
-    let db = std::cell::RefCell::new(open(first.filter(|a| *a != "--memory"), first == Some("--memory")));
-    repl(&mut || if db.borrow().in_transaction() { "polydb*> " } else { "polydb> " }, &mut |cmd| {
-        db.borrow_mut().execute(cmd).map(|o| o.to_string()).map_err(|e| e.to_string())
-    });
+    let db = std::cell::RefCell::new(open(
+        first.filter(|a| *a != "--memory"),
+        first == Some("--memory"),
+    ));
+    repl(
+        &mut || {
+            if db.borrow().in_transaction() {
+                "polydb*> "
+            } else {
+                "polydb> "
+            }
+        },
+        &mut |cmd| {
+            db.borrow_mut()
+                .execute(cmd)
+                .map(|o| o.to_string())
+                .map_err(|e| e.to_string())
+        },
+    );
     if db.borrow().in_transaction() {
         eprintln!("warning: open transaction rolled back at exit");
     }

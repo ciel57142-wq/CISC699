@@ -10,7 +10,12 @@ fn run(stdin: &str) -> String {
         .stdout(Stdio::piped())
         .spawn()
         .expect("spawn polydb");
-    child.stdin.take().unwrap().write_all(stdin.as_bytes()).unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin.as_bytes())
+        .unwrap();
     let out = child.wait_with_output().unwrap();
     assert!(out.status.success());
     String::from_utf8_lossy(&out.stdout).into_owned()

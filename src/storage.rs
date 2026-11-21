@@ -27,7 +27,11 @@ const fn make_crc_table() -> [u32; 256] {
         let mut c = i as u32;
         let mut k = 0;
         while k < 8 {
-            c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+            c = if c & 1 != 0 {
+                0xEDB8_8320 ^ (c >> 1)
+            } else {
+                c >> 1
+            };
             k += 1;
         }
         t[i] = c;
@@ -130,15 +134,26 @@ fn replay(buf: &[u8], map: &mut BTreeMap<Vec<u8>, Vec<u8>>) -> LogTail {
             return LogTail::Torn { valid: pos };
         };
         let payload = &buf[p..end];
-        let ops = if crc32(payload) == crc { decode_payload(payload) } else { None };
+        let ops = if crc32(payload) == crc {
+            decode_payload(payload)
+        } else {
+            None
+        };
         let Some(ops) = ops else {
             if end == buf.len() {
                 return LogTail::Torn { valid: pos };
             }
-            let why = if crc32(payload) != crc { "checksum mismatch" } else { "invalid record framing" };
+            let why = if crc32(payload) != crc {
+                "checksum mismatch"
+            } else {
+                "invalid record framing"
+            };
             return LogTail::Corrupt {
                 valid: pos,
-                reason: format!("{why} in the record at byte {pos}, with {} more byte(s) after it", buf.len() - end),
+                reason: format!(
+                    "{why} in the record at byte {pos}, with {} more byte(s) after it",
+                    buf.len() - end
+                ),
             };
         };
         for (k, v) in ops {
@@ -184,7 +199,15 @@ pub struct Store {
 impl Store {
     /// A volatile store with no files behind it.
     pub fn memory() -> Store {
-        Store { map: BTreeMap::new(), _lock: None, dir: None, wal: None, wal_len: 0, sync: true, checkpoint_bytes: 64 << 20 }
+        Store {
+            map: BTreeMap::new(),
+            _lock: None,
+            dir: None,
+            wal: None,
+            wal_len: 0,
+            sync: true,
+            checkpoint_bytes: 64 << 20,
+        }
     }
 
     /// Open (or create) a store in `dir`, recovering from the snapshot and WAL.
@@ -195,13 +218,21 @@ impl Store {
     pub fn open_with(dir: impl AsRef<Path>, opts: &OpenOptions) -> Result<Store> {
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir)?;
-        let lock = OpenOptions_::new().read(true).write(true).create(true).truncate(false).open(dir.join(LOCK_FILE))?;
+        let lock = OpenOptions_::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join(LOCK_FILE))?;
         match lock.try_lock() {
             Ok(()) => {}
             Err(fs::TryLockError::WouldBlock) => {
                 return Err(Error::Io(std::io::Error::new(
                     std::io::ErrorKind::WouldBlock,
-                    format!("database directory {} is locked by another process", dir.display()),
+                    format!(
+                        "database directory {} is locked by another process",
+                        dir.display()
+                    ),
                 )))
             }
             Err(fs::TryLockError::Error(e)) => return Err(e.into()),
@@ -212,12 +243,19 @@ impl Store {
         if snap.exists() {
             let buf = fs::read(&snap)?;
             if replay(&buf, &mut map) != LogTail::Clean {
-                return Err(Error::Corrupt(format!("snapshot {} failed its checksum", snap.display())));
+                return Err(Error::Corrupt(format!(
+                    "snapshot {} failed its checksum",
+                    snap.display()
+                )));
             }
         }
 
         let wal_path = dir.join(WAL_FILE);
-        let mut wal = OpenOptions_::new().read(true).append(true).create(true).open(&wal_path)?;
+        let mut wal = OpenOptions_::new()
+            .read(true)
+            .append(true)
+            .create(true)
+            .open(&wal_path)?;
         let mut buf = Vec::new();
         wal.read_to_end(&mut buf)?;
         let valid = match replay(&buf, &mut map) {
@@ -255,14 +293,21 @@ impl Store {
         self.map.get(key)
     }
 
-    pub fn scan<'a>(&'a self, prefix: &'a [u8]) -> impl Iterator<Item = (&'a Vec<u8>, &'a Vec<u8>)> + 'a {
+    pub fn scan<'a>(
+        &'a self,
+        prefix: &'a [u8],
+    ) -> impl Iterator<Item = (&'a Vec<u8>, &'a Vec<u8>)> + 'a {
         self.map
             .range::<[u8], _>((Bound::Included(prefix), Bound::Unbounded))
             .take_while(move |(k, _)| k.starts_with(prefix))
     }
 
     /// Committed entries with keys in `[lo, hi)` style bounds, in key order.
-    pub fn range<'a>(&'a self, lo: Bound<&'a [u8]>, hi: Bound<&'a [u8]>) -> impl Iterator<Item = (&'a Vec<u8>, &'a Vec<u8>)> + 'a {
+    pub fn range<'a>(
+        &'a self,
+        lo: Bound<&'a [u8]>,
+        hi: Bound<&'a [u8]>,
+    ) -> impl Iterator<Item = (&'a Vec<u8>, &'a Vec<u8>)> + 'a {
         self.map.range::<[u8], _>((lo, hi))
     }
 
@@ -281,7 +326,9 @@ impl Store {
         }
         if let Some(wal) = self.wal.as_mut() {
             let rec = frame(ws.iter().map(|(k, v)| (k.as_slice(), v.as_deref())));
-            let res = wal.write_all(&rec).and_then(|_| if self.sync { wal.sync_data() } else { Ok(()) });
+            let res =
+                wal.write_all(&rec)
+                    .and_then(|_| if self.sync { wal.sync_data() } else { Ok(()) });
             if let Err(e) = res {
                 // Roll the log back so a half-written record cannot sit in front of later commits.
                 let _ = wal.set_len(self.wal_len);
@@ -407,9 +454,15 @@ impl<'a> Ctx<'a> {
                 r.prefixes.push(prefix.to_vec());
             }
         }
-        let mut out: BTreeMap<Vec<u8>, Vec<u8>> =
-            self.store.scan(prefix).map(|(k, v)| (k.clone(), v.clone())).collect();
-        for (k, v) in self.writes.range::<[u8], _>((Bound::Included(prefix), Bound::Unbounded)) {
+        let mut out: BTreeMap<Vec<u8>, Vec<u8>> = self
+            .store
+            .scan(prefix)
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        for (k, v) in self
+            .writes
+            .range::<[u8], _>((Bound::Included(prefix), Bound::Unbounded))
+        {
             if !k.starts_with(prefix) {
                 break;
             }
@@ -430,10 +483,15 @@ impl<'a> Ctx<'a> {
     /// it (a phantom) makes the commit fail.
     pub fn range(&self, lo: Bound<&[u8]>, hi: Bound<&[u8]>) -> Vec<(Vec<u8>, Vec<u8>)> {
         if let Some(r) = &self.reads {
-            r.borrow_mut().ranges.push((lo.map(<[u8]>::to_vec), hi.map(<[u8]>::to_vec)));
+            r.borrow_mut()
+                .ranges
+                .push((lo.map(<[u8]>::to_vec), hi.map(<[u8]>::to_vec)));
         }
-        let mut out: BTreeMap<Vec<u8>, Vec<u8>> =
-            self.store.range(lo, hi).map(|(k, v)| (k.clone(), v.clone())).collect();
+        let mut out: BTreeMap<Vec<u8>, Vec<u8>> = self
+            .store
+            .range(lo, hi)
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
         for (k, v) in self.writes.range::<[u8], _>((lo, hi)) {
             match v {
                 Some(v) => {

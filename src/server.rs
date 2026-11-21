@@ -34,7 +34,13 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Config { host: "127.0.0.1".into(), native: Some(7878), redis: Some(6380), postgres: Some(5433), mongo: Some(27018) }
+        Config {
+            host: "127.0.0.1".into(),
+            native: Some(7878),
+            redis: Some(6380),
+            postgres: Some(5433),
+            mongo: Some(27018),
+        }
     }
 }
 
@@ -56,7 +62,12 @@ pub struct Limits {
 
 impl Default for Limits {
     fn default() -> Self {
-        Limits { max_request_bytes: 64 << 20, max_args: 1 << 20, max_connections: 1024, mongo_default_db: "test".into() }
+        Limits {
+            max_request_bytes: 64 << 20,
+            max_args: 1 << 20,
+            max_connections: 1024,
+            mongo_default_db: "test".into(),
+        }
     }
 }
 
@@ -71,12 +82,22 @@ pub struct Running {
 
 type Handler = fn(TcpStream, Database, &Limits);
 
-fn listen(db: &Database, host: &str, port: Option<u16>, limits: Limits, handler: Handler) -> Result<Option<SocketAddr>> {
+fn listen(
+    db: &Database,
+    host: &str,
+    port: Option<u16>,
+    limits: Limits,
+    handler: Handler,
+) -> Result<Option<SocketAddr>> {
     let Some(port) = port else {
         return Ok(None);
     };
-    let listener = TcpListener::bind((host, port))
-        .map_err(|e| Error::Io(std::io::Error::new(e.kind(), format!("cannot listen on {host}:{port}: {e}"))))?;
+    let listener = TcpListener::bind((host, port)).map_err(|e| {
+        Error::Io(std::io::Error::new(
+            e.kind(),
+            format!("cannot listen on {host}:{port}: {e}"),
+        ))
+    })?;
     let addr = listener.local_addr()?;
     let db = db.session();
     let open = Arc::new(AtomicUsize::new(0));
@@ -109,8 +130,20 @@ pub fn start(db: &Database, cfg: &Config) -> Result<Running> {
 pub fn start_with_limits(db: &Database, cfg: &Config, limits: Limits) -> Result<Running> {
     Ok(Running {
         native: listen(db, &cfg.host, cfg.native, limits.clone(), handle_native)?,
-        redis: listen(db, &cfg.host, cfg.redis, limits.clone(), crate::resp::handle_with)?,
-        postgres: listen(db, &cfg.host, cfg.postgres, limits.clone(), crate::pgwire::handle_with)?,
+        redis: listen(
+            db,
+            &cfg.host,
+            cfg.redis,
+            limits.clone(),
+            crate::resp::handle_with,
+        )?,
+        postgres: listen(
+            db,
+            &cfg.host,
+            cfg.postgres,
+            limits.clone(),
+            crate::pgwire::handle_with,
+        )?,
         mongo: listen(db, &cfg.host, cfg.mongo, limits, crate::mongo::handle_with)?,
     })
 }
@@ -122,7 +155,12 @@ pub fn serve(db: &Database, cfg: &Config) -> Result<()> {
 
 pub fn serve_with_limits(db: &Database, cfg: &Config, limits: Limits) -> Result<()> {
     let r = start_with_limits(db, cfg, limits)?;
-    for (name, addr) in [("native", r.native), ("redis", r.redis), ("postgres", r.postgres), ("mongodb", r.mongo)] {
+    for (name, addr) in [
+        ("native", r.native),
+        ("redis", r.redis),
+        ("postgres", r.postgres),
+        ("mongodb", r.mongo),
+    ] {
         if let Some(a) = addr {
             println!("{name:<9} listening on {a}");
         }
@@ -135,7 +173,12 @@ pub fn serve_with_limits(db: &Database, cfg: &Config, limits: Limits) -> Result<
 // ------------------------------------------------------------ native protocol
 
 fn obj(pairs: Vec<(&str, Value)>) -> Value {
-    Value::Object(pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect::<BTreeMap<_, _>>())
+    Value::Object(
+        pairs
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect::<BTreeMap<_, _>>(),
+    )
 }
 
 pub(crate) fn error_kind(e: &Error) -> &'static str {
@@ -154,15 +197,37 @@ pub(crate) fn error_kind(e: &Error) -> &'static str {
 /// Encode a command result as the native protocol's one-line JSON reply.
 pub fn result_to_json(res: &Result<Output>) -> String {
     let v = match res {
-        Err(e) => obj(vec![("ok", false.into()), ("kind", error_kind(e).into()), ("error", e.to_string().into())]),
-        Ok(Output::Done(m)) => obj(vec![("ok", true.into()), ("type", "done".into()), ("message", m.as_str().into())]),
-        Ok(Output::Scalar(v)) => obj(vec![("ok", true.into()), ("type", "value".into()), ("value", v.clone())]),
-        Ok(Output::Docs(d)) => obj(vec![("ok", true.into()), ("type", "docs".into()), ("docs", Value::Array(d.clone()))]),
+        Err(e) => obj(vec![
+            ("ok", false.into()),
+            ("kind", error_kind(e).into()),
+            ("error", e.to_string().into()),
+        ]),
+        Ok(Output::Done(m)) => obj(vec![
+            ("ok", true.into()),
+            ("type", "done".into()),
+            ("message", m.as_str().into()),
+        ]),
+        Ok(Output::Scalar(v)) => obj(vec![
+            ("ok", true.into()),
+            ("type", "value".into()),
+            ("value", v.clone()),
+        ]),
+        Ok(Output::Docs(d)) => obj(vec![
+            ("ok", true.into()),
+            ("type", "docs".into()),
+            ("docs", Value::Array(d.clone())),
+        ]),
         Ok(Output::Rows { columns, rows }) => obj(vec![
             ("ok", true.into()),
             ("type", "rows".into()),
-            ("columns", Value::Array(columns.iter().map(|c| c.as_str().into()).collect())),
-            ("rows", Value::Array(rows.iter().map(|r| Value::Array(r.clone())).collect())),
+            (
+                "columns",
+                Value::Array(columns.iter().map(|c| c.as_str().into()).collect()),
+            ),
+            (
+                "rows",
+                Value::Array(rows.iter().map(|r| Value::Array(r.clone())).collect()),
+            ),
         ]),
     };
     v.to_json()
@@ -172,14 +237,23 @@ pub fn result_to_json(res: &Result<Output>) -> String {
 pub fn result_from_json(line: &str) -> std::result::Result<Output, String> {
     let v = Value::parse(line).map_err(|e| format!("malformed reply: {e}"))?;
     if v.get("ok") != Some(&Value::Bool(true)) {
-        return Err(v.get("error").and_then(Value::as_str).unwrap_or("unknown error").to_string());
+        return Err(v
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown error")
+            .to_string());
     }
     let arr = |k: &str| match v.get(k) {
         Some(Value::Array(a)) => a.clone(),
         _ => Vec::new(),
     };
     Ok(match v.get("type").and_then(Value::as_str) {
-        Some("done") => Output::Done(v.get("message").and_then(Value::as_str).unwrap_or("").to_string()),
+        Some("done") => Output::Done(
+            v.get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        ),
         Some("value") => Output::Scalar(v.get("value").cloned().unwrap_or(Value::Null)),
         Some("docs") => Output::Docs(arr("docs")),
         Some("rows") => Output::Rows {
@@ -212,13 +286,19 @@ fn handle_native(stream: TcpStream, mut db: Database, limits: &Limits) {
         }
         if line.last() != Some(&b'\n') && line.len() as u64 >= cap {
             // Never execute the truncated front of an oversized command.
-            let e = Error::Parse(format!("request exceeds the {} byte limit; closing connection", limits.max_request_bytes));
+            let e = Error::Parse(format!(
+                "request exceeds the {} byte limit; closing connection",
+                limits.max_request_bytes
+            ));
             let _ = writer.write_all(format!("{}\n", result_to_json(&Err(e))).as_bytes());
             return;
         }
         let Ok(text) = std::str::from_utf8(&line) else {
             let e = Error::Parse("request is not valid UTF-8".into());
-            if writer.write_all(format!("{}\n", result_to_json(&Err(e))).as_bytes()).is_err() {
+            if writer
+                .write_all(format!("{}\n", result_to_json(&Err(e))).as_bytes())
+                .is_err()
+            {
                 return;
             }
             continue;

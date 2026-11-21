@@ -39,7 +39,9 @@ pub fn aggregate(ctx: &Ctx, coll: &str, pipeline: &[Value]) -> Result<Vec<Value>
             let mut limit_seen = false;
             while let Some((name, arg)) = stages.peek().and_then(|s| stage(s).ok()) {
                 match name {
-                    "$sort" if opts.sort.is_none() && opts.skip == 0 && !limit_seen => opts.sort = Some(arg.clone()),
+                    "$sort" if opts.sort.is_none() && opts.skip == 0 && !limit_seen => {
+                        opts.sort = Some(arg.clone())
+                    }
                     "$skip" if !limit_seen => opts.skip += count(arg)?,
                     "$limit" if !limit_seen => {
                         opts.limit = Some(count(arg)?);
@@ -72,18 +74,29 @@ fn stage(s: &Value) -> Result<(&str, &Value)> {
 fn count(v: &Value) -> Result<usize> {
     match v.as_f64() {
         Some(n) if n >= 0.0 && n.fract() == 0.0 => Ok(n as usize),
-        _ => Err(Error::Type(format!("expected a non-negative integer, got {}", v.to_json()))),
+        _ => Err(Error::Type(format!(
+            "expected a non-negative integer, got {}",
+            v.to_json()
+        ))),
     }
 }
 
 fn sort_docs(docs: &mut [Value], spec: &Value) -> Result<()> {
     let Value::Object(spec) = spec else {
-        return Err(Error::Type("$sort expects an object like {field: 1}".into()));
+        return Err(Error::Type(
+            "$sort expects an object like {field: 1}".into(),
+        ));
     };
-    let keys: Vec<(&String, bool)> = spec.iter().map(|(k, v)| (k, v.as_f64().is_some_and(|n| n < 0.0))).collect();
+    let keys: Vec<(&String, bool)> = spec
+        .iter()
+        .map(|(k, v)| (k, v.as_f64().is_some_and(|n| n < 0.0)))
+        .collect();
     docs.sort_by(|a, b| {
         for (path, desc) in &keys {
-            let (x, y) = (doc::get_path(a, path).unwrap_or(&Value::Null), doc::get_path(b, path).unwrap_or(&Value::Null));
+            let (x, y) = (
+                doc::get_path(a, path).unwrap_or(&Value::Null),
+                doc::get_path(b, path).unwrap_or(&Value::Null),
+            );
             let o = x.total_cmp(y);
             if o != Ordering::Equal {
                 return if *desc { o.reverse() } else { o };
@@ -115,16 +128,23 @@ fn run_stage(ctx: &Ctx, name: &str, arg: &Value, mut docs: Vec<Value>) -> Result
             docs
         }
         "$count" => {
-            let field = arg.as_str().filter(|f| !f.is_empty() && !f.starts_with('$')).ok_or_else(|| {
-                Error::Type("$count takes a field name".into())
-            })?;
+            let field = arg
+                .as_str()
+                .filter(|f| !f.is_empty() && !f.starts_with('$'))
+                .ok_or_else(|| Error::Type("$count takes a field name".into()))?;
             if docs.is_empty() {
                 vec![]
             } else {
-                vec![obj(vec![(field.to_string(), Value::Int(docs.len() as i64))])]
+                vec![obj(vec![(
+                    field.to_string(),
+                    Value::Int(docs.len() as i64),
+                )])]
             }
         }
-        "$project" => docs.into_iter().map(|d| project(&d, arg)).collect::<Result<_>>()?,
+        "$project" => docs
+            .into_iter()
+            .map(|d| project(&d, arg))
+            .collect::<Result<_>>()?,
         "$addFields" | "$set" => {
             let Value::Object(fields) = arg else {
                 return Err(Error::Type(format!("{name} expects an object")));
@@ -142,19 +162,38 @@ fn run_stage(ctx: &Ctx, name: &str, arg: &Value, mut docs: Vec<Value>) -> Result
         "$unset" => {
             let fields: Vec<String> = match arg {
                 Value::Text(s) => vec![s.clone()],
-                Value::Array(a) => a.iter().filter_map(|v| v.as_str().map(String::from)).collect(),
-                _ => return Err(Error::Type("$unset takes a field name or an array of names".into())),
+                Value::Array(a) => a
+                    .iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect(),
+                _ => {
+                    return Err(Error::Type(
+                        "$unset takes a field name or an array of names".into(),
+                    ))
+                }
             };
             let spec = obj(fields.into_iter().map(|f| (f, Value::Int(0))).collect());
-            docs.into_iter().map(|d| project(&d, &spec)).collect::<Result<_>>()?
+            docs.into_iter()
+                .map(|d| project(&d, &spec))
+                .collect::<Result<_>>()?
         }
         "$replaceRoot" | "$replaceWith" => {
-            let e = if name == "$replaceRoot" { arg.get("newRoot").ok_or_else(|| Error::Parse("$replaceRoot needs newRoot".into()))? } else { arg };
+            let e = if name == "$replaceRoot" {
+                arg.get("newRoot")
+                    .ok_or_else(|| Error::Parse("$replaceRoot needs newRoot".into()))?
+            } else {
+                arg
+            };
             let mut out = Vec::new();
             for d in docs {
                 match expr(&d, e)? {
                     Some(v @ Value::Object(_)) => out.push(v),
-                    other => return Err(Error::Type(format!("{name} must produce a document, got {}", other.unwrap_or(Value::Null).to_json()))),
+                    other => {
+                        return Err(Error::Type(format!(
+                            "{name} must produce a document, got {}",
+                            other.unwrap_or(Value::Null).to_json()
+                        )))
+                    }
                 }
             }
             out
@@ -163,11 +202,20 @@ fn run_stage(ctx: &Ctx, name: &str, arg: &Value, mut docs: Vec<Value>) -> Result
             let (path, keep_empty, index_field) = match arg {
                 Value::Text(p) => (p.clone(), false, None),
                 Value::Object(o) => (
-                    o.get("path").and_then(Value::as_str).unwrap_or("").to_string(),
+                    o.get("path")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
                     o.get("preserveNullAndEmptyArrays") == Some(&Value::Bool(true)),
-                    o.get("includeArrayIndex").and_then(Value::as_str).map(String::from),
+                    o.get("includeArrayIndex")
+                        .and_then(Value::as_str)
+                        .map(String::from),
                 ),
-                _ => return Err(Error::Type("$unwind takes \"$path\" or {path: \"$path\"}".into())),
+                _ => {
+                    return Err(Error::Type(
+                        "$unwind takes \"$path\" or {path: \"$path\"}".into(),
+                    ))
+                }
             };
             let Some(field) = path.strip_prefix('$').filter(|f| !f.is_empty()) else {
                 return Err(Error::Type("$unwind path must start with '$'".into()));
@@ -209,7 +257,9 @@ fn run_stage(ctx: &Ctx, name: &str, arg: &Value, mut docs: Vec<Value>) -> Result
         "$group" => group(docs, arg)?,
         "$lookup" => {
             let s = |k: &str| arg.get(k).and_then(Value::as_str).map(String::from);
-            let (Some(from), Some(local), Some(foreign), Some(as_)) = (s("from"), s("localField"), s("foreignField"), s("as")) else {
+            let (Some(from), Some(local), Some(foreign), Some(as_)) =
+                (s("from"), s("localField"), s("foreignField"), s("as"))
+            else {
                 return perr("$lookup needs from, localField, foreignField and as");
             };
             let empty = Value::Object(BTreeMap::new());
@@ -233,10 +283,14 @@ fn run_stage(ctx: &Ctx, name: &str, arg: &Value, mut docs: Vec<Value>) -> Result
                     Some(v) => vec![v.clone()],
                     None => vec![Value::Null],
                 };
-                let mut hits: Vec<usize> = locals.iter().flat_map(|v| by_key.get(&key_of(v)).cloned().unwrap_or_default()).collect();
+                let mut hits: Vec<usize> = locals
+                    .iter()
+                    .flat_map(|v| by_key.get(&key_of(v)).cloned().unwrap_or_default())
+                    .collect();
                 hits.sort_unstable();
                 hits.dedup();
-                let joined = Value::Array(hits.into_iter().map(|i| foreign_docs[i].clone()).collect());
+                let joined =
+                    Value::Array(hits.into_iter().map(|i| foreign_docs[i].clone()).collect());
                 doc::set_path(&mut d, &as_, joined)?;
                 out.push(d);
             }
@@ -266,7 +320,9 @@ fn project(d: &Value, spec: &Value) -> Result<Value> {
     let Value::Object(spec) = spec else {
         return Err(Error::Type("$project expects an object".into()));
     };
-    let inclusion = spec.iter().any(|(k, v)| k != "_id" && truthy_spec(v) != Some(false));
+    let inclusion = spec
+        .iter()
+        .any(|(k, v)| k != "_id" && truthy_spec(v) != Some(false));
     if !inclusion {
         // exclusion: copy and remove
         let mut out = d.clone();
@@ -341,7 +397,10 @@ enum Acc {
 
 fn add_num(a: &Value, b: &Value) -> Value {
     match (a, b) {
-        (Value::Int(x), Value::Int(y)) => x.checked_add(*y).map(Value::Int).unwrap_or(Value::Float(*x as f64 + *y as f64)),
+        (Value::Int(x), Value::Int(y)) => x
+            .checked_add(*y)
+            .map(Value::Int)
+            .unwrap_or(Value::Float(*x as f64 + *y as f64)),
         _ => Value::Float(a.as_f64().unwrap_or(0.0) + b.as_f64().unwrap_or(0.0)),
     }
 }
@@ -350,18 +409,35 @@ fn group(docs: Vec<Value>, arg: &Value) -> Result<Vec<Value>> {
     let Value::Object(spec) = arg else {
         return Err(Error::Type("$group expects an object".into()));
     };
-    let id_expr = spec.get("_id").ok_or_else(|| Error::Parse("$group needs an _id expression (null for one group)".into()))?;
+    let id_expr = spec.get("_id").ok_or_else(|| {
+        Error::Parse("$group needs an _id expression (null for one group)".into())
+    })?;
     let mut accs: Vec<(&String, &str, &Value)> = Vec::new();
     for (field, a) in spec.iter().filter(|(k, _)| *k != "_id") {
         match a {
             Value::Object(o) if o.len() == 1 => {
                 let (op, e) = o.iter().next().expect("one entry");
-                if !matches!(op.as_str(), "$sum" | "$avg" | "$min" | "$max" | "$count" | "$first" | "$last" | "$push" | "$addToSet") {
+                if !matches!(
+                    op.as_str(),
+                    "$sum"
+                        | "$avg"
+                        | "$min"
+                        | "$max"
+                        | "$count"
+                        | "$first"
+                        | "$last"
+                        | "$push"
+                        | "$addToSet"
+                ) {
                     return perr(format!("unknown $group accumulator {op}"));
                 }
                 accs.push((field, op.as_str(), e));
             }
-            _ => return perr(format!("$group field '{field}' must be {{$accumulator: expression}}")),
+            _ => {
+                return perr(format!(
+                    "$group field '{field}' must be {{$accumulator: expression}}"
+                ))
+            }
         }
     }
     let mut index: HashMap<String, usize> = HashMap::new();
@@ -392,7 +468,11 @@ fn group(docs: Vec<Value>, arg: &Value) -> Result<Vec<Value>> {
             }
         };
         for ((_, _, e), acc) in accs.iter().zip(groups[gi].1.iter_mut()) {
-            let v = if matches!(acc, Acc::Count(_)) { None } else { expr(d, e)? };
+            let v = if matches!(acc, Acc::Count(_)) {
+                None
+            } else {
+                expr(d, e)?
+            };
             match acc {
                 Acc::Sum(total) => {
                     if let Some(x) = v.filter(|x| matches!(x, Value::Int(_) | Value::Float(_))) {
@@ -465,8 +545,19 @@ pub fn expr(d: &Value, e: &Value) -> Result<Option<Value>> {
     Ok(match e {
         Value::Text(s) if s.starts_with("$$ROOT") => Some(d.clone()),
         Value::Text(s) if s.starts_with('$') && s.len() > 1 => doc::get_path(d, &s[1..]).cloned(),
-        Value::Array(a) => Some(Value::Array(a.iter().map(|x| expr(d, x).map(|v| v.unwrap_or(Value::Null))).collect::<Result<_>>()?)),
-        Value::Object(o) if o.len() == 1 && o.keys().next().is_some_and(|k| k.starts_with('$')) && !matches!(o.keys().next().map(String::as_str), Some("$oid" | "$date" | "$numberLong")) => {
+        Value::Array(a) => Some(Value::Array(
+            a.iter()
+                .map(|x| expr(d, x).map(|v| v.unwrap_or(Value::Null)))
+                .collect::<Result<_>>()?,
+        )),
+        Value::Object(o)
+            if o.len() == 1
+                && o.keys().next().is_some_and(|k| k.starts_with('$'))
+                && !matches!(
+                    o.keys().next().map(String::as_str),
+                    Some("$oid" | "$date" | "$numberLong")
+                ) =>
+        {
             let (op, a) = o.iter().next().expect("one entry");
             Some(operator(d, op, a)?)
         }
@@ -485,7 +576,10 @@ pub fn expr(d: &Value, e: &Value) -> Result<Option<Value>> {
 
 fn args(d: &Value, a: &Value) -> Result<Vec<Value>> {
     match a {
-        Value::Array(items) => items.iter().map(|x| expr(d, x).map(|v| v.unwrap_or(Value::Null))).collect(),
+        Value::Array(items) => items
+            .iter()
+            .map(|x| expr(d, x).map(|v| v.unwrap_or(Value::Null)))
+            .collect(),
         other => Ok(vec![expr(d, other)?.unwrap_or(Value::Null)]),
     }
 }
@@ -501,15 +595,24 @@ fn operator(d: &Value, op: &str, a: &Value) -> Result<Value> {
             _ => perr(format!("{op} takes two arguments")),
         }
     };
-    let truthy = |x: &Value| !matches!(x, Value::Null | Value::Bool(false)) && x.as_f64() != Some(0.0);
+    let truthy =
+        |x: &Value| !matches!(x, Value::Null | Value::Bool(false)) && x.as_f64() != Some(0.0);
     Ok(match op {
         "$add" | "$multiply" => {
             if v.iter().any(Value::is_null) {
                 return Ok(Value::Null);
             }
-            let mut acc = if op == "$add" { Value::Int(0) } else { Value::Int(1) };
+            let mut acc = if op == "$add" {
+                Value::Int(0)
+            } else {
+                Value::Int(1)
+            };
             for x in &v {
-                let o = if op == "$add" { crate::pbsql::ast::Op::Add } else { crate::pbsql::ast::Op::Mul };
+                let o = if op == "$add" {
+                    crate::pbsql::ast::Op::Add
+                } else {
+                    crate::pbsql::ast::Op::Mul
+                };
                 acc = crate::query::eval::arith(o, &acc, x)?;
             }
             acc
@@ -520,7 +623,9 @@ fn operator(d: &Value, op: &str, a: &Value) -> Result<Value> {
                 "$subtract" => crate::pbsql::ast::Op::Sub,
                 "$divide" => {
                     return Ok(match (x.as_f64(), y.as_f64()) {
-                        (_, Some(z)) if z == 0.0 => return Err(Error::Type("$divide by zero".into())),
+                        (_, Some(z)) if z == 0.0 => {
+                            return Err(Error::Type("$divide by zero".into()))
+                        }
                         (Some(p), Some(q)) => Value::Float(p / q),
                         _ => Value::Null,
                     })
@@ -537,10 +642,18 @@ fn operator(d: &Value, op: &str, a: &Value) -> Result<Value> {
             }
         }
         "$toUpper" | "$toLower" => match v.first() {
-            Some(Value::Text(s)) => Value::Text(if op == "$toUpper" { s.to_uppercase() } else { s.to_lowercase() }),
+            Some(Value::Text(s)) => Value::Text(if op == "$toUpper" {
+                s.to_uppercase()
+            } else {
+                s.to_lowercase()
+            }),
             _ => Value::Text(String::new()),
         },
-        "$ifNull" => v.iter().find(|x| !x.is_null()).cloned().unwrap_or(Value::Null),
+        "$ifNull" => v
+            .iter()
+            .find(|x| !x.is_null())
+            .cloned()
+            .unwrap_or(Value::Null),
         "$cond" => {
             let (c, t, f) = match a {
                 Value::Object(o) => (
@@ -548,7 +661,11 @@ fn operator(d: &Value, op: &str, a: &Value) -> Result<Value> {
                     o.get("then").unwrap_or(&Value::Null),
                     o.get("else").unwrap_or(&Value::Null),
                 ),
-                Value::Array(items) if items.len() == 3 => (expr(d, &items[0])?.unwrap_or(Value::Null), &items[1], &items[2]),
+                Value::Array(items) if items.len() == 3 => (
+                    expr(d, &items[0])?.unwrap_or(Value::Null),
+                    &items[1],
+                    &items[2],
+                ),
                 _ => return perr("$cond takes {if, then, else} or [if, then, else]"),
             };
             expr(d, if truthy(&c) { t } else { f })?.unwrap_or(Value::Null)

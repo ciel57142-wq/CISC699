@@ -195,7 +195,10 @@ impl Value {
         let v = p.value()?;
         p.ws();
         if p.pos != s.len() {
-            return Err(Error::Parse(format!("unexpected trailing text in JSON at byte {}", p.pos)));
+            return Err(Error::Parse(format!(
+                "unexpected trailing text in JSON at byte {}",
+                p.pos
+            )));
         }
         Ok(v)
     }
@@ -238,7 +241,12 @@ pub struct JsonParser<'a> {
 
 impl<'a> JsonParser<'a> {
     pub fn at(src: &'a str, pos: usize) -> Self {
-        JsonParser { src, s: src.as_bytes(), pos, depth: 0 }
+        JsonParser {
+            src,
+            s: src.as_bytes(),
+            pos,
+            depth: 0,
+        }
     }
 
     fn err<T>(&self, msg: &str) -> Result<T> {
@@ -319,7 +327,11 @@ impl<'a> JsonParser<'a> {
             b'"' | b'\'' => Ok(Value::Text(self.string()?)),
             b'-' | b'+' | b'0'..=b'9' | b'.' => self.number(),
             _ => {
-                for (word, v) in [("true", Value::Bool(true)), ("false", Value::Bool(false)), ("null", Value::Null)] {
+                for (word, v) in [
+                    ("true", Value::Bool(true)),
+                    ("false", Value::Bool(false)),
+                    ("null", Value::Null),
+                ] {
                     if self.src[self.pos..].starts_with(word) {
                         self.pos += word.len();
                         return Ok(v);
@@ -337,7 +349,8 @@ impl<'a> JsonParser<'a> {
                 let start = self.pos;
                 while self.pos < self.s.len() {
                     let c = self.s[self.pos];
-                    if c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || c == b'.' || c >= 0x80 {
+                    if c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || c == b'.' || c >= 0x80
+                    {
                         self.pos += 1;
                     } else {
                         break;

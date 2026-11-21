@@ -38,7 +38,10 @@ pub struct Executor<'p, 'c, 'a> {
 
 impl SubRunner for Executor<'_, '_, '_> {
     fn run_sub(&self, id: usize, outer: &[&[Value]]) -> Result<Vec<Vec<Value>>> {
-        let sp = self.subs.get(id).ok_or_else(|| Error::Parse("internal error: missing subplan".into()))?;
+        let sp = self
+            .subs
+            .get(id)
+            .ok_or_else(|| Error::Parse("internal error: missing subplan".into()))?;
         if !sp.correlated {
             if let Some(rows) = self.cache.borrow().get(&id) {
                 return Ok((**rows).clone());
@@ -94,7 +97,11 @@ impl<'p, 'c, 'a> Executor<'p, 'c, 'a> {
     }
 
     pub fn stat(&self, tree: usize, id: usize) -> Stat {
-        self.stats.borrow().get(&(tree, id)).cloned().unwrap_or_default()
+        self.stats
+            .borrow()
+            .get(&(tree, id))
+            .cloned()
+            .unwrap_or_default()
     }
 
     pub fn exec(&self, node: &Node, outer: &[&[Value]]) -> Result<Vec<Row>> {
@@ -113,15 +120,34 @@ impl<'p, 'c, 'a> Executor<'p, 'c, 'a> {
         Ok(rows)
     }
 
-    fn exec_op(&self, node: &Node, outer: &[&[Value]], examined: &mut u64, fallback: &mut bool) -> Result<Vec<Row>> {
+    fn exec_op(
+        &self,
+        node: &Node,
+        outer: &[&[Value]],
+        examined: &mut u64,
+        fallback: &mut bool,
+    ) -> Result<Vec<Row>> {
         Ok(match &node.op {
             PhysOp::Unit => vec![vec![]],
-            PhysOp::Scan { access, filter, limit, .. } => {
+            PhysOp::Scan {
+                access,
+                filter,
+                limit,
+                ..
+            } => {
                 let mut out = Vec::new();
-                self.scan(access, filter.as_ref(), *limit, outer, examined, fallback, &mut |_, r| {
-                    out.push(r);
-                    Ok(())
-                })?;
+                self.scan(
+                    access,
+                    filter.as_ref(),
+                    *limit,
+                    outer,
+                    examined,
+                    fallback,
+                    &mut |_, r| {
+                        out.push(r);
+                        Ok(())
+                    },
+                )?;
                 out
             }
             PhysOp::Derived { input, .. } => self.exec(input, outer)?,
@@ -136,7 +162,13 @@ impl<'p, 'c, 'a> Executor<'p, 'c, 'a> {
                 }
                 kept
             }
-            PhysOp::NestedLoopJoin { left, right, on, outer: lo, right_width } => {
+            PhysOp::NestedLoopJoin {
+                left,
+                right,
+                on,
+                outer: lo,
+                right_width,
+            } => {
                 let l = self.exec(left, outer)?;
                 let r = self.exec(right, outer)?;
                 let mut out = Vec::new();
@@ -145,7 +177,10 @@ impl<'p, 'c, 'a> Executor<'p, 'c, 'a> {
                     for rr in &r {
                         *examined += 1;
                         let c = combine(lr, rr);
-                        if on.as_ref().map_or(Ok(true), |p| is_true(&eval(p, &self.env(&c, outer))?))? {
+                        if on
+                            .as_ref()
+                            .map_or(Ok(true), |p| is_true(&eval(p, &self.env(&c, outer))?))?
+                        {
                             out.push(c);
                             matched = true;
                         }
@@ -158,11 +193,22 @@ impl<'p, 'c, 'a> Executor<'p, 'c, 'a> {
                 }
                 out
             }
-            PhysOp::HashJoin { left, right, lkeys, rkeys, on, outer: lo, right_width } => {
+            PhysOp::HashJoin {
+                left,
+                right,
+                lkeys,
+                rkeys,
+                on,
+                outer: lo,
+                right_width,
+            } => {
                 let r = self.exec(right, outer)?;
                 let mut table: HashMap<String, Vec<usize>> = HashMap::new();
                 for (i, rr) in r.iter().enumerate() {
-                    let k = rkeys.iter().map(|e| eval(e, &self.env(rr, outer))).collect::<Result<Vec<_>>>()?;
+                    let k = rkeys
+                        .iter()
+                        .map(|e| eval(e, &self.env(rr, outer)))
+                        .collect::<Result<Vec<_>>>()?;
                     if let Some(h) = hash_key(&k, false) {
                         table.entry(h).or_default().push(i);
                     }
@@ -170,13 +216,19 @@ impl<'p, 'c, 'a> Executor<'p, 'c, 'a> {
                 let l = self.exec(left, outer)?;
                 let mut out = Vec::new();
                 for lr in &l {
-                    let k = lkeys.iter().map(|e| eval(e, &self.env(lr, outer))).collect::<Result<Vec<_>>>()?;
+                    let k = lkeys
+                        .iter()
+                        .map(|e| eval(e, &self.env(lr, outer)))
+                        .collect::<Result<Vec<_>>>()?;
                     let mut matched = false;
                     if let Some(idx) = hash_key(&k, false).and_then(|h| table.get(&h)) {
                         for i in idx {
                             *examined += 1;
                             let c = combine(lr, &r[*i]);
-                            if on.as_ref().map_or(Ok(true), |p| is_true(&eval(p, &self.env(&c, outer))?))? {
+                            if on
+                                .as_ref()
+                                .map_or(Ok(true), |p| is_true(&eval(p, &self.env(&c, outer))?))?
+                            {
                                 out.push(c);
                                 matched = true;
                             }
@@ -190,7 +242,13 @@ impl<'p, 'c, 'a> Executor<'p, 'c, 'a> {
                 }
                 out
             }
-            PhysOp::LookupJoin { left, right, on, outer: lo, right_width } => {
+            PhysOp::LookupJoin {
+                left,
+                right,
+                on,
+                outer: lo,
+                right_width,
+            } => {
                 let l = self.exec(left, outer)?;
                 let mut out = Vec::new();
                 for lr in &l {
@@ -201,7 +259,10 @@ impl<'p, 'c, 'a> Executor<'p, 'c, 'a> {
                     for rr in self.exec(right, &stack)? {
                         *examined += 1;
                         let c = combine(lr, &rr);
-                        if on.as_ref().map_or(Ok(true), |p| is_true(&eval(p, &self.env(&c, outer))?))? {
+                        if on
+                            .as_ref()
+                            .map_or(Ok(true), |p| is_true(&eval(p, &self.env(&c, outer))?))?
+                        {
                             out.push(c);
                             matched = true;
                         }
@@ -214,7 +275,12 @@ impl<'p, 'c, 'a> Executor<'p, 'c, 'a> {
                 }
                 out
             }
-            PhysOp::HashAggregate { input, group, aggs, width } => {
+            PhysOp::HashAggregate {
+                input,
+                group,
+                aggs,
+                width,
+            } => {
                 let rows = self.exec(input, outer)?;
                 *examined = rows.len() as u64;
                 self.aggregate(rows, group, aggs, *width, outer)?
@@ -223,7 +289,12 @@ impl<'p, 'c, 'a> Executor<'p, 'c, 'a> {
                 let rows = self.exec(input, outer)?;
                 let mut out = Vec::with_capacity(rows.len());
                 for r in &rows {
-                    out.push(exprs.iter().map(|e| eval(e, &self.env(r, outer))).collect::<Result<Row>>()?);
+                    out.push(
+                        exprs
+                            .iter()
+                            .map(|e| eval(e, &self.env(r, outer)))
+                            .collect::<Result<Row>>()?,
+                    );
                 }
                 out
             }
@@ -237,7 +308,10 @@ impl<'p, 'c, 'a> Executor<'p, 'c, 'a> {
                 let rows = self.exec(input, outer)?;
                 let mut keyed = Vec::with_capacity(rows.len());
                 for r in rows {
-                    let k = keys.iter().map(|(e, _)| eval(e, &self.env(&r, outer))).collect::<Result<Vec<_>>>()?;
+                    let k = keys
+                        .iter()
+                        .map(|(e, _)| eval(e, &self.env(&r, outer)))
+                        .collect::<Result<Vec<_>>>()?;
                     keyed.push((k, r));
                 }
                 keyed.sort_by(|a, b| {
@@ -251,9 +325,16 @@ impl<'p, 'c, 'a> Executor<'p, 'c, 'a> {
                 });
                 keyed.into_iter().map(|(_, r)| r).collect()
             }
-            PhysOp::Limit { input, limit, offset } => {
+            PhysOp::Limit {
+                input,
+                limit,
+                offset,
+            } => {
                 let rows = self.exec(input, outer)?;
-                rows.into_iter().skip(*offset).take(limit.unwrap_or(usize::MAX)).collect()
+                rows.into_iter()
+                    .skip(*offset)
+                    .take(limit.unwrap_or(usize::MAX))
+                    .collect()
             }
             PhysOp::Union { left, right, all } => {
                 let mut rows = self.exec(left, outer)?;
@@ -267,12 +348,22 @@ impl<'p, 'c, 'a> Executor<'p, 'c, 'a> {
         })
     }
 
-    fn aggregate(&self, rows: Vec<Row>, group: &[Expr], aggs: &[AggSpec], width: usize, outer: &[&[Value]]) -> Result<Vec<Row>> {
+    fn aggregate(
+        &self,
+        rows: Vec<Row>,
+        group: &[Expr],
+        aggs: &[AggSpec],
+        width: usize,
+        outer: &[&[Value]],
+    ) -> Result<Vec<Row>> {
         let mut index: HashMap<String, usize> = HashMap::new();
         let mut groups: Vec<(Row, Vec<Vec<Value>>, u64)> = Vec::new();
         for r in rows {
             let env = self.env(&r, outer);
-            let key = group.iter().map(|e| eval(e, &env)).collect::<Result<Vec<_>>>()?;
+            let key = group
+                .iter()
+                .map(|e| eval(e, &env))
+                .collect::<Result<Vec<_>>>()?;
             let mut vals = Vec::with_capacity(aggs.len());
             for a in aggs {
                 vals.push(match &a.arg {
@@ -307,7 +398,9 @@ impl<'p, 'c, 'a> Executor<'p, 'c, 'a> {
             for (a, v) in aggs.iter().zip(vals.iter_mut()) {
                 if a.distinct {
                     let mut seen = HashSet::new();
-                    v.retain(|x| seen.insert(hash_key(std::slice::from_ref(x), true).unwrap_or_default()));
+                    v.retain(|x| {
+                        seen.insert(hash_key(std::slice::from_ref(x), true).unwrap_or_default())
+                    });
                 }
                 row.push(finish_agg(a, v, n)?);
             }
@@ -415,7 +508,9 @@ impl<'p, 'c, 'a> Executor<'p, 'c, 'a> {
                         }
                         ks.sort();
                         ks.dedup();
-                        ks.into_iter().filter_map(|k| self.ctx.get(&k).map(|v| (k, v))).collect()
+                        ks.into_iter()
+                            .filter_map(|k| self.ctx.get(&k).map(|v| (k, v)))
+                            .collect()
                     }
                     KvPath::Prefix(p) => {
                         let mut k = base.clone();
@@ -423,19 +518,28 @@ impl<'p, 'c, 'a> Executor<'p, 'c, 'a> {
                         self.ctx.scan(&k)
                     }
                     KvPath::Range { lo, hi } => {
-                        let bound = |b: &Option<Bound>, lower: bool| -> Result<Option<B<Vec<u8>>>> {
-                            Ok(match b {
-                                None => Some(if lower { B::Included(base.clone()) } else { B::Excluded(prefix_end(&base)) }),
-                                Some(b) => match ev(&b.expr)? {
-                                    Value::Text(s) => {
-                                        let mut k = base.clone();
-                                        k.extend_from_slice(s.as_bytes());
-                                        Some(if b.inclusive { B::Included(k) } else { B::Excluded(k) })
-                                    }
-                                    _ => None,
-                                },
-                            })
-                        };
+                        let bound =
+                            |b: &Option<Bound>, lower: bool| -> Result<Option<B<Vec<u8>>>> {
+                                Ok(match b {
+                                    None => Some(if lower {
+                                        B::Included(base.clone())
+                                    } else {
+                                        B::Excluded(prefix_end(&base))
+                                    }),
+                                    Some(b) => match ev(&b.expr)? {
+                                        Value::Text(s) => {
+                                            let mut k = base.clone();
+                                            k.extend_from_slice(s.as_bytes());
+                                            Some(if b.inclusive {
+                                                B::Included(k)
+                                            } else {
+                                                B::Excluded(k)
+                                            })
+                                        }
+                                        _ => None,
+                                    },
+                                })
+                            };
                         match (bound(lo, true)?, bound(hi, false)?) {
                             (Some(l), Some(h)) => self.ctx.range(as_ref(&l), as_ref(&h)),
                             _ => {
@@ -458,7 +562,12 @@ impl<'p, 'c, 'a> Executor<'p, 'c, 'a> {
     }
 
     /// Storage keys a table path visits, or `None` to fall back to a full scan.
-    fn table_keys(&self, s: &Schema, path: &TablePath, ev: &dyn Fn(&Expr) -> Result<Value>) -> Result<Option<Vec<Vec<u8>>>> {
+    fn table_keys(
+        &self,
+        s: &Schema,
+        path: &TablePath,
+        ev: &dyn Fn(&Expr) -> Result<Value>,
+    ) -> Result<Option<Vec<Vec<u8>>>> {
         let pk = s.pk_positions();
         let typed = |ci: usize, v: Value| -> Option<Value> {
             let ty = s.cols[ci].ty;
@@ -503,7 +612,11 @@ impl<'p, 'c, 'a> Executor<'p, 'c, 'a> {
                 };
                 let bound = |b: &Option<Bound>, lower: bool| -> Result<Option<B<Vec<u8>>>> {
                     Ok(match b {
-                        None => Some(if lower { B::Included(prefix.clone()) } else { B::Excluded(prefix_end(&prefix)) }),
+                        None => Some(if lower {
+                            B::Included(prefix.clone())
+                        } else {
+                            B::Excluded(prefix_end(&prefix))
+                        }),
                         Some(b) => {
                             let v = ev(&b.expr)?;
                             if v.is_null() {
@@ -514,14 +627,23 @@ impl<'p, 'c, 'a> Executor<'p, 'c, 'a> {
                                 Some(e) => {
                                     let mut k = prefix.clone();
                                     k.extend(e);
-                                    Some(if lower || single { B::Included(k) } else { B::Excluded(prefix_end(&k)) })
+                                    Some(if lower || single {
+                                        B::Included(k)
+                                    } else {
+                                        B::Excluded(prefix_end(&k))
+                                    })
                                 }
                             }
                         }
                     })
                 };
                 match (bound(lo, true)?, bound(hi, false)?) {
-                    (Some(l), Some(h)) => self.ctx.range(as_ref(&l), as_ref(&h)).into_iter().map(|(k, _)| k).collect(),
+                    (Some(l), Some(h)) => self
+                        .ctx
+                        .range(as_ref(&l), as_ref(&h))
+                        .into_iter()
+                        .map(|(k, _)| k)
+                        .collect(),
                     _ => return Ok(None),
                 }
             }
@@ -531,7 +653,11 @@ impl<'p, 'c, 'a> Executor<'p, 'c, 'a> {
                 let cols: Vec<usize> = ix.cols.iter().filter_map(|c| s.find_col(c)).collect();
                 for (e, ci) in eq.iter().zip(&cols) {
                     let v = ev(e)?;
-                    let v = if ix.enc == Enc::Exact { typed(*ci, v) } else { Some(v).filter(|v| !v.is_null()) };
+                    let v = if ix.enc == Enc::Exact {
+                        typed(*ci, v)
+                    } else {
+                        Some(v).filter(|v| !v.is_null())
+                    };
                     match v.and_then(|v| rel::encode_with(ix.enc, &v)) {
                         Some(enc) => prefix.extend(enc),
                         None => return Ok(Some(vec![])),
@@ -549,7 +675,14 @@ impl<'p, 'c, 'a> Executor<'p, 'c, 'a> {
                     Some(b) => b,
                     None => return Ok(None),
                 };
-                let mut ks = rel::ids_from_index(self.ctx, s, as_ref(&l), as_ref(&h), field_prefix.len(), ix);
+                let mut ks = rel::ids_from_index(
+                    self.ctx,
+                    s,
+                    as_ref(&l),
+                    as_ref(&h),
+                    field_prefix.len(),
+                    ix,
+                );
                 if lo.is_none() && hi.is_none() {
                     ks.sort();
                 }
@@ -566,11 +699,20 @@ impl<'p, 'c, 'a> Executor<'p, 'c, 'a> {
                         (Enc::Exact, Some(ci)) => typed(ci, v),
                         _ => Some(v).filter(|v| !v.is_null()),
                     };
-                    let Some(enc) = v.and_then(|v| rel::encode_with(ix.enc, &v)) else { continue };
+                    let Some(enc) = v.and_then(|v| rel::encode_with(ix.enc, &v)) else {
+                        continue;
+                    };
                     let mut p = field_prefix.clone();
                     p.extend(enc);
                     let end = prefix_end(&p);
-                    out.extend(rel::ids_from_index(self.ctx, s, B::Included(&p), B::Excluded(&end), field_prefix.len(), ix));
+                    out.extend(rel::ids_from_index(
+                        self.ctx,
+                        s,
+                        B::Included(&p),
+                        B::Excluded(&end),
+                        field_prefix.len(),
+                        ix,
+                    ));
                 }
                 out.sort();
                 out.dedup();
@@ -579,7 +721,12 @@ impl<'p, 'c, 'a> Executor<'p, 'c, 'a> {
         }))
     }
 
-    fn doc_keys(&self, coll: &str, path: &DocPath, ev: &dyn Fn(&Expr) -> Result<Value>) -> Result<Option<Vec<Vec<u8>>>> {
+    fn doc_keys(
+        &self,
+        coll: &str,
+        path: &DocPath,
+        ev: &dyn Fn(&Expr) -> Result<Value>,
+    ) -> Result<Option<Vec<Vec<u8>>>> {
         Ok(Some(match path {
             DocPath::FullScan => return Ok(None),
             DocPath::Ids(list) => {
@@ -691,7 +838,10 @@ fn index_bounds(
     };
     let Some(tag) = tag else {
         // no bound at all: the whole prefix
-        return Ok(Some((B::Included(prefix.to_vec()), B::Excluded(prefix_end(prefix)))));
+        return Ok(Some((
+            B::Included(prefix.to_vec()),
+            B::Excluded(prefix_end(prefix)),
+        )));
     };
     let lo_key = match l {
         Some(e) => [prefix, &e].concat(),
@@ -708,8 +858,14 @@ fn finish_agg(a: &AggSpec, vals: &mut Vec<Value>, n: u64) -> Result<Value> {
     Ok(match a.func {
         AggFn::Count if a.arg.is_none() => Value::Int(n as i64),
         AggFn::Count => Value::Int(vals.len() as i64),
-        AggFn::Min => vals.drain(..).min_by(|a, b| a.total_cmp(b)).unwrap_or(Value::Null),
-        AggFn::Max => vals.drain(..).max_by(|a, b| a.total_cmp(b)).unwrap_or(Value::Null),
+        AggFn::Min => vals
+            .drain(..)
+            .min_by(|a, b| a.total_cmp(b))
+            .unwrap_or(Value::Null),
+        AggFn::Max => vals
+            .drain(..)
+            .max_by(|a, b| a.total_cmp(b))
+            .unwrap_or(Value::Null),
         AggFn::Sum | AggFn::Avg => {
             if vals.is_empty() {
                 return Ok(Value::Null);
@@ -746,14 +902,24 @@ pub fn fmt_expr(e: &Expr) -> String {
         Expr::Not(a) => format!("NOT {}", fmt_expr(a)),
         Expr::Neg(a) => format!("-{}", fmt_expr(a)),
         Expr::IsNull(a, n) => format!("{} IS {}NULL", fmt_expr(a), if *n { "NOT " } else { "" }),
-        Expr::Like(a, p, n) => format!("{} {}LIKE {}", fmt_expr(a), if *n { "NOT " } else { "" }, fmt_expr(p)),
+        Expr::Like(a, p, n) => format!(
+            "{} {}LIKE {}",
+            fmt_expr(a),
+            if *n { "NOT " } else { "" },
+            fmt_expr(p)
+        ),
         Expr::In(a, l, n) => format!(
             "{} {}IN ({})",
             fmt_expr(a),
             if *n { "NOT " } else { "" },
             l.iter().map(fmt_expr).collect::<Vec<_>>().join(", ")
         ),
-        Expr::InQuery(a, s, n) => format!("{} {}IN ({})", fmt_expr(a), if *n { "NOT " } else { "" }, sub(s)),
+        Expr::InQuery(a, s, n) => format!(
+            "{} {}IN ({})",
+            fmt_expr(a),
+            if *n { "NOT " } else { "" },
+            sub(s)
+        ),
         Expr::Exists(s, n) => format!("{}EXISTS ({})", if *n { "NOT " } else { "" }, sub(s)),
         Expr::ScalarQuery(s) => format!("({})", sub(s)),
         Expr::Agg(f, a, d) => format!(
@@ -762,7 +928,10 @@ pub fn fmt_expr(e: &Expr) -> String {
             if *d { "DISTINCT " } else { "" },
             a.as_ref().map_or("*".into(), |x| fmt_expr(x))
         ),
-        Expr::Func(n, a) => format!("{n}({})", a.iter().map(fmt_expr).collect::<Vec<_>>().join(", ")),
+        Expr::Func(n, a) => format!(
+            "{n}({})",
+            a.iter().map(fmt_expr).collect::<Vec<_>>().join(", ")
+        ),
         Expr::Case { .. } => "CASE ...".into(),
         Expr::Cast(a, t) => format!("CAST({} AS {})", fmt_expr(a), t.name().to_uppercase()),
         Expr::Default => "DEFAULT".into(),
@@ -772,19 +941,29 @@ pub fn fmt_expr(e: &Expr) -> String {
 fn fmt_bound(name: &str, lo: &Option<Bound>, hi: &Option<Bound>) -> Vec<String> {
     let mut v = Vec::new();
     if let Some(b) = lo {
-        v.push(format!("{name} {} {}", if b.inclusive { ">=" } else { ">" }, fmt_expr(&b.expr)));
+        v.push(format!(
+            "{name} {} {}",
+            if b.inclusive { ">=" } else { ">" },
+            fmt_expr(&b.expr)
+        ));
     }
     if let Some(b) = hi {
-        v.push(format!("{name} {} {}", if b.inclusive { "<=" } else { "<" }, fmt_expr(&b.expr)));
+        v.push(format!(
+            "{name} {} {}",
+            if b.inclusive { "<=" } else { "<" },
+            fmt_expr(&b.expr)
+        ));
     }
     v
 }
 
 fn describe_access(access: &Access, alias: &str) -> (String, Option<String>) {
-    let on = |kind: &str, what: &str| if alias == what || what.ends_with(&format!(".{alias}")) {
-        format!("{kind} on {what}")
-    } else {
-        format!("{kind} on {what} {alias}")
+    let on = |kind: &str, what: &str| {
+        if alias == what || what.ends_with(&format!(".{alias}")) {
+            format!("{kind} on {what}")
+        } else {
+            format!("{kind} on {what} {alias}")
+        }
     };
     match access {
         Access::Table { schema, path } => {
@@ -794,27 +973,59 @@ fn describe_access(access: &Access, alias: &str) -> (String, Option<String>) {
                 TablePath::PkPoints(points) => {
                     let conds: Vec<String> = points
                         .iter()
-                        .map(|p| pk.iter().zip(p).map(|(c, e)| format!("{c} = {}", fmt_expr(e))).collect::<Vec<_>>().join(" AND "))
+                        .map(|p| {
+                            pk.iter()
+                                .zip(p)
+                                .map(|(c, e)| format!("{c} = {}", fmt_expr(e)))
+                                .collect::<Vec<_>>()
+                                .join(" AND ")
+                        })
                         .collect();
-                    (on("PrimaryKeyLookup", &schema.name), Some(conds.join(" OR ")))
+                    (
+                        on("PrimaryKeyLookup", &schema.name),
+                        Some(conds.join(" OR ")),
+                    )
                 }
                 TablePath::PkRange { eq, lo, hi } => {
-                    let mut c: Vec<String> = pk.iter().zip(eq).map(|(c, e)| format!("{c} = {}", fmt_expr(e))).collect();
+                    let mut c: Vec<String> = pk
+                        .iter()
+                        .zip(eq)
+                        .map(|(c, e)| format!("{c} = {}", fmt_expr(e)))
+                        .collect();
                     c.extend(fmt_bound(&pk[eq.len()], lo, hi));
-                    (on("PrimaryKeyRangeScan", &schema.name), Some(c.join(" AND ")))
+                    (
+                        on("PrimaryKeyRangeScan", &schema.name),
+                        Some(c.join(" AND ")),
+                    )
                 }
                 TablePath::Index { ix, eq, lo, hi } => {
-                    let mut c: Vec<String> = ix.cols.iter().zip(eq).map(|(c, e)| format!("{c} = {}", fmt_expr(e))).collect();
+                    let mut c: Vec<String> = ix
+                        .cols
+                        .iter()
+                        .zip(eq)
+                        .map(|(c, e)| format!("{c} = {}", fmt_expr(e)))
+                        .collect();
                     let ranged = lo.is_some() || hi.is_some();
                     if let Some(next) = ix.cols.get(eq.len()) {
                         c.extend(fmt_bound(next, lo, hi));
                     }
-                    let kind = if ranged || eq.len() < ix.cols.len() { "IndexRangeScan" } else { "IndexScan" };
-                    (format!("{} using {}", on(kind, &schema.name), ix.name), Some(c.join(" AND ")))
+                    let kind = if ranged || eq.len() < ix.cols.len() {
+                        "IndexRangeScan"
+                    } else {
+                        "IndexScan"
+                    };
+                    (
+                        format!("{} using {}", on(kind, &schema.name), ix.name),
+                        Some(c.join(" AND ")),
+                    )
                 }
                 TablePath::IndexIn { ix, vals } => (
                     format!("{} using {}", on("IndexScan", &schema.name), ix.name),
-                    Some(format!("{} IN ({})", ix.cols[0], vals.iter().map(fmt_expr).collect::<Vec<_>>().join(", "))),
+                    Some(format!(
+                        "{} IN ({})",
+                        ix.cols[0],
+                        vals.iter().map(fmt_expr).collect::<Vec<_>>().join(", ")
+                    )),
                 ),
             }
         }
@@ -824,27 +1035,50 @@ fn describe_access(access: &Access, alias: &str) -> (String, Option<String>) {
                 DocPath::FullScan => (on("DocumentScan", &what), None),
                 DocPath::Ids(ids) => (
                     on("DocumentIdLookup", &what),
-                    Some(ids.iter().map(|e| format!("_id = {}", fmt_expr(e))).collect::<Vec<_>>().join(" OR ")),
+                    Some(
+                        ids.iter()
+                            .map(|e| format!("_id = {}", fmt_expr(e)))
+                            .collect::<Vec<_>>()
+                            .join(" OR "),
+                    ),
                 ),
                 DocPath::Index { field, eq, lo, hi } => {
                     let (kind, cond) = match eq {
-                        Some(e) => ("DocumentIndexScan", vec![format!("{field} = {}", fmt_expr(e))]),
+                        Some(e) => (
+                            "DocumentIndexScan",
+                            vec![format!("{field} = {}", fmt_expr(e))],
+                        ),
                         None => ("DocumentIndexRangeScan", fmt_bound(field, lo, hi)),
                     };
-                    (format!("{} using index on {field}", on(kind, &what)), Some(cond.join(" AND ")))
+                    (
+                        format!("{} using index on {field}", on(kind, &what)),
+                        Some(cond.join(" AND ")),
+                    )
                 }
             }
         }
         Access::Kv { ns, path } => {
-            let what = if ns.is_empty() { "KV".to_string() } else { format!("KV.{ns}") };
+            let what = if ns.is_empty() {
+                "KV".to_string()
+            } else {
+                format!("KV.{ns}")
+            };
             match path {
                 KvPath::FullScan => (on("KVScan", &what), None),
                 KvPath::Keys(k) => (
                     on("KVGet", &what),
-                    Some(k.iter().map(|e| format!("key = {}", fmt_expr(e))).collect::<Vec<_>>().join(" OR ")),
+                    Some(
+                        k.iter()
+                            .map(|e| format!("key = {}", fmt_expr(e)))
+                            .collect::<Vec<_>>()
+                            .join(" OR "),
+                    ),
                 ),
                 KvPath::Prefix(p) => (on("KVPrefixScan", &what), Some(format!("key LIKE '{p}%'"))),
-                KvPath::Range { lo, hi } => (on("KVRangeScan", &what), Some(fmt_bound("key", lo, hi).join(" AND "))),
+                KvPath::Range { lo, hi } => (
+                    on("KVRangeScan", &what),
+                    Some(fmt_bound("key", lo, hi).join(" AND ")),
+                ),
             }
         }
     }
@@ -867,7 +1101,9 @@ fn models(n: &Node, out: &mut HashSet<&'static str>) {
         out.insert(m);
     }
     match &n.op {
-        PhysOp::NestedLoopJoin { left, right, .. } | PhysOp::HashJoin { left, right, .. } | PhysOp::LookupJoin { left, right, .. } => {
+        PhysOp::NestedLoopJoin { left, right, .. }
+        | PhysOp::HashJoin { left, right, .. }
+        | PhysOp::LookupJoin { left, right, .. } => {
             models(left, out);
             models(right, out);
         }
@@ -880,13 +1116,28 @@ pub struct ExplainOpts {
     pub analyze: bool,
 }
 
-pub fn render(root: &Node, tree: usize, ex: Option<&Executor>, out: &mut Vec<String>, depth: usize) {
-    let pad = if depth == 0 { String::new() } else { format!("{}-> ", "   ".repeat(depth - 1)) };
+pub fn render(
+    root: &Node,
+    tree: usize,
+    ex: Option<&Executor>,
+    out: &mut Vec<String>,
+    depth: usize,
+) {
+    let pad = if depth == 0 {
+        String::new()
+    } else {
+        format!("{}-> ", "   ".repeat(depth - 1))
+    };
     let detail_pad = "   ".repeat(depth) + "   ";
     let mut details: Vec<String> = Vec::new();
     let title = match &root.op {
         PhysOp::Unit => "Result (one row)".to_string(),
-        PhysOp::Scan { access, alias, filter, limit } => {
+        PhysOp::Scan {
+            access,
+            alias,
+            filter,
+            limit,
+        } => {
             let (t, cond) = describe_access(access, alias);
             if let Some(c) = cond {
                 details.push(format!("Index Cond: {c}"));
@@ -904,7 +1155,9 @@ pub fn render(root: &Node, tree: usize, ex: Option<&Executor>, out: &mut Vec<Str
             details.push(format!("Filter: {}", fmt_expr(pred)));
             "Filter".into()
         }
-        PhysOp::NestedLoopJoin { on, outer, .. } | PhysOp::HashJoin { on, outer, .. } | PhysOp::LookupJoin { on, outer, .. } => {
+        PhysOp::NestedLoopJoin { on, outer, .. }
+        | PhysOp::HashJoin { on, outer, .. }
+        | PhysOp::LookupJoin { on, outer, .. } => {
             let kind = match &root.op {
                 PhysOp::NestedLoopJoin { .. } => "NestedLoopJoin",
                 PhysOp::HashJoin { .. } => "HashJoin",
@@ -933,24 +1186,37 @@ pub fn render(root: &Node, tree: usize, ex: Option<&Executor>, out: &mut Vec<Str
         }
         PhysOp::HashAggregate { group, aggs, .. } => {
             if !group.is_empty() {
-                details.push(format!("Group Key: {}", group.iter().map(fmt_expr).collect::<Vec<_>>().join(", ")));
+                details.push(format!(
+                    "Group Key: {}",
+                    group.iter().map(fmt_expr).collect::<Vec<_>>().join(", ")
+                ));
             }
             if !aggs.is_empty() {
                 details.push(format!(
                     "Aggregates: {}",
                     aggs.iter()
-                        .map(|a| fmt_expr(&Expr::Agg(a.func, a.arg.clone().map(Box::new), a.distinct)))
+                        .map(|a| fmt_expr(&Expr::Agg(
+                            a.func,
+                            a.arg.clone().map(Box::new),
+                            a.distinct
+                        )))
                         .collect::<Vec<_>>()
                         .join(", ")
                 ));
             }
             "HashAggregate".into()
         }
-        PhysOp::Project { exprs, .. } => format!("Projection ({})", exprs.iter().map(fmt_expr).collect::<Vec<_>>().join(", ")),
+        PhysOp::Project { exprs, .. } => format!(
+            "Projection ({})",
+            exprs.iter().map(fmt_expr).collect::<Vec<_>>().join(", ")
+        ),
         PhysOp::Distinct { .. } => "Distinct".into(),
         PhysOp::Sort { keys, .. } => format!(
             "Sort ({})",
-            keys.iter().map(|(e, d)| format!("{}{}", fmt_expr(e), if *d { " DESC" } else { "" })).collect::<Vec<_>>().join(", ")
+            keys.iter()
+                .map(|(e, d)| format!("{}{}", fmt_expr(e), if *d { " DESC" } else { "" }))
+                .collect::<Vec<_>>()
+                .join(", ")
         ),
         PhysOp::Limit { limit, offset, .. } => match (limit, offset) {
             (Some(l), 0) => format!("Limit ({l})"),
@@ -986,11 +1252,17 @@ pub fn render(root: &Node, tree: usize, ex: Option<&Executor>, out: &mut Vec<Str
     }
     let kids: Vec<&Node> = match &root.op {
         PhysOp::Unit | PhysOp::Scan { .. } => vec![],
-        PhysOp::Derived { input, .. } | PhysOp::Filter { input, .. } | PhysOp::HashAggregate { input, .. }
-        | PhysOp::Project { input, .. } | PhysOp::Distinct { input } | PhysOp::Sort { input, .. }
+        PhysOp::Derived { input, .. }
+        | PhysOp::Filter { input, .. }
+        | PhysOp::HashAggregate { input, .. }
+        | PhysOp::Project { input, .. }
+        | PhysOp::Distinct { input }
+        | PhysOp::Sort { input, .. }
         | PhysOp::Limit { input, .. } => vec![input],
-        PhysOp::NestedLoopJoin { left, right, .. } | PhysOp::HashJoin { left, right, .. }
-        | PhysOp::LookupJoin { left, right, .. } | PhysOp::Union { left, right, .. } => vec![left, right],
+        PhysOp::NestedLoopJoin { left, right, .. }
+        | PhysOp::HashJoin { left, right, .. }
+        | PhysOp::LookupJoin { left, right, .. }
+        | PhysOp::Union { left, right, .. } => vec![left, right],
     };
     for k in kids {
         render(k, tree, ex, out, depth + 1);
@@ -1001,7 +1273,14 @@ pub fn explain(plan: &Plan, ex: Option<&Executor>) -> Vec<String> {
     let mut out = Vec::new();
     render(&plan.root, 0, ex, &mut out, 0);
     for (i, sp) in plan.subs.iter().enumerate() {
-        out.push(format!("SubPlan {i}{}", if sp.correlated { " (correlated: runs once per outer row)" } else { " (runs once)" }));
+        out.push(format!(
+            "SubPlan {i}{}",
+            if sp.correlated {
+                " (correlated: runs once per outer row)"
+            } else {
+                " (runs once)"
+            }
+        ));
         render(&sp.root, i + 1, ex, &mut out, 1);
     }
     out
@@ -1014,7 +1293,10 @@ pub fn run(ctx: &Ctx, plan: &Plan) -> Result<Vec<Row>> {
 }
 
 /// Run a planned query and return its rows together with the executor (for EXPLAIN ANALYZE).
-pub fn run_analyze<'p, 'c, 'a>(ctx: &'c Ctx<'a>, plan: &'p Plan) -> Result<(Vec<Row>, Executor<'p, 'c, 'a>, u128)> {
+pub fn run_analyze<'p, 'c, 'a>(
+    ctx: &'c Ctx<'a>,
+    plan: &'p Plan,
+) -> Result<(Vec<Row>, Executor<'p, 'c, 'a>, u128)> {
     let ex = Executor::new(ctx, &plan.subs);
     let t = Instant::now();
     let rows = ex.exec(&plan.root, &[])?;

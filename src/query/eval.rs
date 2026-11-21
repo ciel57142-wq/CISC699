@@ -46,7 +46,9 @@ fn days_in_month(y: i64, m: u32) -> u32 {
 }
 
 fn num(s: &str, digits: usize) -> Option<u32> {
-    (s.len() == digits && s.bytes().all(|b| b.is_ascii_digit())).then(|| s.parse().ok()).flatten()
+    (s.len() == digits && s.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| s.parse().ok())
+        .flatten()
 }
 
 fn parse_date(s: &str) -> Option<String> {
@@ -66,7 +68,9 @@ fn parse_date(s: &str) -> Option<String> {
 
 fn parse_time(s: &str) -> Option<String> {
     let (hms, frac) = match s.split_once('.') {
-        Some((a, f)) if !f.is_empty() && f.len() <= 9 && f.bytes().all(|b| b.is_ascii_digit()) => (a, Some(f)),
+        Some((a, f)) if !f.is_empty() && f.len() <= 9 && f.bytes().all(|b| b.is_ascii_digit()) => {
+            (a, Some(f))
+        }
         Some(_) => return None,
         None => (s, None),
     };
@@ -118,17 +122,31 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 
 /// Current UTC time as a canonical TIMESTAMP string.
 pub fn now_timestamp() -> String {
-    let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
     let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
     let t = secs.rem_euclid(86_400);
-    format!("{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02}", t / 3600, (t / 60) % 60, t % 60)
+    format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02}",
+        t / 3600,
+        (t / 60) % 60,
+        t % 60
+    )
 }
 
 /// Convert a value to a column type, validating and canonicalising it.
 /// Dates and times are stored as canonical ISO text, whose byte order is
 /// chronological order, so comparisons and indexes work on them directly.
 pub fn coerce_type(ty: Ty, v: Value) -> Result<Value> {
-    let bad = |v: &Value| Error::Type(format!("expected {}, got {}", ty.name().to_uppercase(), v.to_json()));
+    let bad = |v: &Value| {
+        Error::Type(format!(
+            "expected {}, got {}",
+            ty.name().to_uppercase(),
+            v.to_json()
+        ))
+    };
     Ok(match (ty, v) {
         (_, Value::Null) => Value::Null,
         (Ty::Int, Value::Int(i)) => Value::Int(i),
@@ -140,15 +158,19 @@ pub fn coerce_type(ty: Ty, v: Value) -> Result<Value> {
         (Ty::Date, Value::Text(s)) => {
             let s2 = s.trim();
             let d = parse_date(s2).or_else(|| parse_timestamp(s2).map(|t| t[..10].to_string()));
-            Value::Text(d.ok_or_else(|| Error::Type(format!("invalid DATE '{s}' (expected YYYY-MM-DD)")))?)
+            Value::Text(
+                d.ok_or_else(|| Error::Type(format!("invalid DATE '{s}' (expected YYYY-MM-DD)")))?,
+            )
         }
         (Ty::Time, Value::Text(s)) => Value::Text(
-            parse_time(s.trim()).ok_or_else(|| Error::Type(format!("invalid TIME '{s}' (expected HH:MM:SS)")))?,
+            parse_time(s.trim())
+                .ok_or_else(|| Error::Type(format!("invalid TIME '{s}' (expected HH:MM:SS)")))?,
         ),
-        (Ty::Timestamp, Value::Text(s)) => Value::Text(
-            parse_timestamp(&s)
-                .ok_or_else(|| Error::Type(format!("invalid TIMESTAMP '{s}' (expected YYYY-MM-DD HH:MM:SS)")))?,
-        ),
+        (Ty::Timestamp, Value::Text(s)) => Value::Text(parse_timestamp(&s).ok_or_else(|| {
+            Error::Type(format!(
+                "invalid TIMESTAMP '{s}' (expected YYYY-MM-DD HH:MM:SS)"
+            ))
+        })?),
         (Ty::Json, Value::Text(s)) => match Value::parse(&s) {
             Ok(v @ (Value::Object(_) | Value::Array(_))) => v,
             _ => Value::Text(s),
@@ -169,13 +191,19 @@ fn cast(v: Value, ty: Ty) -> Result<Value> {
             .trim()
             .parse::<i64>()
             .map(Value::Int)
-            .or_else(|_| s.trim().parse::<f64>().map(|f| Value::Int(f.trunc() as i64)))
+            .or_else(|_| {
+                s.trim()
+                    .parse::<f64>()
+                    .map(|f| Value::Int(f.trunc() as i64))
+            })
             .map_err(|_| Error::Type(format!("cannot cast '{s}' to INT"))),
         (Ty::Int, Value::Float(f)) => Ok(Value::Int(f.trunc() as i64)),
         (Ty::Int, Value::Bool(b)) => Ok(Value::Int(*b as i64)),
-        (Ty::Float, Value::Text(s)) => {
-            s.trim().parse::<f64>().map(Value::Float).map_err(|_| Error::Type(format!("cannot cast '{s}' to REAL")))
-        }
+        (Ty::Float, Value::Text(s)) => s
+            .trim()
+            .parse::<f64>()
+            .map(Value::Float)
+            .map_err(|_| Error::Type(format!("cannot cast '{s}' to REAL"))),
         (Ty::Bool, Value::Text(s)) => match s.trim().to_ascii_lowercase().as_str() {
             "true" | "t" | "yes" | "1" => Ok(Value::Bool(true)),
             "false" | "f" | "no" | "0" => Ok(Value::Bool(false)),
@@ -193,7 +221,10 @@ pub fn tri(v: &Value) -> Result<Option<bool>> {
     match v {
         Value::Null => Ok(None),
         Value::Bool(b) => Ok(Some(*b)),
-        other => Err(Error::Type(format!("expected a boolean, got {}", other.to_json()))),
+        other => Err(Error::Type(format!(
+            "expected a boolean, got {}",
+            other.to_json()
+        ))),
     }
 }
 
@@ -246,7 +277,9 @@ pub fn arith(op: Op, l: &Value, r: &Value) -> Result<Value> {
             Op::Div => a.checked_div(*b),
             _ => a.checked_rem(*b),
         };
-        return res.map(Value::Int).ok_or_else(|| Error::Type("integer overflow".into()));
+        return res
+            .map(Value::Int)
+            .ok_or_else(|| Error::Type("integer overflow".into()));
     }
     match (l.as_f64(), r.as_f64()) {
         (Some(a), Some(b)) => Ok(Value::Float(match op {
@@ -256,7 +289,12 @@ pub fn arith(op: Op, l: &Value, r: &Value) -> Result<Value> {
             Op::Div => a / b,
             _ => a % b,
         })),
-        _ => Err(Error::Type(format!("cannot apply '{}' to {} and {}", op.text(), l.to_json(), r.to_json()))),
+        _ => Err(Error::Type(format!(
+            "cannot apply '{}' to {} and {}",
+            op.text(),
+            l.to_json(),
+            r.to_json()
+        ))),
     }
 }
 
@@ -318,18 +356,38 @@ pub fn walk_path(v: &Value, path: &[String]) -> Value {
 
 fn date_part(name: &str, v: &Value) -> Result<Value> {
     let Value::Text(s) = v else {
-        return if v.is_null() { Ok(Value::Null) } else { Err(Error::Type(format!("{name}() needs a date or time"))) };
+        return if v.is_null() {
+            Ok(Value::Null)
+        } else {
+            Err(Error::Type(format!("{name}() needs a date or time")))
+        };
     };
     let ts = parse_timestamp(s);
     let time = parse_time(s);
-    let field = |a: usize, b: usize, src: &str| src.get(a..b).and_then(|x| x.parse::<i64>().ok()).map(Value::Int);
+    let field = |a: usize, b: usize, src: &str| {
+        src.get(a..b)
+            .and_then(|x| x.parse::<i64>().ok())
+            .map(Value::Int)
+    };
     let out = match name {
         "year" => ts.as_deref().and_then(|t| field(0, 4, t)),
         "month" => ts.as_deref().and_then(|t| field(5, 7, t)),
         "day" => ts.as_deref().and_then(|t| field(8, 10, t)),
-        "hour" => ts.as_deref().map(|t| &t[11..]).or(time.as_deref()).and_then(|t| field(0, 2, t)),
-        "minute" => ts.as_deref().map(|t| &t[11..]).or(time.as_deref()).and_then(|t| field(3, 5, t)),
-        "second" => ts.as_deref().map(|t| &t[11..]).or(time.as_deref()).and_then(|t| field(6, 8, t)),
+        "hour" => ts
+            .as_deref()
+            .map(|t| &t[11..])
+            .or(time.as_deref())
+            .and_then(|t| field(0, 2, t)),
+        "minute" => ts
+            .as_deref()
+            .map(|t| &t[11..])
+            .or(time.as_deref())
+            .and_then(|t| field(3, 5, t)),
+        "second" => ts
+            .as_deref()
+            .map(|t| &t[11..])
+            .or(time.as_deref())
+            .and_then(|t| field(6, 8, t)),
         _ => None,
     };
     out.ok_or_else(|| Error::Type(format!("{name}() cannot read '{s}' as a date/time")))
@@ -342,7 +400,11 @@ fn func(name: &str, vals: Vec<Value>) -> Result<Value> {
     };
     Ok(match name {
         "version" => Value::Text(format!("polydb {}", env!("CARGO_PKG_VERSION"))),
-        "coalesce" | "ifnull" => vals.iter().find(|v| !v.is_null()).cloned().unwrap_or(Value::Null),
+        "coalesce" | "ifnull" => vals
+            .iter()
+            .find(|v| !v.is_null())
+            .cloned()
+            .unwrap_or(Value::Null),
         "nullif" => match vals.as_slice() {
             [a, b] => {
                 if !a.is_null() && a.total_cmp(b) == Ordering::Equal {
@@ -353,7 +415,12 @@ fn func(name: &str, vals: Vec<Value>) -> Result<Value> {
             }
             _ => return Err(Error::Parse("nullif() takes two arguments".into())),
         },
-        "concat" => Value::Text(vals.iter().filter(|v| !v.is_null()).map(Value::display).collect()),
+        "concat" => Value::Text(
+            vals.iter()
+                .filter(|v| !v.is_null())
+                .map(Value::display)
+                .collect(),
+        ),
         "lower" | "upper" | "length" | "trim" => match one()? {
             Value::Null => Value::Null,
             Value::Text(s) => match name {
@@ -363,7 +430,12 @@ fn func(name: &str, vals: Vec<Value>) -> Result<Value> {
                 _ => Value::Int(s.chars().count() as i64),
             },
             Value::Array(a) if name == "length" => Value::Int(a.len() as i64),
-            other => return Err(Error::Type(format!("{name}() needs text, got {}", other.to_json()))),
+            other => {
+                return Err(Error::Type(format!(
+                    "{name}() needs text, got {}",
+                    other.to_json()
+                )))
+            }
         },
         "substr" | "substring" => match vals.as_slice() {
             [Value::Null, ..] => Value::Null,
@@ -373,26 +445,48 @@ fn func(name: &str, vals: Vec<Value>) -> Result<Value> {
                 let len = match rest {
                     [Value::Int(n)] => (*n).max(0) as usize,
                     [] => chars.len(),
-                    _ => return Err(Error::Type("substr(text, start[, length]) needs integers".into())),
+                    _ => {
+                        return Err(Error::Type(
+                            "substr(text, start[, length]) needs integers".into(),
+                        ))
+                    }
                 };
                 Value::Text(chars.iter().skip(from).take(len).collect())
             }
-            _ => return Err(Error::Type("substr(text, start[, length]) needs text and integers".into())),
+            _ => {
+                return Err(Error::Type(
+                    "substr(text, start[, length]) needs text and integers".into(),
+                ))
+            }
         },
         "abs" => match one()? {
             Value::Null => Value::Null,
-            Value::Int(i) => Value::Int(i.checked_abs().ok_or_else(|| Error::Type("integer overflow".into()))?),
+            Value::Int(i) => Value::Int(
+                i.checked_abs()
+                    .ok_or_else(|| Error::Type("integer overflow".into()))?,
+            ),
             Value::Float(f) => Value::Float(f.abs()),
-            other => return Err(Error::Type(format!("abs() needs a number, got {}", other.to_json()))),
+            other => {
+                return Err(Error::Type(format!(
+                    "abs() needs a number, got {}",
+                    other.to_json()
+                )))
+            }
         },
         "round" => match vals.as_slice() {
             [Value::Null, ..] => Value::Null,
             [v] => match v {
                 Value::Int(i) => Value::Int(*i),
-                _ => Value::Float(v.as_f64().ok_or_else(|| Error::Type("round() needs a number".into()))?.round()),
+                _ => Value::Float(
+                    v.as_f64()
+                        .ok_or_else(|| Error::Type("round() needs a number".into()))?
+                        .round(),
+                ),
             },
             [v, Value::Int(d)] => {
-                let f = v.as_f64().ok_or_else(|| Error::Type("round() needs a number".into()))?;
+                let f = v
+                    .as_f64()
+                    .ok_or_else(|| Error::Type("round() needs a number".into()))?;
                 let m = 10f64.powi(*d as i32);
                 Value::Float((f * m).round() / m)
             }
@@ -430,10 +524,36 @@ fn func(name: &str, vals: Vec<Value>) -> Result<Value> {
 pub fn known_function(name: &str) -> bool {
     matches!(
         name,
-        "version" | "coalesce" | "ifnull" | "nullif" | "concat" | "lower" | "upper" | "length" | "trim" | "substr"
-            | "substring" | "abs" | "round" | "now" | "current_timestamp" | "localtimestamp" | "current_date"
-            | "current_time" | "date" | "time" | "timestamp" | "datetime" | "year" | "month" | "day" | "hour"
-            | "minute" | "second" | "json_type" | "typeof"
+        "version"
+            | "coalesce"
+            | "ifnull"
+            | "nullif"
+            | "concat"
+            | "lower"
+            | "upper"
+            | "length"
+            | "trim"
+            | "substr"
+            | "substring"
+            | "abs"
+            | "round"
+            | "now"
+            | "current_timestamp"
+            | "localtimestamp"
+            | "current_date"
+            | "current_time"
+            | "date"
+            | "time"
+            | "timestamp"
+            | "datetime"
+            | "year"
+            | "month"
+            | "day"
+            | "hour"
+            | "minute"
+            | "second"
+            | "json_type"
+            | "typeof"
     )
 }
 
@@ -447,19 +567,37 @@ fn sub_id(s: &SubRef) -> Result<usize> {
 pub fn eval(e: &Expr, env: &Env) -> Result<Value> {
     Ok(match e {
         Expr::Lit(v) => v.clone(),
-        Expr::Slot { level, idx, path, .. } => {
-            let row = if *level == 0 { env.row } else { env.outer.get(level - 1).copied().unwrap_or(&[]) };
+        Expr::Slot {
+            level, idx, path, ..
+        } => {
+            let row = if *level == 0 {
+                env.row
+            } else {
+                env.outer.get(level - 1).copied().unwrap_or(&[])
+            };
             match row.get(*idx) {
                 Some(v) => walk_path(v, path),
                 None => Value::Null,
             }
         }
-        Expr::Col(p) => return Err(Error::Schema(format!("unresolved column '{}'", p.join(".")))),
-        Expr::Default => return Err(Error::Parse("DEFAULT is only allowed in INSERT ... VALUES".into())),
+        Expr::Col(p) => {
+            return Err(Error::Schema(format!(
+                "unresolved column '{}'",
+                p.join(".")
+            )))
+        }
+        Expr::Default => {
+            return Err(Error::Parse(
+                "DEFAULT is only allowed in INSERT ... VALUES".into(),
+            ))
+        }
         Expr::Not(a) => from_tri(tri(&eval(a, env)?)?.map(|b| !b)),
         Expr::Neg(a) => match eval(a, env)? {
             Value::Null => Value::Null,
-            Value::Int(i) => Value::Int(i.checked_neg().ok_or_else(|| Error::Type("integer overflow".into()))?),
+            Value::Int(i) => Value::Int(
+                i.checked_neg()
+                    .ok_or_else(|| Error::Type("integer overflow".into()))?,
+            ),
             Value::Float(f) => Value::Float(-f),
             other => return Err(Error::Type(format!("cannot negate {}", other.to_json()))),
         },
@@ -483,7 +621,11 @@ pub fn eval(e: &Expr, env: &Env) -> Result<Value> {
         Expr::InQuery(a, sub, neg) => {
             let v = eval(a, env)?;
             let rows = run(env, sub_id(sub)?)?;
-            in_list(&v, rows.iter().map(|r| r.first().unwrap_or(&Value::Null)), *neg)
+            in_list(
+                &v,
+                rows.iter().map(|r| r.first().unwrap_or(&Value::Null)),
+                *neg,
+            )
         }
         Expr::Exists(sub, neg) => Value::Bool(run(env, sub_id(sub)?)?.is_empty() == *neg),
         Expr::ScalarQuery(sub) => {
@@ -539,7 +681,11 @@ pub fn eval(e: &Expr, env: &Env) -> Result<Value> {
             }
             func(name, vals)?
         }
-        Expr::Case { operand, whens, otherwise } => {
+        Expr::Case {
+            operand,
+            whens,
+            otherwise,
+        } => {
             let base = match operand {
                 Some(o) => Some(eval(o, env)?),
                 None => None,
@@ -559,7 +705,11 @@ pub fn eval(e: &Expr, env: &Env) -> Result<Value> {
             }
         }
         Expr::Cast(a, ty) => cast(eval(a, env)?, *ty)?,
-        Expr::Agg(..) => return Err(Error::Parse("aggregate functions are not allowed here".into())),
+        Expr::Agg(..) => {
+            return Err(Error::Parse(
+                "aggregate functions are not allowed here".into(),
+            ))
+        }
     })
 }
 

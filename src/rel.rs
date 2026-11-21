@@ -106,7 +106,8 @@ pub fn owner(table: &str) -> String {
 
 impl Schema {
     pub fn col_index(&self, name: &str) -> Result<usize> {
-        self.find_col(name).ok_or_else(|| Error::Schema(format!("table '{}' has no column '{name}'", self.name)))
+        self.find_col(name)
+            .ok_or_else(|| Error::Schema(format!("table '{}' has no column '{name}'", self.name)))
     }
 
     pub fn find_col(&self, name: &str) -> Option<usize> {
@@ -157,7 +158,14 @@ impl Schema {
                 o.insert("cols".to_string(), list(&i.cols));
                 o.insert("unique".to_string(), Value::Bool(i.unique));
                 o.insert("field".to_string(), s(&i.field));
-                o.insert("enc".to_string(), s(if i.enc == Enc::Exact { "exact" } else { "legacy" }));
+                o.insert(
+                    "enc".to_string(),
+                    s(if i.enc == Enc::Exact {
+                        "exact"
+                    } else {
+                        "legacy"
+                    }),
+                );
                 Value::Object(o)
             })
             .collect();
@@ -193,7 +201,10 @@ impl Schema {
         let v = Value::parse(std::str::from_utf8(&raw).map_err(|_| bad())?).map_err(|_| bad())?;
         let strs = |v: Option<&Value>| -> Vec<String> {
             match v {
-                Some(Value::Array(a)) => a.iter().filter_map(|x| x.as_str().map(String::from)).collect(),
+                Some(Value::Array(a)) => a
+                    .iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect(),
                 _ => vec![],
             }
         };
@@ -203,7 +214,11 @@ impl Schema {
         let mut out = Vec::new();
         let mut pk_flags = Vec::new();
         for c in cols {
-            let cname = c.get("name").and_then(|v| v.as_str()).ok_or_else(bad)?.to_string();
+            let cname = c
+                .get("name")
+                .and_then(|v| v.as_str())
+                .ok_or_else(bad)?
+                .to_string();
             if c.get("pk") == Some(&Value::Bool(true)) {
                 pk_flags.push(cname.clone());
             }
@@ -214,19 +229,28 @@ impl Schema {
             };
             out.push(Column {
                 name: cname,
-                ty: c.get("type").and_then(|v| v.as_str()).and_then(Ty::from_name).ok_or_else(bad)?,
+                ty: c
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .and_then(Ty::from_name)
+                    .ok_or_else(bad)?,
                 not_null: c.get("not_null") == Some(&Value::Bool(true)),
                 default,
             });
         }
-        let pk = if v.get("pk").is_some() { strs(v.get("pk")) } else { pk_flags };
+        let pk = if v.get("pk").is_some() {
+            strs(v.get("pk"))
+        } else {
+            pk_flags
+        };
         let mut indexes = Vec::new();
         if let Some(Value::Array(list)) = v.get("indexes") {
             for ix in list {
                 match ix {
                     // format of earlier versions: [name, column]
                     Value::Array(p) => {
-                        if let (Some(Value::Text(n)), Some(Value::Text(c))) = (p.first(), p.get(1)) {
+                        if let (Some(Value::Text(n)), Some(Value::Text(c))) = (p.first(), p.get(1))
+                        {
                             indexes.push(Index {
                                 name: n.clone(),
                                 cols: vec![c.clone()],
@@ -237,11 +261,23 @@ impl Schema {
                         }
                     }
                     Value::Object(_) => indexes.push(Index {
-                        name: ix.get("name").and_then(Value::as_str).ok_or_else(bad)?.to_string(),
+                        name: ix
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .ok_or_else(bad)?
+                            .to_string(),
                         cols: strs(ix.get("cols")),
                         unique: ix.get("unique") == Some(&Value::Bool(true)),
-                        field: ix.get("field").and_then(Value::as_str).ok_or_else(bad)?.to_string(),
-                        enc: if ix.get("enc").and_then(Value::as_str) == Some("exact") { Enc::Exact } else { Enc::Legacy },
+                        field: ix
+                            .get("field")
+                            .and_then(Value::as_str)
+                            .ok_or_else(bad)?
+                            .to_string(),
+                        enc: if ix.get("enc").and_then(Value::as_str) == Some("exact") {
+                            Enc::Exact
+                        } else {
+                            Enc::Legacy
+                        },
                     }),
                     _ => return Err(bad()),
                 }
@@ -252,7 +288,11 @@ impl Schema {
             for f in list {
                 fks.push(ForeignKey {
                     cols: strs(f.get("cols")),
-                    table: f.get("table").and_then(Value::as_str).ok_or_else(bad)?.to_string(),
+                    table: f
+                        .get("table")
+                        .and_then(Value::as_str)
+                        .ok_or_else(bad)?
+                        .to_string(),
                     ref_cols: strs(f.get("ref_cols")),
                     on_delete: match f.get("on_delete").and_then(Value::as_str) {
                         Some("cascade") => FkAction::Cascade,
@@ -262,7 +302,13 @@ impl Schema {
                 });
             }
         }
-        Ok(Some(Schema { name: name.to_string(), cols: out, pk, indexes, fks }))
+        Ok(Some(Schema {
+            name: name.to_string(),
+            cols: out,
+            pk,
+            indexes,
+            fks,
+        }))
     }
 
     pub fn save(&self, ctx: &mut Ctx) {
@@ -282,7 +328,9 @@ pub fn all_schemas(ctx: &Ctx) -> Result<Vec<Schema>> {
 }
 
 pub fn decode_row(raw: &[u8]) -> Result<Vec<Value>> {
-    let parsed = std::str::from_utf8(raw).ok().and_then(|s| Value::parse(s).ok());
+    let parsed = std::str::from_utf8(raw)
+        .ok()
+        .and_then(|s| Value::parse(s).ok());
     match parsed {
         Some(Value::Array(a)) => Ok(a),
         _ => Err(Error::Corrupt("stored row is unreadable".into())),
@@ -298,7 +346,10 @@ pub fn coerce(s: &Schema, ci: usize, v: Value) -> Result<Value> {
     let col = &s.cols[ci];
     if v.is_null() {
         if col.not_null || s.is_pk(&col.name) {
-            return Err(Error::Constraint(format!("column '{}' cannot be NULL", col.name)));
+            return Err(Error::Constraint(format!(
+                "column '{}' cannot be NULL",
+                col.name
+            )));
         }
         return Ok(Value::Null);
     }
@@ -330,7 +381,11 @@ pub fn encode_pk(vals: &[&Value]) -> Result<Vec<u8>> {
     }
     let mut out = Vec::new();
     for v in vals {
-        out.extend(encode_exact(v).ok_or_else(|| Error::Type(format!("cannot use {} in a primary key", v.to_json())))?);
+        out.extend(
+            encode_exact(v).ok_or_else(|| {
+                Error::Type(format!("cannot use {} in a primary key", v.to_json()))
+            })?,
+        );
     }
     Ok(out)
 }
@@ -343,7 +398,9 @@ pub fn row_key(ctx: &mut Ctx, s: &Schema, row: &[Value]) -> Result<Vec<u8>> {
         let id = keys::next_seq(ctx, &format!("t:{}", s.name))?;
         k.extend(keys::encode_id(&Value::Int(id))?);
     } else {
-        k.extend(encode_pk(&pos.iter().map(|i| &row[*i]).collect::<Vec<_>>())?);
+        k.extend(encode_pk(
+            &pos.iter().map(|i| &row[*i]).collect::<Vec<_>>(),
+        )?);
     }
     Ok(k)
 }
@@ -364,7 +421,11 @@ pub fn index_value_prefix(s: &Schema, ix: &Index, vals: &[Value]) -> Option<Vec<
 }
 
 fn index_entry(s: &Schema, ix: &Index, id: &[u8], row: &[Value]) -> Option<Vec<u8>> {
-    let vals: Vec<Value> = ix.cols.iter().map(|c| s.find_col(c).map(|i| row[i].clone())).collect::<Option<_>>()?;
+    let vals: Vec<Value> = ix
+        .cols
+        .iter()
+        .map(|c| s.find_col(c).map(|i| row[i].clone()))
+        .collect::<Option<_>>()?;
     let mut k = index_value_prefix(s, ix, &vals)?;
     k.extend_from_slice(id);
     Some(k)
@@ -374,14 +435,25 @@ fn index_entry(s: &Schema, ix: &Index, id: &[u8], row: &[Value]) -> Option<Vec<u
 /// otherwise unindexable) value in an indexed column get no entry.
 pub fn index_entries(s: &Schema, key: &[u8], row: &[Value]) -> Vec<Vec<u8>> {
     let id = &key[keys::row_prefix(&s.name).len()..];
-    let mut out: Vec<Vec<u8>> = s.indexes.iter().filter_map(|ix| index_entry(s, ix, id, row)).collect();
+    let mut out: Vec<Vec<u8>> = s
+        .indexes
+        .iter()
+        .filter_map(|ix| index_entry(s, ix, id, row))
+        .collect();
     out.sort();
     out.dedup();
     out
 }
 
 /// Row keys found through an index entry prefix.
-pub fn ids_from_index(ctx: &Ctx, s: &Schema, lo: Bound<&[u8]>, hi: Bound<&[u8]>, field_prefix_len: usize, ix: &Index) -> Vec<Vec<u8>> {
+pub fn ids_from_index(
+    ctx: &Ctx,
+    s: &Schema,
+    lo: Bound<&[u8]>,
+    hi: Bound<&[u8]>,
+    field_prefix_len: usize,
+    ix: &Index,
+) -> Vec<Vec<u8>> {
     let _ = ix;
     let rp = keys::row_prefix(&s.name);
     ctx.range(lo, hi)
@@ -442,15 +514,27 @@ fn get_row(ctx: &Ctx, key: &[u8]) -> Result<Option<Vec<Value>>> {
 }
 
 fn values_of(s: &Schema, row: &[Value], cols: &[String]) -> Vec<Value> {
-    cols.iter().map(|c| s.find_col(c).map_or(Value::Null, |i| row[i].clone())).collect()
+    cols.iter()
+        .map(|c| s.find_col(c).map_or(Value::Null, |i| row[i].clone()))
+        .collect()
 }
 
 /// Rows of `s` whose `cols` equal `vals`, using the primary key or an index when possible.
-pub fn rows_where(ctx: &Ctx, s: &Schema, cols: &[String], vals: &[Value]) -> Result<Vec<(Vec<u8>, Vec<Value>)>> {
+pub fn rows_where(
+    ctx: &Ctx,
+    s: &Schema,
+    cols: &[String],
+    vals: &[Value],
+) -> Result<Vec<(Vec<u8>, Vec<Value>)>> {
     if !s.pk.is_empty() && s.pk.len() == cols.len() && s.pk.iter().all(|p| cols.contains(p)) {
-        let ordered: Vec<&Value> = s.pk.iter().map(|p| &vals[cols.iter().position(|c| c == p).unwrap()]).collect();
+        let ordered: Vec<&Value> =
+            s.pk.iter()
+                .map(|p| &vals[cols.iter().position(|c| c == p).unwrap()])
+                .collect();
         let key = pk_key(s, &ordered)?;
-        return Ok(get_row(ctx, &key)?.map(|r| vec![(key, r)]).unwrap_or_default());
+        return Ok(get_row(ctx, &key)?
+            .map(|r| vec![(key, r)])
+            .unwrap_or_default());
     }
     // an index whose leading columns are exactly these
     for ix in &s.indexes {
@@ -468,9 +552,20 @@ pub fn rows_where(ctx: &Ctx, s: &Schema, cols: &[String], vals: &[Value]) -> Res
         let mut hi = prefix.clone();
         hi.push(0xff);
         let mut out = Vec::new();
-        for rk in ids_from_index(ctx, s, Bound::Included(&prefix), Bound::Excluded(&hi), field_len, ix) {
+        for rk in ids_from_index(
+            ctx,
+            s,
+            Bound::Included(&prefix),
+            Bound::Excluded(&hi),
+            field_len,
+            ix,
+        ) {
             if let Some(r) = get_row(ctx, &rk)? {
-                if values_of(s, &r, cols).iter().zip(vals).all(|(a, b)| a.total_cmp(b) == Ordering::Equal) {
+                if values_of(s, &r, cols)
+                    .iter()
+                    .zip(vals)
+                    .all(|(a, b)| a.total_cmp(b) == Ordering::Equal)
+                {
                     out.push((rk, r));
                 }
             }
@@ -480,7 +575,11 @@ pub fn rows_where(ctx: &Ctx, s: &Schema, cols: &[String], vals: &[Value]) -> Res
     let mut out = Vec::new();
     for (k, raw) in ctx.scan(&keys::row_prefix(&s.name)) {
         let r = decode_row(&raw)?;
-        if values_of(s, &r, cols).iter().zip(vals).all(|(a, b)| a.total_cmp(b) == Ordering::Equal) {
+        if values_of(s, &r, cols)
+            .iter()
+            .zip(vals)
+            .all(|(a, b)| a.total_cmp(b) == Ordering::Equal)
+        {
             out.push((k, r));
         }
     }
@@ -508,7 +607,12 @@ fn check_unique(ctx: &Ctx, s: &Schema, key: &[u8], row: &[Value]) -> Result<()> 
     Ok(())
 }
 
-fn check_parents(ctx: &Ctx, s: &Schema, row: &[Value], only_changed: Option<&[Value]>) -> Result<()> {
+fn check_parents(
+    ctx: &Ctx,
+    s: &Schema,
+    row: &[Value],
+    only_changed: Option<&[Value]>,
+) -> Result<()> {
     for fk in &s.fks {
         let vals = values_of(s, row, &fk.cols);
         if vals.iter().any(Value::is_null) {
@@ -516,11 +620,19 @@ fn check_parents(ctx: &Ctx, s: &Schema, row: &[Value], only_changed: Option<&[Va
         }
         if let Some(old) = only_changed {
             let before = values_of(s, old, &fk.cols);
-            if before.iter().zip(&vals).all(|(a, b)| a.total_cmp(b) == Ordering::Equal) {
+            if before
+                .iter()
+                .zip(&vals)
+                .all(|(a, b)| a.total_cmp(b) == Ordering::Equal)
+            {
                 continue;
             }
         }
-        let parent = if fk.table == s.name { s.clone() } else { Schema::load(ctx, &fk.table)? };
+        let parent = if fk.table == s.name {
+            s.clone()
+        } else {
+            Schema::load(ctx, &fk.table)?
+        };
         // coerce to the parent's column types so 1 and 1.0 find the same row
         let mut typed = Vec::new();
         for (v, rc) in vals.iter().zip(&fk.ref_cols) {
@@ -559,7 +671,11 @@ pub fn insert_row(ctx: &mut Ctx, s: &Schema, row: Vec<Value>) -> Result<()> {
     let key = row_key(ctx, s, &row)?;
     if ctx.get(&key).is_some() {
         let pk: Vec<String> = s.pk_positions().iter().map(|i| row[*i].to_json()).collect();
-        return Err(Error::Constraint(format!("duplicate primary key {} in table '{}'", pk_text(pk), s.name)));
+        return Err(Error::Constraint(format!(
+            "duplicate primary key {} in table '{}'",
+            pk_text(pk),
+            s.name
+        )));
     }
     check_unique(ctx, s, &key, &row)?;
     check_parents(ctx, s, &row, None)?;
@@ -569,13 +685,26 @@ pub fn insert_row(ctx: &mut Ctx, s: &Schema, row: Vec<Value>) -> Result<()> {
 
 /// Replace a row, enforcing constraints on the new values and referential
 /// integrity for rows of other tables that reference the old ones.
-pub fn update_row(ctx: &mut Ctx, s: &Schema, key: Vec<u8>, old: &[Value], new: Vec<Value>) -> Result<()> {
+pub fn update_row(
+    ctx: &mut Ctx,
+    s: &Schema,
+    key: Vec<u8>,
+    old: &[Value],
+    new: Vec<Value>,
+) -> Result<()> {
     let pos = s.pk_positions();
-    let new_key = if pos.iter().any(|i| old[*i].total_cmp(&new[*i]) != Ordering::Equal) {
+    let new_key = if pos
+        .iter()
+        .any(|i| old[*i].total_cmp(&new[*i]) != Ordering::Equal)
+    {
         let k = pk_key(s, &pos.iter().map(|i| &new[*i]).collect::<Vec<_>>())?;
         if ctx.get(&k).is_some() {
             let pk: Vec<String> = pos.iter().map(|i| new[*i].to_json()).collect();
-            return Err(Error::Constraint(format!("duplicate primary key {} in table '{}'", pk_text(pk), s.name)));
+            return Err(Error::Constraint(format!(
+                "duplicate primary key {} in table '{}'",
+                pk_text(pk),
+                s.name
+            )));
         }
         k
     } else {
@@ -588,10 +717,19 @@ pub fn update_row(ctx: &mut Ctx, s: &Schema, key: Vec<u8>, old: &[Value], new: V
     for (child, fk) in referencing(ctx, &s.name)? {
         let before = values_of(s, old, &fk.ref_cols);
         let after = values_of(s, &new, &fk.ref_cols);
-        if before.iter().any(Value::is_null) || before.iter().zip(&after).all(|(a, b)| a.total_cmp(b) == Ordering::Equal) {
+        if before.iter().any(Value::is_null)
+            || before
+                .iter()
+                .zip(&after)
+                .all(|(a, b)| a.total_cmp(b) == Ordering::Equal)
+        {
             continue;
         }
-        let child = if child.name == s.name { s.clone() } else { child };
+        let child = if child.name == s.name {
+            s.clone()
+        } else {
+            child
+        };
         if !rows_where(ctx, &child, &fk.cols, &before)?.is_empty() {
             return Err(Error::Constraint(format!(
                 "cannot change ({}) of '{}': rows in '{}' still reference it",
@@ -623,9 +761,17 @@ pub fn delete_row(ctx: &mut Ctx, s: &Schema, key: &[u8], row: &[Value]) -> Resul
     delete_row_depth(ctx, s, key, row, 0)
 }
 
-fn delete_row_depth(ctx: &mut Ctx, s: &Schema, key: &[u8], row: &[Value], depth: usize) -> Result<()> {
+fn delete_row_depth(
+    ctx: &mut Ctx,
+    s: &Schema,
+    key: &[u8],
+    row: &[Value],
+    depth: usize,
+) -> Result<()> {
     if depth > 64 {
-        return Err(Error::Constraint("ON DELETE CASCADE chain is deeper than 64 levels".into()));
+        return Err(Error::Constraint(
+            "ON DELETE CASCADE chain is deeper than 64 levels".into(),
+        ));
     }
     remove_entries(ctx, s, key, row);
     for (child, fk) in referencing(ctx, &s.name)? {
@@ -671,12 +817,18 @@ fn delete_row_depth(ctx: &mut Ctx, s: &Schema, key: &[u8], row: &[Value], depth:
 
 /// All rows of a table, in primary-key order.
 pub fn scan_rows(ctx: &Ctx, s: &Schema) -> Result<Vec<(Vec<u8>, Vec<Value>)>> {
-    ctx.scan(&keys::row_prefix(&s.name)).into_iter().map(|(k, raw)| Ok((k, decode_row(&raw)?))).collect()
+    ctx.scan(&keys::row_prefix(&s.name))
+        .into_iter()
+        .map(|(k, raw)| Ok((k, decode_row(&raw)?)))
+        .collect()
 }
 
 /// Write (or rewrite) every index entry of one index.
 pub fn build_index(ctx: &mut Ctx, s: &Schema, ix: &Index) -> Result<()> {
-    let one = Schema { indexes: vec![ix.clone()], ..s.clone() };
+    let one = Schema {
+        indexes: vec![ix.clone()],
+        ..s.clone()
+    };
     for (key, row) in scan_rows(ctx, s)? {
         if ix.unique {
             check_unique(ctx, &one, &key, &row)?;
@@ -689,7 +841,10 @@ pub fn build_index(ctx: &mut Ctx, s: &Schema, ix: &Index) -> Result<()> {
 }
 
 pub fn drop_index_entries(ctx: &mut Ctx, s: &Schema, ix: &Index) {
-    if s.indexes.iter().any(|o| o.name != ix.name && o.field == ix.field) {
+    if s.indexes
+        .iter()
+        .any(|o| o.name != ix.name && o.field == ix.field)
+    {
         return; // another index shares these entries
     }
     for (k, _) in ctx.scan(&keys::index_prefix(&owner(&s.name), &ix.field)) {
@@ -699,7 +854,10 @@ pub fn drop_index_entries(ctx: &mut Ctx, s: &Schema, ix: &Index) {
 
 /// Remove every key belonging to a table (rows, index entries, sequence, schema).
 pub fn drop_table_data(ctx: &mut Ctx, name: &str) {
-    for prefix in [keys::row_prefix(name), keys::index_owner_prefix(&owner(name))] {
+    for prefix in [
+        keys::row_prefix(name),
+        keys::index_owner_prefix(&owner(name)),
+    ] {
         for (k, _) in ctx.scan(&prefix) {
             ctx.delete(k);
         }

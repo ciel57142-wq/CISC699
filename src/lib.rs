@@ -56,7 +56,10 @@ pub enum Output {
     /// A status message ("3 row(s) inserted").
     Done(String),
     /// A relational result set.
-    Rows { columns: Vec<String>, rows: Vec<Vec<Value>> },
+    Rows {
+        columns: Vec<String>,
+        rows: Vec<Vec<Value>>,
+    },
     /// Documents returned by a collection query.
     Docs(Vec<Value>),
     /// A single value (key-value reads, counts, generated ids).
@@ -75,7 +78,10 @@ impl fmt::Display for Output {
                 write!(f, "({} document(s))", docs.len())
             }
             Output::Rows { columns, rows } => {
-                let cells: Vec<Vec<String>> = rows.iter().map(|r| r.iter().map(|v| v.display()).collect()).collect();
+                let cells: Vec<Vec<String>> = rows
+                    .iter()
+                    .map(|r| r.iter().map(|v| v.display()).collect())
+                    .collect();
                 let mut w: Vec<usize> = columns.iter().map(|c| c.chars().count()).collect();
                 for r in &cells {
                     for (i, c) in r.iter().enumerate() {
@@ -85,12 +91,24 @@ impl fmt::Display for Output {
                 let line = |f: &mut fmt::Formatter<'_>, cols: &[String]| -> fmt::Result {
                     for (i, c) in cols.iter().enumerate() {
                         let pad = w[i] - c.chars().count();
-                        write!(f, "{}{c}{}", if i == 0 { " " } else { " | " }, " ".repeat(pad))?;
+                        write!(
+                            f,
+                            "{}{c}{}",
+                            if i == 0 { " " } else { " | " },
+                            " ".repeat(pad)
+                        )?;
                     }
                     writeln!(f)
                 };
                 line(f, columns)?;
-                writeln!(f, "{}", w.iter().map(|n| "-".repeat(n + 2)).collect::<Vec<_>>().join("+"))?;
+                writeln!(
+                    f,
+                    "{}",
+                    w.iter()
+                        .map(|n| "-".repeat(n + 2))
+                        .collect::<Vec<_>>()
+                        .join("+")
+                )?;
                 for r in &cells {
                     line(f, r)?;
                 }
@@ -117,7 +135,8 @@ impl Shared {
         if ws.is_empty() {
             return Ok(());
         }
-        let keys: Option<Vec<Vec<u8>>> = (!self.active.is_empty()).then(|| ws.keys().cloned().collect());
+        let keys: Option<Vec<Vec<u8>>> =
+            (!self.active.is_empty()).then(|| ws.keys().cloned().collect());
         self.store.commit(ws)?;
         self.version += 1;
         if let Some(keys) = keys {
@@ -175,8 +194,16 @@ impl Drop for Database {
 
 impl Database {
     fn from_store(store: Store) -> Database {
-        let shared = Shared { store, version: 0, log: VecDeque::new(), active: BTreeMap::new() };
-        Database { shared: Arc::new(RwLock::new(shared)), txn: None }
+        let shared = Shared {
+            store,
+            version: 0,
+            log: VecDeque::new(),
+            active: BTreeMap::new(),
+        };
+        Database {
+            shared: Arc::new(RwLock::new(shared)),
+            txn: None,
+        }
     }
 
     /// Open or create a durable database in directory `path`.
@@ -197,7 +224,10 @@ impl Database {
     /// Another session on the same data, with its own transaction state.
     /// Sessions are `Send`: give one to each thread.
     pub fn session(&self) -> Database {
-        Database { shared: self.shared.clone(), txn: None }
+        Database {
+            shared: self.shared.clone(),
+            txn: None,
+        }
     }
 
     fn read_lock(&self) -> RwLockReadGuard<'_, Shared> {
@@ -221,9 +251,17 @@ impl Database {
         if let Some(mut t) = self.txn.take() {
             let guard = self.shared.read().unwrap_or_else(|e| e.into_inner());
             let savepoint = t.writes.clone();
-            let mut ctx = Ctx { store: &guard.store, writes: t.writes, reads: Some(RefCell::new(t.reads)) };
+            let mut ctx = Ctx {
+                store: &guard.store,
+                writes: t.writes,
+                reads: Some(RefCell::new(t.reads)),
+            };
             let res = f(&mut ctx);
-            t.reads = ctx.reads.take().map(RefCell::into_inner).unwrap_or_default();
+            t.reads = ctx
+                .reads
+                .take()
+                .map(RefCell::into_inner)
+                .unwrap_or_default();
             t.writes = if res.is_ok() { ctx.writes } else { savepoint };
             drop(guard);
             self.txn = Some(t);
@@ -232,14 +270,22 @@ impl Database {
         if writes {
             // Hold the write lock across read-modify-write so the statement is atomic.
             let mut guard = self.shared.write().unwrap_or_else(|e| e.into_inner());
-            let mut ctx = Ctx { store: &guard.store, writes: WriteSet::new(), reads: None };
+            let mut ctx = Ctx {
+                store: &guard.store,
+                writes: WriteSet::new(),
+                reads: None,
+            };
             let out = f(&mut ctx)?;
             let ws = ctx.writes;
             guard.commit(ws)?;
             Ok(out)
         } else {
             let guard = self.shared.read().unwrap_or_else(|e| e.into_inner());
-            let mut ctx = Ctx { store: &guard.store, writes: WriteSet::new(), reads: None };
+            let mut ctx = Ctx {
+                store: &guard.store,
+                writes: WriteSet::new(),
+                reads: None,
+            };
             f(&mut ctx)
         }
     }
@@ -254,25 +300,39 @@ impl Database {
         let start = g.version;
         *g.active.entry(start).or_insert(0) += 1;
         drop(g);
-        self.txn = Some(Txn { writes: WriteSet::new(), reads: ReadSet::default(), start });
+        self.txn = Some(Txn {
+            writes: WriteSet::new(),
+            reads: ReadSet::default(),
+            start,
+        });
         Ok(())
     }
 
     pub fn commit(&mut self) -> Result<()> {
-        let t = self.txn.take().ok_or_else(|| Error::Txn("no transaction is open".into()))?;
+        let t = self
+            .txn
+            .take()
+            .ok_or_else(|| Error::Txn("no transaction is open".into()))?;
         let mut g = self.write_lock();
-        let stale = g.log.iter().any(|(v, keys)| *v > t.start && keys.iter().any(|k| t.reads.touches(k)));
+        let stale = g
+            .log
+            .iter()
+            .any(|(v, keys)| *v > t.start && keys.iter().any(|k| t.reads.touches(k)));
         g.release(t.start);
         if stale {
             return Err(Error::Conflict(
-                "another session changed data this transaction read; nothing was written, retry it".into(),
+                "another session changed data this transaction read; nothing was written, retry it"
+                    .into(),
             ));
         }
         g.commit(t.writes)
     }
 
     pub fn rollback(&mut self) -> Result<()> {
-        let t = self.txn.take().ok_or_else(|| Error::Txn("no transaction is open".into()))?;
+        let t = self
+            .txn
+            .take()
+            .ok_or_else(|| Error::Txn("no transaction is open".into()))?;
         self.write_lock().release(t.start);
         Ok(())
     }
@@ -332,13 +392,19 @@ impl Database {
         self.run(true, |ctx| doc::insert(ctx, collection, doc))
     }
 
-    pub fn doc_find(&mut self, collection: &str, filter: &Value, opts: &FindOptions) -> Result<Vec<Value>> {
+    pub fn doc_find(
+        &mut self,
+        collection: &str,
+        filter: &Value,
+        opts: &FindOptions,
+    ) -> Result<Vec<Value>> {
         self.run(false, |ctx| doc::find(ctx, collection, filter, opts))
     }
 
     /// Update every matching document; returns how many.
     pub fn doc_update(&mut self, collection: &str, filter: &Value, update: &Value) -> Result<u64> {
-        self.doc_update_with(collection, filter, update, true, false).map(|r| r.0)
+        self.doc_update_with(collection, filter, update, true, false)
+            .map(|r| r.0)
     }
 
     /// Update with control over `multi` (all matches vs first) and `upsert`.
@@ -351,7 +417,9 @@ impl Database {
         multi: bool,
         upsert: bool,
     ) -> Result<(u64, Option<Value>)> {
-        self.run(true, |ctx| doc::update(ctx, collection, filter, update, multi, upsert))
+        self.run(true, |ctx| {
+            doc::update(ctx, collection, filter, update, multi, upsert)
+        })
     }
 
     /// Delete every matching document; returns how many.
@@ -360,7 +428,12 @@ impl Database {
     }
 
     /// Delete at most `limit` matching documents.
-    pub fn doc_delete_with(&mut self, collection: &str, filter: &Value, limit: Option<u64>) -> Result<u64> {
+    pub fn doc_delete_with(
+        &mut self,
+        collection: &str,
+        filter: &Value,
+        limit: Option<u64>,
+    ) -> Result<u64> {
         self.run(true, |ctx| doc::delete(ctx, collection, filter, limit))
     }
 
@@ -394,8 +467,14 @@ impl Database {
     pub fn execute(&mut self, command: &str) -> Result<Output> {
         let s = command.trim().trim_end_matches(';').trim_end();
         if let Some(rest) = s.strip_prefix("db.") {
-            let method = rest.split_once('.').map_or("", |(_, m)| m.split('(').next().unwrap_or("")).to_ascii_lowercase();
-            let read = matches!(method.trim(), "find" | "findone" | "count" | "countdocuments" | "aggregate");
+            let method = rest
+                .split_once('.')
+                .map_or("", |(_, m)| m.split('(').next().unwrap_or(""))
+                .to_ascii_lowercase();
+            let read = matches!(
+                method.trim(),
+                "find" | "findone" | "count" | "countdocuments" | "aggregate"
+            );
             return self.run(!read, |ctx| doc_command(ctx, s));
         }
         let (word, rest) = match s.find(char::is_whitespace) {
@@ -439,7 +518,11 @@ impl Database {
 /// `KV 'key' ...` / `KV.ns 'key' ...` after SET or EXISTS (legacy forms take a bare key).
 fn is_pbsql_kv(rest: &str) -> bool {
     let r = rest.trim_start();
-    let Some(after) = r.get(..2).filter(|p| p.eq_ignore_ascii_case("kv")).map(|_| &r[2..]) else {
+    let Some(after) = r
+        .get(..2)
+        .filter(|p| p.eq_ignore_ascii_case("kv"))
+        .map(|_| &r[2..])
+    else {
         return false;
     };
     let after = after.trim_start();
@@ -447,7 +530,11 @@ fn is_pbsql_kv(rest: &str) -> bool {
 }
 
 fn first_word(s: &str) -> String {
-    s.trim_start().split(|c: char| !c.is_alphanumeric()).next().unwrap_or("").to_ascii_lowercase()
+    s.trim_start()
+        .split(|c: char| !c.is_alphanumeric())
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase()
 }
 
 // ------------------------------------------------------- key-value commands
@@ -490,15 +577,28 @@ fn no_more(rest: &str) -> Result<()> {
     if rest.trim().is_empty() {
         Ok(())
     } else {
-        Err(Error::Parse(format!("unexpected extra argument '{}'", rest.trim())))
+        Err(Error::Parse(format!(
+            "unexpected extra argument '{}'",
+            rest.trim()
+        )))
     }
 }
 
 fn kv_command(ctx: &mut Ctx, word: &str, rest: &str) -> Result<Output> {
     if word == "keys" {
-        let prefix = if rest.trim().is_empty() { String::new() } else { take_arg(rest)?.0 };
-        let rows = kv::keys(ctx, &prefix).into_iter().map(|k| vec![Value::Text(k)]).collect();
-        return Ok(Output::Rows { columns: vec!["key".into()], rows });
+        let prefix = if rest.trim().is_empty() {
+            String::new()
+        } else {
+            take_arg(rest)?.0
+        };
+        let rows = kv::keys(ctx, &prefix)
+            .into_iter()
+            .map(|k| vec![Value::Text(k)])
+            .collect();
+        return Ok(Output::Rows {
+            columns: vec!["key".into()],
+            rows,
+        });
     }
     let (key, rest) = take_arg(rest)?;
     match word {
@@ -537,7 +637,9 @@ fn kv_command(ctx: &mut Ctx, word: &str, rest: &str) -> Result<Output> {
             let by = if rest.trim().is_empty() {
                 1
             } else {
-                rest.trim().parse::<i64>().map_err(|_| Error::Parse("INCR amount must be an integer".into()))?
+                rest.trim()
+                    .parse::<i64>()
+                    .map_err(|_| Error::Parse("INCR amount must be an integer".into()))?
             };
             Ok(Output::Scalar(Value::Int(kv::incr(ctx, &key, by)?)))
         }
@@ -563,7 +665,9 @@ fn parse_calls(s: &str) -> Result<Vec<(String, Vec<Value>)>> {
         }
         let name = s[start..pos].to_ascii_lowercase();
         if name.is_empty() || b.get(pos) != Some(&b'(') {
-            return Err(Error::Parse("expected db.<collection>.<method>(...)".into()));
+            return Err(Error::Parse(
+                "expected db.<collection>.<method>(...)".into(),
+            ));
         }
         pos += 1;
         let mut args = Vec::new();
@@ -588,17 +692,26 @@ fn parse_calls(s: &str) -> Result<Vec<(String, Vec<Value>)>> {
         match b.get(pos) {
             None => return Ok(calls),
             Some(b'.') => pos += 1,
-            Some(_) => return Err(Error::Parse(format!("unexpected text after ')': '{}'", &s[pos..]))),
+            Some(_) => {
+                return Err(Error::Parse(format!(
+                    "unexpected text after ')': '{}'",
+                    &s[pos..]
+                )))
+            }
         }
     }
 }
 
 fn doc_command(ctx: &mut Ctx, s: &str) -> Result<Output> {
     let rest = &s[3..];
-    let mut dot = rest.find('.').ok_or_else(|| Error::Parse("expected db.<collection>.<method>(...)".into()))?;
+    let mut dot = rest
+        .find('.')
+        .ok_or_else(|| Error::Parse("expected db.<collection>.<method>(...)".into()))?;
     // db.<namespace>.<collection>.<method>(...): the segment after the first dot is not a call
     let after = &rest[dot + 1..];
-    let seg_end = after.find(|c: char| !(c.is_alphanumeric() || c == '_')).unwrap_or(after.len());
+    let seg_end = after
+        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .unwrap_or(after.len());
     if after[seg_end..].starts_with('.') {
         dot += 1 + seg_end;
     }
@@ -608,7 +721,8 @@ fn doc_command(ctx: &mut Ctx, s: &str) -> Result<Output> {
     let empty = Value::Object(Default::default());
     let arg = |i: usize| args.get(i).unwrap_or(&empty);
     let need = |i: usize, what: &str| {
-        args.get(i).ok_or_else(|| Error::Parse(format!("{method}() needs {what}")))
+        args.get(i)
+            .ok_or_else(|| Error::Parse(format!("{method}() needs {what}")))
     };
     let as_count = |v: &Value| {
         v.as_i64()

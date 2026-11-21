@@ -45,7 +45,12 @@ fn read_command(r: &mut impl BufRead, limits: &Limits) -> io::Result<Option<Vec<
     };
     if line.first() != Some(&b'*') {
         // inline command, as typed into telnet
-        return Ok(Some(line.split(|b| b.is_ascii_whitespace()).filter(|p| !p.is_empty()).map(<[u8]>::to_vec).collect()));
+        return Ok(Some(
+            line.split(|b| b.is_ascii_whitespace())
+                .filter(|p| !p.is_empty())
+                .map(<[u8]>::to_vec)
+                .collect(),
+        ));
     }
     let n = parse_len(&line[1..], limits.max_args)?;
     let mut args = Vec::with_capacity(n.min(1024));
@@ -55,7 +60,10 @@ fn read_command(r: &mut impl BufRead, limits: &Limits) -> io::Result<Option<Vec<
             return Ok(None);
         };
         if h.first() != Some(&b'$') {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "expected bulk string"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "expected bulk string",
+            ));
         }
         let len = parse_len(&h[1..], limits.max_request_bytes)?;
         total += len;
@@ -73,7 +81,11 @@ fn read_command(r: &mut impl BufRead, limits: &Limits) -> io::Result<Option<Vec<
 fn bulk(out: &mut Vec<u8>, proto: u8, v: Option<&[u8]>) {
     match v {
         // RESP3 has a dedicated null; RESP2 uses the null bulk string
-        None => out.extend_from_slice(if proto >= 3 { b"_\r\n".as_slice() } else { b"$-1\r\n".as_slice() }),
+        None => out.extend_from_slice(if proto >= 3 {
+            b"_\r\n".as_slice()
+        } else {
+            b"$-1\r\n".as_slice()
+        }),
         Some(v) => {
             out.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
             out.extend_from_slice(v);
@@ -105,12 +117,23 @@ fn key(b: &[u8]) -> String {
     String::from_utf8_lossy(b).into_owned()
 }
 
-fn exec(db: &mut Database, args: &[Vec<u8>], proto: &mut u8, out: &mut Vec<u8>) -> Result<bool, Error> {
+fn exec(
+    db: &mut Database,
+    args: &[Vec<u8>],
+    proto: &mut u8,
+    out: &mut Vec<u8>,
+) -> Result<bool, Error> {
     let name = String::from_utf8_lossy(&args[0]).to_ascii_uppercase();
     let argc = |n: usize, out: &mut Vec<u8>| {
         let ok = args.len() == n + 1;
         if !ok {
-            err(out, &format!("wrong number of arguments for '{}' command", name.to_lowercase()));
+            err(
+                out,
+                &format!(
+                    "wrong number of arguments for '{}' command",
+                    name.to_lowercase()
+                ),
+            );
         }
         ok
     };
@@ -127,13 +150,22 @@ fn exec(db: &mut Database, args: &[Vec<u8>], proto: &mut u8, out: &mut Vec<u8>) 
         "SELECT" | "CLIENT" => out.extend_from_slice(b"+OK\r\n"),
         "COMMAND" => out.extend_from_slice(b"*0\r\n"),
         "HELLO" => {
-            let want = args.get(1).and_then(|v| std::str::from_utf8(v).ok()).and_then(|v| v.parse::<u8>().ok());
+            let want = args
+                .get(1)
+                .and_then(|v| std::str::from_utf8(v).ok())
+                .and_then(|v| v.parse::<u8>().ok());
             match want {
-                Some(v) if v != 2 && v != 3 => out.extend_from_slice(b"-NOPROTO unsupported protocol version\r\n"),
+                Some(v) if v != 2 && v != 3 => {
+                    out.extend_from_slice(b"-NOPROTO unsupported protocol version\r\n")
+                }
                 _ => {
                     *proto = want.unwrap_or(*proto);
                     // a map in RESP3, a flat array in RESP2
-                    out.extend_from_slice(if *proto >= 3 { b"%3\r\n".as_slice() } else { b"*6\r\n".as_slice() });
+                    out.extend_from_slice(if *proto >= 3 {
+                        b"%3\r\n".as_slice()
+                    } else {
+                        b"*6\r\n".as_slice()
+                    });
                     out.extend_from_slice(b"$6\r\nserver\r\n$6\r\npolydb\r\n$7\r\nversion\r\n");
                     bulk(out, *proto, Some(env!("CARGO_PKG_VERSION").as_bytes()));
                     out.extend_from_slice(format!("$5\r\nproto\r\n:{}\r\n", *proto).as_bytes());
@@ -149,10 +181,16 @@ fn exec(db: &mut Database, args: &[Vec<u8>], proto: &mut u8, out: &mut Vec<u8>) 
             bulk(out, *proto, Some(info.as_bytes()));
         }
         "GET" if argc(1, out) => bulk(out, *proto, db.kv_get(&key(&args[1]))?.as_deref()),
-        "STRLEN" if argc(1, out) => int(out, db.kv_get(&key(&args[1]))?.map_or(0, |v| v.len() as i64)),
+        "STRLEN" if argc(1, out) => int(
+            out,
+            db.kv_get(&key(&args[1]))?.map_or(0, |v| v.len() as i64),
+        ),
         "SET" => {
             if args.len() != 3 {
-                err(out, "only plain 'SET key value' is supported (no EX/PX/NX/XX options)");
+                err(
+                    out,
+                    "only plain 'SET key value' is supported (no EX/PX/NX/XX options)",
+                );
             } else {
                 db.kv_set(&key(&args[1]), &args[2])?;
                 out.extend_from_slice(b"+OK\r\n");
@@ -213,26 +251,51 @@ fn exec(db: &mut Database, args: &[Vec<u8>], proto: &mut u8, out: &mut Vec<u8>) 
             }
             int(out, n);
         }
-        "INCR" | "DECR" if argc(1, out) => int(out, db.kv_incr(&key(&args[1]), if name == "INCR" { 1 } else { -1 })?),
-        "INCRBY" | "DECRBY" if argc(2, out) => match std::str::from_utf8(&args[2]).ok().and_then(|s| s.parse::<i64>().ok()) {
-            Some(by) => int(out, db.kv_incr(&key(&args[1]), if name == "INCRBY" { by } else { -by })?),
+        "INCR" | "DECR" if argc(1, out) => int(
+            out,
+            db.kv_incr(&key(&args[1]), if name == "INCR" { 1 } else { -1 })?,
+        ),
+        "INCRBY" | "DECRBY" if argc(2, out) => match std::str::from_utf8(&args[2])
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
+        {
+            Some(by) => int(
+                out,
+                db.kv_incr(&key(&args[1]), if name == "INCRBY" { by } else { -by })?,
+            ),
             None => err(out, "value is not an integer or out of range"),
         },
         "KEYS" if argc(1, out) => {
             let pat = &args[1];
-            let literal = pat.iter().position(|b| matches!(b, b'*' | b'?' | b'\\' | b'[')).unwrap_or(pat.len());
-            let keys: Vec<String> =
-                db.kv_keys(&key(&pat[..literal]))?.into_iter().filter(|k| glob(pat, k.as_bytes())).collect();
+            let literal = pat
+                .iter()
+                .position(|b| matches!(b, b'*' | b'?' | b'\\' | b'['))
+                .unwrap_or(pat.len());
+            let keys: Vec<String> = db
+                .kv_keys(&key(&pat[..literal]))?
+                .into_iter()
+                .filter(|k| glob(pat, k.as_bytes()))
+                .collect();
             out.extend_from_slice(format!("*{}\r\n", keys.len()).as_bytes());
             for k in keys {
                 bulk(out, *proto, Some(k.as_bytes()));
             }
         }
         "DBSIZE" => int(out, db.kv_keys("")?.len() as i64),
-        "TTL" | "PTTL" if argc(1, out) => int(out, if db.kv_get(&key(&args[1]))?.is_some() { -1 } else { -2 }),
+        "TTL" | "PTTL" if argc(1, out) => int(
+            out,
+            if db.kv_get(&key(&args[1]))?.is_some() {
+                -1
+            } else {
+                -2
+            },
+        ),
         // the `if argc(..)` guards above fall through to here after writing their own error
         _ if !out.is_empty() => {}
-        _ => err(out, &format!("unknown or unsupported command '{}'", name.to_lowercase())),
+        _ => err(
+            out,
+            &format!("unknown or unsupported command '{}'", name.to_lowercase()),
+        ),
     }
     Ok(true)
 }
@@ -263,7 +326,11 @@ pub fn handle_with(stream: TcpStream, mut db: Database, limits: &Limits) {
                     let _ = db.rollback();
                 }
                 out.clear();
-                let prefix = if matches!(e, Error::Type(_)) { "value is not an integer or out of range: " } else { "" };
+                let prefix = if matches!(e, Error::Type(_)) {
+                    "value is not an integer or out of range: "
+                } else {
+                    ""
+                };
                 err(&mut out, &format!("{prefix}{e}"));
                 true
             }

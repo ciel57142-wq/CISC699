@@ -11,7 +11,10 @@ use crate::value::{JsonParser, Value};
 pub enum Tok {
     /// Unquoted word: `lower` is used for keywords and relational names,
     /// `orig` keeps the case for document field paths and collection names.
-    Word { lower: String, orig: String },
+    Word {
+        lower: String,
+        orig: String,
+    },
     /// Quoted identifier (`"x"` or `` `x` ``), case preserved.
     Ident(String),
     Int(i64),
@@ -44,8 +47,13 @@ pub fn lex(src: &str) -> Result<Vec<Tok>> {
                 i += 1;
             }
             let orig: String = cs[start..i].iter().map(|x| x.1).collect();
-            out.push(Tok::Word { lower: orig.to_lowercase(), orig });
-        } else if c.is_ascii_digit() || (c == '.' && next.is_some_and(|n| n.is_ascii_digit()) && !after_name(&out)) {
+            out.push(Tok::Word {
+                lower: orig.to_lowercase(),
+                orig,
+            });
+        } else if c.is_ascii_digit()
+            || (c == '.' && next.is_some_and(|n| n.is_ascii_digit()) && !after_name(&out))
+        {
             let start = i;
             let mut float = false;
             while i < cs.len() && (cs[i].1.is_ascii_digit() || cs[i].1 == '.') {
@@ -66,7 +74,11 @@ pub fn lex(src: &str) -> Result<Vec<Tok>> {
                 }
             }
             let text: String = cs[start..i].iter().map(|x| x.1).collect();
-            let tok = if float { None } else { text.parse::<i64>().ok().map(Tok::Int) };
+            let tok = if float {
+                None
+            } else {
+                text.parse::<i64>().ok().map(Tok::Int)
+            };
             match tok {
                 Some(t) => out.push(t),
                 None => match text.parse::<f64>() {

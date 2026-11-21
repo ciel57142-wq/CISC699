@@ -47,9 +47,17 @@ pub enum SourceKind {
 
 impl SourceKind {
     fn scope(&self, alias: &str) -> Scope {
-        let col = |n: &str, kind| ScopeCol { alias: alias.to_string(), name: n.to_string(), kind };
+        let col = |n: &str, kind| ScopeCol {
+            alias: alias.to_string(),
+            name: n.to_string(),
+            kind,
+        };
         match self {
-            SourceKind::Table(s) => s.cols.iter().map(|c| col(&c.name, ColKind::Column)).collect(),
+            SourceKind::Table(s) => s
+                .cols
+                .iter()
+                .map(|c| col(&c.name, ColKind::Column))
+                .collect(),
             SourceKind::Collection(_) => vec![col(alias, ColKind::Doc)],
             SourceKind::Kv(_) => vec![col("key", ColKind::Column), col("value", ColKind::Column)],
         }
@@ -67,16 +75,53 @@ pub struct AggSpec {
 pub enum Logical {
     /// One empty row (SELECT without FROM).
     Unit,
-    Scan { src: SourceKind, alias: String, filter: Vec<Expr> },
-    Derived { input: Box<Logical>, alias: String },
-    Filter { input: Box<Logical>, pred: Expr },
-    Join { left: Box<Logical>, right: Box<Logical>, kind: JoinKind, on: Vec<Expr>, right_width: usize },
-    Aggregate { input: Box<Logical>, group: Vec<Expr>, aggs: Vec<AggSpec>, width: usize },
-    Project { input: Box<Logical>, exprs: Vec<Expr> },
-    Distinct { input: Box<Logical> },
-    Sort { input: Box<Logical>, keys: Vec<(Expr, bool)> },
-    Limit { input: Box<Logical>, limit: Option<usize>, offset: usize },
-    Union { left: Box<Logical>, right: Box<Logical>, all: bool },
+    Scan {
+        src: SourceKind,
+        alias: String,
+        filter: Vec<Expr>,
+    },
+    Derived {
+        input: Box<Logical>,
+        alias: String,
+    },
+    Filter {
+        input: Box<Logical>,
+        pred: Expr,
+    },
+    Join {
+        left: Box<Logical>,
+        right: Box<Logical>,
+        kind: JoinKind,
+        on: Vec<Expr>,
+        right_width: usize,
+    },
+    Aggregate {
+        input: Box<Logical>,
+        group: Vec<Expr>,
+        aggs: Vec<AggSpec>,
+        width: usize,
+    },
+    Project {
+        input: Box<Logical>,
+        exprs: Vec<Expr>,
+    },
+    Distinct {
+        input: Box<Logical>,
+    },
+    Sort {
+        input: Box<Logical>,
+        keys: Vec<(Expr, bool)>,
+    },
+    Limit {
+        input: Box<Logical>,
+        limit: Option<usize>,
+        offset: usize,
+    },
+    Union {
+        left: Box<Logical>,
+        right: Box<Logical>,
+        all: bool,
+    },
 }
 
 // =========================================================== physical plan
@@ -93,18 +138,35 @@ pub enum TablePath {
     /// Point lookups by full primary key (one entry per IN-list value).
     PkPoints(Vec<Vec<Expr>>),
     /// Leading primary-key equalities plus an optional range on the next key column.
-    PkRange { eq: Vec<Expr>, lo: Option<Bound>, hi: Option<Bound> },
+    PkRange {
+        eq: Vec<Expr>,
+        lo: Option<Bound>,
+        hi: Option<Bound>,
+    },
     /// Secondary index: equality on leading columns, optional range on the next one.
-    Index { ix: Index, eq: Vec<Expr>, lo: Option<Bound>, hi: Option<Bound> },
+    Index {
+        ix: Index,
+        eq: Vec<Expr>,
+        lo: Option<Bound>,
+        hi: Option<Bound>,
+    },
     /// Secondary index point lookups for an IN list on its first column.
-    IndexIn { ix: Index, vals: Vec<Expr> },
+    IndexIn {
+        ix: Index,
+        vals: Vec<Expr>,
+    },
 }
 
 #[derive(Debug, Clone)]
 pub enum DocPath {
     FullScan,
     Ids(Vec<Expr>),
-    Index { field: String, eq: Option<Expr>, lo: Option<Bound>, hi: Option<Bound> },
+    Index {
+        field: String,
+        eq: Option<Expr>,
+        lo: Option<Bound>,
+        hi: Option<Bound>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -112,7 +174,10 @@ pub enum KvPath {
     FullScan,
     Keys(Vec<Expr>),
     Prefix(String),
-    Range { lo: Option<Bound>, hi: Option<Bound> },
+    Range {
+        lo: Option<Bound>,
+        hi: Option<Bound>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -125,10 +190,27 @@ pub enum Access {
 #[derive(Debug, Clone)]
 pub enum PhysOp {
     Unit,
-    Scan { access: Access, alias: String, filter: Option<Expr>, limit: Option<usize> },
-    Derived { input: Box<Node>, alias: String },
-    Filter { input: Box<Node>, pred: Expr },
-    NestedLoopJoin { left: Box<Node>, right: Box<Node>, on: Option<Expr>, outer: bool, right_width: usize },
+    Scan {
+        access: Access,
+        alias: String,
+        filter: Option<Expr>,
+        limit: Option<usize>,
+    },
+    Derived {
+        input: Box<Node>,
+        alias: String,
+    },
+    Filter {
+        input: Box<Node>,
+        pred: Expr,
+    },
+    NestedLoopJoin {
+        left: Box<Node>,
+        right: Box<Node>,
+        on: Option<Expr>,
+        outer: bool,
+        right_width: usize,
+    },
     HashJoin {
         left: Box<Node>,
         right: Box<Node>,
@@ -140,13 +222,40 @@ pub enum PhysOp {
     },
     /// For each left row, look matching rows up in the right source through
     /// its index / primary key / document id / key-value key.
-    LookupJoin { left: Box<Node>, right: Box<Node>, on: Option<Expr>, outer: bool, right_width: usize },
-    HashAggregate { input: Box<Node>, group: Vec<Expr>, aggs: Vec<AggSpec>, width: usize },
-    Project { input: Box<Node>, exprs: Vec<Expr> },
-    Distinct { input: Box<Node> },
-    Sort { input: Box<Node>, keys: Vec<(Expr, bool)> },
-    Limit { input: Box<Node>, limit: Option<usize>, offset: usize },
-    Union { left: Box<Node>, right: Box<Node>, all: bool },
+    LookupJoin {
+        left: Box<Node>,
+        right: Box<Node>,
+        on: Option<Expr>,
+        outer: bool,
+        right_width: usize,
+    },
+    HashAggregate {
+        input: Box<Node>,
+        group: Vec<Expr>,
+        aggs: Vec<AggSpec>,
+        width: usize,
+    },
+    Project {
+        input: Box<Node>,
+        exprs: Vec<Expr>,
+    },
+    Distinct {
+        input: Box<Node>,
+    },
+    Sort {
+        input: Box<Node>,
+        keys: Vec<(Expr, bool)>,
+    },
+    Limit {
+        input: Box<Node>,
+        limit: Option<usize>,
+        offset: usize,
+    },
+    Union {
+        left: Box<Node>,
+        right: Box<Node>,
+        all: bool,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -199,20 +308,40 @@ fn conjuncts(e: Expr, out: &mut Vec<Expr>) {
 }
 
 fn and_all(mut v: Vec<Expr>) -> Option<Expr> {
-    let first = if v.is_empty() { return None } else { v.remove(0) };
-    Some(v.into_iter().fold(first, |a, b| Expr::Bin(Box::new(a), Op::And, Box::new(b))))
+    let first = if v.is_empty() {
+        return None;
+    } else {
+        v.remove(0)
+    };
+    Some(
+        v.into_iter()
+            .fold(first, |a, b| Expr::Bin(Box::new(a), Op::And, Box::new(b))),
+    )
 }
 
 /// Visit every direct sub-expression.
 fn children(e: &Expr) -> Vec<&Expr> {
     match e {
-        Expr::Lit(_) | Expr::Col(_) | Expr::Slot { .. } | Expr::Default | Expr::Exists(..) | Expr::ScalarQuery(_) => vec![],
-        Expr::Not(a) | Expr::Neg(a) | Expr::IsNull(a, _) | Expr::Cast(a, _) | Expr::InQuery(a, ..) => vec![a],
+        Expr::Lit(_)
+        | Expr::Col(_)
+        | Expr::Slot { .. }
+        | Expr::Default
+        | Expr::Exists(..)
+        | Expr::ScalarQuery(_) => vec![],
+        Expr::Not(a)
+        | Expr::Neg(a)
+        | Expr::IsNull(a, _)
+        | Expr::Cast(a, _)
+        | Expr::InQuery(a, ..) => vec![a],
         Expr::Bin(a, _, b) | Expr::Like(a, b, _) => vec![a, b],
         Expr::In(a, l, _) => std::iter::once(&**a).chain(l.iter()).collect(),
         Expr::Agg(_, a, _) => a.iter().map(|x| &**x).collect(),
         Expr::Func(_, a) => a.iter().collect(),
-        Expr::Case { operand, whens, otherwise } => operand
+        Expr::Case {
+            operand,
+            whens,
+            otherwise,
+        } => operand
             .iter()
             .map(|x| &**x)
             .chain(whens.iter().flat_map(|(w, t)| [w, t]))
@@ -231,12 +360,23 @@ fn map_children(e: Expr, f: &mut dyn FnMut(Expr) -> Result<Expr>) -> Result<Expr
         Expr::InQuery(a, s, n) => Expr::InQuery(b(a, f)?, s, n),
         Expr::Bin(a, op, c) => Expr::Bin(b(a, f)?, op, b(c, f)?),
         Expr::Like(a, c, n) => Expr::Like(b(a, f)?, b(c, f)?, n),
-        Expr::In(a, l, n) => Expr::In(b(a, f)?, l.into_iter().map(&mut *f).collect::<Result<_>>()?, n),
+        Expr::In(a, l, n) => Expr::In(
+            b(a, f)?,
+            l.into_iter().map(&mut *f).collect::<Result<_>>()?,
+            n,
+        ),
         Expr::Agg(func, a, d) => Expr::Agg(func, a.map(|x| b(x, f)).transpose()?, d),
         Expr::Func(n, a) => Expr::Func(n, a.into_iter().map(&mut *f).collect::<Result<_>>()?),
-        Expr::Case { operand, whens, otherwise } => Expr::Case {
+        Expr::Case {
+            operand,
+            whens,
+            otherwise,
+        } => Expr::Case {
             operand: operand.map(|x| b(x, f)).transpose()?,
-            whens: whens.into_iter().map(|(w, t)| Ok((f(w)?, f(t)?))).collect::<Result<_>>()?,
+            whens: whens
+                .into_iter()
+                .map(|(w, t)| Ok((f(w)?, f(t)?)))
+                .collect::<Result<_>>()?,
             otherwise: otherwise.map(|x| b(x, f)).transpose()?,
         },
         other => other,
@@ -248,7 +388,8 @@ fn map_children(e: Expr, f: &mut dyn FnMut(Expr) -> Result<Expr>) -> Result<Expr
 fn refs(e: &Expr, subs: &[(Logical, bool)]) -> Option<BTreeSet<usize>> {
     let mut out = BTreeSet::new();
     fn walk(e: &Expr, subs: &[(Logical, bool)], out: &mut BTreeSet<usize>) -> bool {
-        let sub_ok = |s: &SubRef| matches!(s, SubRef::Bound(i) if !subs.get(*i).is_none_or(|x| x.1));
+        let sub_ok =
+            |s: &SubRef| matches!(s, SubRef::Bound(i) if !subs.get(*i).is_none_or(|x| x.1));
         match e {
             Expr::Slot { level: 0, idx, .. } => {
                 out.insert(*idx);
@@ -269,9 +410,17 @@ fn has_agg(e: &Expr) -> bool {
 /// Add `delta` to level-0 slot indexes (moving an expression to another row layout).
 pub fn shift_slots(e: Expr, delta: isize) -> Expr {
     match e {
-        Expr::Slot { level: 0, idx, path, name } => {
-            Expr::Slot { level: 0, idx: (idx as isize + delta) as usize, path, name }
-        }
+        Expr::Slot {
+            level: 0,
+            idx,
+            path,
+            name,
+        } => Expr::Slot {
+            level: 0,
+            idx: (idx as isize + delta) as usize,
+            path,
+            name,
+        },
         other => map_children(other, &mut |c| Ok(shift_slots(c, delta))).expect("infallible"),
     }
 }
@@ -280,8 +429,20 @@ pub fn shift_slots(e: Expr, delta: isize) -> Expr {
 /// moved one row-context deeper).
 pub fn shift_levels(e: Expr, min_level: usize, by: usize) -> Expr {
     match e {
-        Expr::Slot { level, idx, path, name } if level >= min_level => Expr::Slot { level: level + by, idx, path, name },
-        other => map_children(other, &mut |c| Ok(shift_levels(c, min_level, by))).expect("infallible"),
+        Expr::Slot {
+            level,
+            idx,
+            path,
+            name,
+        } if level >= min_level => Expr::Slot {
+            level: level + by,
+            idx,
+            path,
+            name,
+        },
+        other => {
+            map_children(other, &mut |c| Ok(shift_levels(c, min_level, by))).expect("infallible")
+        }
     }
 }
 
@@ -299,7 +460,10 @@ fn label(e: &Expr) -> String {
             if *d { "distinct " } else { "" },
             arg.as_ref().map_or("*".to_string(), |a| label(a))
         ),
-        Expr::Func(n, args) => format!("{n}({})", args.iter().map(label).collect::<Vec<_>>().join(", ")),
+        Expr::Func(n, args) => format!(
+            "{n}({})",
+            args.iter().map(label).collect::<Vec<_>>().join(", ")
+        ),
         Expr::Cast(a, _) => label(a),
         Expr::ScalarQuery(_) => "subquery".into(),
         Expr::Exists(..) => "exists".into(),
@@ -316,7 +480,14 @@ pub fn valid_collection(name: &str) -> bool {
 
 impl<'c, 'a> Planner<'c, 'a> {
     pub fn new(ctx: &'c Ctx<'a>) -> Self {
-        Planner { ctx, subs: Vec::new(), outer: Vec::new(), used: vec![0], depth: 0, docs_flag: false }
+        Planner {
+            ctx,
+            subs: Vec::new(),
+            outer: Vec::new(),
+            used: vec![0],
+            depth: 0,
+            docs_flag: false,
+        }
     }
 
     fn resolve_in(scope: &Scope, path: &[String]) -> Result<Option<(usize, Vec<String>, String)>> {
@@ -335,27 +506,41 @@ impl<'c, 'a> Planner<'c, 'a> {
                         return Ok(Some((i, path[2..].to_vec(), path[1..].join("."))));
                     }
                 }
-                return Err(Error::Schema(format!("no such column '{}.{}'", path[0], path[1])));
+                return Err(Error::Schema(format!(
+                    "no such column '{}.{}'",
+                    path[0], path[1]
+                )));
             }
         }
         if path.len() == 1 {
             let a = path[0].to_lowercase();
-            if let Some(i) = scope.iter().position(|c| c.kind == ColKind::Doc && c.alias == a) {
+            if let Some(i) = scope
+                .iter()
+                .position(|c| c.kind == ColKind::Doc && c.alias == a)
+            {
                 return Ok(Some((i, vec![], scope[i].name.clone())));
             }
         }
         let want = path[0].to_lowercase();
         let hits: Vec<usize> = (0..scope.len())
-            .filter(|i| scope[*i].kind == ColKind::Column && (scope[*i].name == path[0] || scope[*i].name == want))
+            .filter(|i| {
+                scope[*i].kind == ColKind::Column
+                    && (scope[*i].name == path[0] || scope[*i].name == want)
+            })
             .collect();
         match hits.len() {
             1 => return Ok(Some((hits[0], path[1..].to_vec(), path.join(".")))),
             n if n > 1 => {
-                return Err(Error::Schema(format!("column '{}' is ambiguous; qualify it with a table name", path[0])))
+                return Err(Error::Schema(format!(
+                    "column '{}' is ambiguous; qualify it with a table name",
+                    path[0]
+                )))
             }
             _ => {}
         }
-        let docs: Vec<usize> = (0..scope.len()).filter(|i| scope[*i].kind == ColKind::Doc).collect();
+        let docs: Vec<usize> = (0..scope.len())
+            .filter(|i| scope[*i].kind == ColKind::Doc)
+            .collect();
         match docs.len() {
             1 => Ok(Some((docs[0], path.to_vec(), path.join(".")))),
             0 => Ok(None),
@@ -368,7 +553,12 @@ impl<'c, 'a> Planner<'c, 'a> {
 
     fn resolve(&mut self, scope: &Scope, path: &[String]) -> Result<Expr> {
         if let Some((idx, p, name)) = Self::resolve_in(scope, path)? {
-            return Ok(Expr::Slot { level: 0, idx, path: p, name });
+            return Ok(Expr::Slot {
+                level: 0,
+                idx,
+                path: p,
+                name,
+            });
         }
         for (k, sc) in self.outer.iter().enumerate() {
             if let Some((idx, p, name)) = Self::resolve_in(sc, path)? {
@@ -376,7 +566,12 @@ impl<'c, 'a> Planner<'c, 'a> {
                 if let Some(u) = self.used.last_mut() {
                     *u = (*u).max(level);
                 }
-                return Ok(Expr::Slot { level, idx, path: p, name });
+                return Ok(Expr::Slot {
+                    level,
+                    idx,
+                    path: p,
+                    name,
+                });
             }
         }
         Err(match path {
@@ -394,13 +589,21 @@ impl<'c, 'a> Planner<'c, 'a> {
                 let id = self.subquery(*q, scope, Some(1))?;
                 Ok(Expr::InQuery(Box::new(a), SubRef::Bound(id), n))
             }
-            Expr::Exists(SubRef::Parsed(q), n) => Ok(Expr::Exists(SubRef::Bound(self.subquery(*q, scope, None)?), n)),
-            Expr::ScalarQuery(SubRef::Parsed(q)) => Ok(Expr::ScalarQuery(SubRef::Bound(self.subquery(*q, scope, Some(1))?))),
+            Expr::Exists(SubRef::Parsed(q), n) => Ok(Expr::Exists(
+                SubRef::Bound(self.subquery(*q, scope, None)?),
+                n,
+            )),
+            Expr::ScalarQuery(SubRef::Parsed(q)) => Ok(Expr::ScalarQuery(SubRef::Bound(
+                self.subquery(*q, scope, Some(1))?,
+            ))),
             Expr::Func(name, args) => {
                 if !known_function(&name) {
                     return Err(Error::Parse(format!("unknown function '{name}'")));
                 }
-                let args = args.into_iter().map(|a| self.bind(a, scope)).collect::<Result<_>>()?;
+                let args = args
+                    .into_iter()
+                    .map(|a| self.bind(a, scope))
+                    .collect::<Result<_>>()?;
                 Ok(Expr::Func(name, args))
             }
             other => map_children(other, &mut |c| self.bind(c, scope)),
@@ -418,7 +621,10 @@ impl<'c, 'a> Planner<'c, 'a> {
         let (plan, cols) = res?;
         if let Some(n) = want_cols {
             if cols.len() != n {
-                return Err(Error::Schema(format!("subquery must return {n} column, not {}", cols.len())));
+                return Err(Error::Schema(format!(
+                    "subquery must return {n} column, not {}",
+                    cols.len()
+                )));
             }
         }
         if used > 1 {
@@ -437,14 +643,24 @@ impl<'c, 'a> Planner<'c, 'a> {
                     Model::Relational => SourceKind::Table(Schema::load(self.ctx, &o.name)?),
                     Model::Document => {
                         if !valid_collection(&o.name) {
-                            return Err(Error::Schema(format!("invalid collection name '{}'", o.name)));
+                            return Err(Error::Schema(format!(
+                                "invalid collection name '{}'",
+                                o.name
+                            )));
                         }
                         SourceKind::Collection(o.name)
                     }
                     Model::Kv => SourceKind::Kv(o.name),
                 };
                 let scope = src.scope(&tr.alias);
-                Ok((Logical::Scan { src, alias: tr.alias, filter: vec![] }, scope))
+                Ok((
+                    Logical::Scan {
+                        src,
+                        alias: tr.alias,
+                        filter: vec![],
+                    },
+                    scope,
+                ))
             }
             Source::Subquery(q) => {
                 // a derived table cannot see the FROM items beside it, only enclosing queries
@@ -452,41 +668,73 @@ impl<'c, 'a> Planner<'c, 'a> {
                 let res = self.query(*q);
                 self.depth -= 1;
                 let (plan, cols) = res?;
-                let scope =
-                    cols.into_iter().map(|n| ScopeCol { alias: tr.alias.clone(), name: n, kind: ColKind::Column }).collect();
-                Ok((Logical::Derived { input: Box::new(plan), alias: tr.alias }, scope))
+                let scope = cols
+                    .into_iter()
+                    .map(|n| ScopeCol {
+                        alias: tr.alias.clone(),
+                        name: n,
+                        kind: ColKind::Column,
+                    })
+                    .collect();
+                Ok((
+                    Logical::Derived {
+                        input: Box::new(plan),
+                        alias: tr.alias,
+                    },
+                    scope,
+                ))
             }
         }
     }
 
     /// Plan a full query; returns the logical plan and its output column names.
     pub fn query(&mut self, q: Query) -> Result<(Logical, Vec<String>)> {
-        let Query { body, order_by, limit, offset } = q;
+        let Query {
+            body,
+            order_by,
+            limit,
+            offset,
+        } = q;
         if let SetExpr::Select(sel) = body {
             return self.select(*sel, order_by, limit, offset);
         }
         let (plan, cols) = self.set_expr(body)?;
-        let scope: Scope =
-            cols.iter().map(|c| ScopeCol { alias: String::new(), name: c.clone(), kind: ColKind::Column }).collect();
+        let scope: Scope = cols
+            .iter()
+            .map(|c| ScopeCol {
+                alias: String::new(),
+                name: c.clone(),
+                kind: ColKind::Column,
+            })
+            .collect();
         let mut plan = plan;
         if !order_by.is_empty() {
             let mut keys = Vec::new();
             for (e, desc) in order_by {
                 let e = match e {
-                    Expr::Lit(Value::Int(k)) if k >= 1 && (k as usize) <= cols.len() => Expr::Slot {
-                        level: 0,
-                        idx: k as usize - 1,
-                        path: vec![],
-                        name: cols[k as usize - 1].clone(),
-                    },
+                    Expr::Lit(Value::Int(k)) if k >= 1 && (k as usize) <= cols.len() => {
+                        Expr::Slot {
+                            level: 0,
+                            idx: k as usize - 1,
+                            path: vec![],
+                            name: cols[k as usize - 1].clone(),
+                        }
+                    }
                     e => self.bind(e, &scope)?,
                 };
                 keys.push((e, desc));
             }
-            plan = Logical::Sort { input: Box::new(plan), keys };
+            plan = Logical::Sort {
+                input: Box::new(plan),
+                keys,
+            };
         }
         if limit.is_some() || offset > 0 {
-            plan = Logical::Limit { input: Box::new(plan), limit, offset };
+            plan = Logical::Limit {
+                input: Box::new(plan),
+                limit,
+                offset,
+            };
         }
         Ok((plan, cols))
     }
@@ -504,7 +752,14 @@ impl<'c, 'a> Planner<'c, 'a> {
                         rc.len()
                     )));
                 }
-                Ok((Logical::Union { left: Box::new(lp), right: Box::new(rp), all }, lc))
+                Ok((
+                    Logical::Union {
+                        left: Box::new(lp),
+                        right: Box::new(rp),
+                        all,
+                    },
+                    lc,
+                ))
             }
         }
     }
@@ -527,7 +782,10 @@ impl<'c, 'a> Planner<'c, 'a> {
             scope.extend(sc);
             for j in s.joins {
                 if scope.iter().any(|c| c.alias == j.table.alias) {
-                    return Err(Error::Schema(format!("table name '{}' used twice; give it an alias", j.table.alias)));
+                    return Err(Error::Schema(format!(
+                        "table name '{}' used twice; give it an alias",
+                        j.table.alias
+                    )));
                 }
                 let (p, sc) = self.source(j.table)?;
                 let off = scope.len();
@@ -546,7 +804,9 @@ impl<'c, 'a> Planner<'c, 'a> {
         if let Some(f) = s.filter {
             let f = self.bind(f, &scope)?;
             if has_agg(&f) {
-                return Err(Error::Parse("aggregate functions are not allowed in WHERE".into()));
+                return Err(Error::Parse(
+                    "aggregate functions are not allowed in WHERE".into(),
+                ));
             }
             conjuncts(f, &mut where_c);
         }
@@ -555,7 +815,10 @@ impl<'c, 'a> Planner<'c, 'a> {
         if !parts.is_empty() {
             plan = self.build_joins(parts, where_c)?;
         } else if let Some(f) = and_all(where_c) {
-            plan = Logical::Filter { input: Box::new(plan), pred: f };
+            plan = Logical::Filter {
+                input: Box::new(plan),
+                pred: f,
+            };
         }
 
         // 4. select list
@@ -569,13 +832,31 @@ impl<'c, 'a> Planner<'c, 'a> {
                     }
                     for (i, c) in scope.iter().enumerate() {
                         star_doc |= c.kind == ColKind::Doc;
-                        items.push((Expr::Slot { level: 0, idx: i, path: vec![], name: c.name.clone() }, c.name.clone(), false));
+                        items.push((
+                            Expr::Slot {
+                                level: 0,
+                                idx: i,
+                                path: vec![],
+                                name: c.name.clone(),
+                            },
+                            c.name.clone(),
+                            false,
+                        ));
                     }
                 }
                 Item::TableStar(t) => {
                     let before = items.len();
                     for (i, c) in scope.iter().enumerate().filter(|(_, c)| c.alias == t) {
-                        items.push((Expr::Slot { level: 0, idx: i, path: vec![], name: c.name.clone() }, c.name.clone(), false));
+                        items.push((
+                            Expr::Slot {
+                                level: 0,
+                                idx: i,
+                                path: vec![],
+                                name: c.name.clone(),
+                            },
+                            c.name.clone(),
+                            false,
+                        ));
                     }
                     if items.len() == before {
                         return Err(Error::Schema(format!("no table '{t}' in this query")));
@@ -594,10 +875,22 @@ impl<'c, 'a> Planner<'c, 'a> {
         let mut order = Vec::new();
         for (e, desc) in order_by {
             let e = match e {
-                Expr::Col(p) if p.len() == 1 && items.iter().any(|(_, n, a)| *a && n.eq_ignore_ascii_case(&p[0])) => {
-                    items.iter().find(|(_, n, a)| *a && n.eq_ignore_ascii_case(&p[0])).unwrap().0.clone()
+                Expr::Col(p)
+                    if p.len() == 1
+                        && items
+                            .iter()
+                            .any(|(_, n, a)| *a && n.eq_ignore_ascii_case(&p[0])) =>
+                {
+                    items
+                        .iter()
+                        .find(|(_, n, a)| *a && n.eq_ignore_ascii_case(&p[0]))
+                        .unwrap()
+                        .0
+                        .clone()
                 }
-                Expr::Lit(Value::Int(k)) if k >= 1 && (k as usize) <= items.len() => items[k as usize - 1].0.clone(),
+                Expr::Lit(Value::Int(k)) if k >= 1 && (k as usize) <= items.len() => {
+                    items[k as usize - 1].0.clone()
+                }
                 e => self.bind(e, &scope)?,
             };
             order.push((e, desc));
@@ -605,12 +898,17 @@ impl<'c, 'a> Planner<'c, 'a> {
         let mut group = Vec::new();
         for e in s.group_by {
             let e = match e {
-                Expr::Lit(Value::Int(k)) if k >= 1 && (k as usize) <= items.len() => items[k as usize - 1].0.clone(),
+                Expr::Lit(Value::Int(k)) if k >= 1 && (k as usize) <= items.len() => {
+                    items[k as usize - 1].0.clone()
+                }
                 Expr::Col(p)
                     if p.len() == 1
                         && !matches!(Self::resolve_in(&scope, &p)?, Some((i, _, _)) if scope[i].kind == ColKind::Column) =>
                 {
-                    match items.iter().find(|(_, n, a)| *a && n.eq_ignore_ascii_case(&p[0])) {
+                    match items
+                        .iter()
+                        .find(|(_, n, a)| *a && n.eq_ignore_ascii_case(&p[0]))
+                    {
                         Some(i) => i.0.clone(),
                         None => self.bind(Expr::Col(p), &scope)?,
                     }
@@ -618,7 +916,9 @@ impl<'c, 'a> Planner<'c, 'a> {
                 e => self.bind(e, &scope)?,
             };
             if has_agg(&e) {
-                return Err(Error::Parse("aggregate functions are not allowed in GROUP BY".into()));
+                return Err(Error::Parse(
+                    "aggregate functions are not allowed in GROUP BY".into(),
+                ));
             }
             group.push(e);
         }
@@ -643,9 +943,17 @@ impl<'c, 'a> Planner<'c, 'a> {
             for o in order.iter_mut() {
                 o.0 = extract(o.0.clone())?;
             }
-            plan = Logical::Aggregate { input: Box::new(plan), group, aggs, width };
+            plan = Logical::Aggregate {
+                input: Box::new(plan),
+                group,
+                aggs,
+                width,
+            };
             if let Some(h) = having {
-                plan = Logical::Filter { input: Box::new(plan), pred: h };
+                plan = Logical::Filter {
+                    input: Box::new(plan),
+                    pred: h,
+                };
             }
         } else if having.is_some() {
             return Err(Error::Parse("HAVING needs GROUP BY or an aggregate".into()));
@@ -653,15 +961,27 @@ impl<'c, 'a> Planner<'c, 'a> {
 
         // 6. sort (before projection, so keys can use any column), project, distinct, limit
         if !order.is_empty() {
-            plan = Logical::Sort { input: Box::new(plan), keys: order };
+            plan = Logical::Sort {
+                input: Box::new(plan),
+                keys: order,
+            };
         }
         let names: Vec<String> = items.iter().map(|i| i.1.clone()).collect();
-        plan = Logical::Project { input: Box::new(plan), exprs: items.into_iter().map(|i| i.0).collect() };
+        plan = Logical::Project {
+            input: Box::new(plan),
+            exprs: items.into_iter().map(|i| i.0).collect(),
+        };
         if s.distinct {
-            plan = Logical::Distinct { input: Box::new(plan) };
+            plan = Logical::Distinct {
+                input: Box::new(plan),
+            };
         }
         if limit.is_some() || offset > 0 {
-            plan = Logical::Limit { input: Box::new(plan), limit, offset };
+            plan = Logical::Limit {
+                input: Box::new(plan),
+                limit,
+                offset,
+            };
         }
         if docs_output && self.depth == 0 {
             self.docs_flag = true;
@@ -671,7 +991,11 @@ impl<'c, 'a> Planner<'c, 'a> {
 
     /// Push WHERE / ON conjuncts as far down as is semantically safe and
     /// build a left-deep join tree.
-    fn build_joins(&mut self, parts: Vec<(Logical, usize, usize, JoinKind, Option<Expr>)>, where_c: Vec<Expr>) -> Result<Logical> {
+    fn build_joins(
+        &mut self,
+        parts: Vec<(Logical, usize, usize, JoinKind, Option<Expr>)>,
+        where_c: Vec<Expr>,
+    ) -> Result<Logical> {
         let n = parts.len();
         // a source is null-supplying if it is the right side of a LEFT JOIN
         let nullable: Vec<bool> = parts.iter().map(|p| p.3 == JoinKind::Left).collect();
@@ -688,7 +1012,15 @@ impl<'c, 'a> Planner<'c, 'a> {
             owner
         };
         let last_source = |set: &BTreeSet<usize>| -> usize {
-            set.iter().map(|s| ranges.iter().position(|(a, b)| s >= a && s < b).unwrap_or(0)).max().unwrap_or(0)
+            set.iter()
+                .map(|s| {
+                    ranges
+                        .iter()
+                        .position(|(a, b)| s >= a && s < b)
+                        .unwrap_or(0)
+                })
+                .max()
+                .unwrap_or(0)
         };
         let mut scan_filters: Vec<Vec<Expr>> = vec![Vec::new(); n];
         let mut join_on: Vec<Vec<Expr>> = vec![Vec::new(); n];
@@ -702,8 +1034,14 @@ impl<'c, 'a> Planner<'c, 'a> {
             conjuncts(on, &mut cs);
             for c in cs {
                 match refs(&c, &self.subs) {
-                    Some(set) if !set.is_empty() && owner_of(&set) == Some(j) => scan_filters[j].push(c),
-                    Some(set) if parts[j].3 != JoinKind::Left && !set.is_empty() && last_source(&set) < j => {
+                    Some(set) if !set.is_empty() && owner_of(&set) == Some(j) => {
+                        scan_filters[j].push(c)
+                    }
+                    Some(set)
+                        if parts[j].3 != JoinKind::Left
+                            && !set.is_empty()
+                            && last_source(&set) < j =>
+                    {
                         match owner_of(&set) {
                             Some(o) if !nullable[o] => scan_filters[o].push(c),
                             _ => join_on[last_source(&set).max(1)].push(c),
@@ -722,7 +1060,13 @@ impl<'c, 'a> Planner<'c, 'a> {
                     _ => {
                         let j = last_source(&set);
                         // an inner join's condition can absorb it (enables hash/lookup joins)
-                        if j > 0 && parts[j].3 != JoinKind::Left && !(0..=j).any(|k| nullable[k] && set.iter().any(|s| *s >= ranges[k].0 && *s < ranges[k].1)) {
+                        if j > 0
+                            && parts[j].3 != JoinKind::Left
+                            && !(0..=j).any(|k| {
+                                nullable[k]
+                                    && set.iter().any(|s| *s >= ranges[k].0 && *s < ranges[k].1)
+                            })
+                        {
                             join_on[j].push(c);
                         } else {
                             residual.push(c);
@@ -738,7 +1082,11 @@ impl<'c, 'a> Planner<'c, 'a> {
         let mut plan = push_scan_filter(first, f0, off0);
         for (j, ((p, off, width, kind, _), f)) in it {
             let right = push_scan_filter(p, f, off);
-            let kind = if kind == JoinKind::Cross && !join_on[j].is_empty() { JoinKind::Inner } else { kind };
+            let kind = if kind == JoinKind::Cross && !join_on[j].is_empty() {
+                JoinKind::Inner
+            } else {
+                kind
+            };
             plan = Logical::Join {
                 left: Box::new(plan),
                 right: Box::new(right),
@@ -748,7 +1096,10 @@ impl<'c, 'a> Planner<'c, 'a> {
             };
         }
         if let Some(f) = and_all(residual) {
-            plan = Logical::Filter { input: Box::new(plan), pred: f };
+            plan = Logical::Filter {
+                input: Box::new(plan),
+                pred: f,
+            };
         }
         Ok(plan)
     }
@@ -759,13 +1110,23 @@ fn push_scan_filter(p: Logical, filters: Vec<Expr>, offset: usize) -> Logical {
     if filters.is_empty() {
         return p;
     }
-    let local: Vec<Expr> = filters.into_iter().map(|e| shift_slots(e, -(offset as isize))).collect();
+    let local: Vec<Expr> = filters
+        .into_iter()
+        .map(|e| shift_slots(e, -(offset as isize)))
+        .collect();
     match p {
-        Logical::Scan { src, alias, mut filter } => {
+        Logical::Scan {
+            src,
+            alias,
+            mut filter,
+        } => {
             filter.extend(local);
             Logical::Scan { src, alias, filter }
         }
-        other => Logical::Filter { input: Box::new(other), pred: and_all(local).expect("non-empty") },
+        other => Logical::Filter {
+            input: Box::new(other),
+            pred: and_all(local).expect("non-empty"),
+        },
     }
 }
 
@@ -776,8 +1137,17 @@ fn extract_aggs(e: Expr, width: usize, aggs: &mut Vec<AggSpec>) -> Result<Expr> 
                 return Err(Error::Parse("aggregate functions cannot be nested".into()));
             }
             let name = label(&Expr::Agg(func, arg.clone(), distinct));
-            aggs.push(AggSpec { func, arg: arg.map(|a| *a), distinct });
-            Ok(Expr::Slot { level: 0, idx: width + aggs.len() - 1, path: vec![], name })
+            aggs.push(AggSpec {
+                func,
+                arg: arg.map(|a| *a),
+                distinct,
+            });
+            Ok(Expr::Slot {
+                level: 0,
+                idx: width + aggs.len() - 1,
+                path: vec![],
+                name,
+            })
         }
         other => map_children(other, &mut |c| extract_aggs(c, width, aggs)),
     }
@@ -802,8 +1172,19 @@ enum PredOp {
 fn is_const(e: &Expr) -> bool {
     match e {
         Expr::Slot { level, .. } => *level > 0,
-        Expr::Exists(..) | Expr::ScalarQuery(_) | Expr::InQuery(..) | Expr::Agg(..) | Expr::Col(_) => false,
-        Expr::Func(name, _) if matches!(name.as_str(), "now" | "current_timestamp" | "current_date" | "current_time") => true,
+        Expr::Exists(..)
+        | Expr::ScalarQuery(_)
+        | Expr::InQuery(..)
+        | Expr::Agg(..)
+        | Expr::Col(_) => false,
+        Expr::Func(name, _)
+            if matches!(
+                name.as_str(),
+                "now" | "current_timestamp" | "current_date" | "current_time"
+            ) =>
+        {
+            true
+        }
         _ => children(e).into_iter().all(is_const),
     }
 }
@@ -817,22 +1198,59 @@ fn analyze(e: &Expr) -> Option<Pred> {
     match e {
         Expr::Bin(a, op @ (Op::Eq | Op::Lt | Op::Le | Op::Gt | Op::Ge), b) => {
             let (col, k, op) = match (&**a, &**b) {
-                (Expr::Slot { level: 0, idx, path, .. }, k) if is_const(k) => ((*idx, path.clone()), k.clone(), *op),
-                (k, Expr::Slot { level: 0, idx, path, .. }) if is_const(k) => ((*idx, path.clone()), k.clone(), op.flip()),
+                (
+                    Expr::Slot {
+                        level: 0,
+                        idx,
+                        path,
+                        ..
+                    },
+                    k,
+                ) if is_const(k) => ((*idx, path.clone()), k.clone(), *op),
+                (
+                    k,
+                    Expr::Slot {
+                        level: 0,
+                        idx,
+                        path,
+                        ..
+                    },
+                ) if is_const(k) => ((*idx, path.clone()), k.clone(), op.flip()),
                 _ => return None,
             };
-            Some(Pred { col: col.0, path: col.1, op: PredOp::Cmp(op, k) })
+            Some(Pred {
+                col: col.0,
+                path: col.1,
+                op: PredOp::Cmp(op, k),
+            })
         }
         Expr::In(a, list, false) => match &**a {
-            Expr::Slot { level: 0, idx, path, .. } if list.iter().all(is_const) => {
-                Some(Pred { col: *idx, path: path.clone(), op: PredOp::In(list.clone()) })
-            }
+            Expr::Slot {
+                level: 0,
+                idx,
+                path,
+                ..
+            } if list.iter().all(is_const) => Some(Pred {
+                col: *idx,
+                path: path.clone(),
+                op: PredOp::In(list.clone()),
+            }),
             _ => None,
         },
         Expr::Like(a, p, false) => match (&**a, &**p) {
-            (Expr::Slot { level: 0, idx, path, .. }, Expr::Lit(Value::Text(pat))) => {
-                like_prefix(pat).map(|pre| Pred { col: *idx, path: path.clone(), op: PredOp::Prefix(pre) })
-            }
+            (
+                Expr::Slot {
+                    level: 0,
+                    idx,
+                    path,
+                    ..
+                },
+                Expr::Lit(Value::Text(pat)),
+            ) => like_prefix(pat).map(|pre| Pred {
+                col: *idx,
+                path: path.clone(),
+                op: PredOp::Prefix(pre),
+            }),
             _ => None,
         },
         _ => None,
@@ -840,7 +1258,10 @@ fn analyze(e: &Expr) -> Option<Pred> {
 }
 
 fn bound(e: &Expr, inclusive: bool) -> Option<Bound> {
-    Some(Bound { expr: e.clone(), inclusive })
+    Some(Bound {
+        expr: e.clone(),
+        inclusive,
+    })
 }
 
 /// Lower and upper bound from the range predicates on one column (the tightest literal wins).
@@ -849,7 +1270,12 @@ fn range_of(preds: &[&Pred], col: usize, path: &[String]) -> (Option<Bound>, Opt
     let tighter = |cur: &Option<Bound>, new: &Expr, lower: bool| -> bool {
         match (cur, new) {
             (None, _) => true,
-            (Some(Bound { expr: Expr::Lit(a), .. }), Expr::Lit(b)) => {
+            (
+                Some(Bound {
+                    expr: Expr::Lit(a), ..
+                }),
+                Expr::Lit(b),
+            ) => {
                 let o = b.total_cmp(a);
                 if lower {
                     o == std::cmp::Ordering::Greater
@@ -889,13 +1315,19 @@ fn in_of<'p>(preds: &'p [&Pred], col: usize, path: &[String]) -> Option<&'p Vec<
 /// A literal whose type the column cannot hold exactly can never use the index.
 fn literal_fits(ty: Ty, e: &Expr) -> bool {
     match e {
-        Expr::Lit(v) => coerce_type(ty, v.clone()).is_ok_and(|c| !c.is_null() && c.rank() == v.rank()),
+        Expr::Lit(v) => {
+            coerce_type(ty, v.clone()).is_ok_and(|c| !c.is_null() && c.rank() == v.rank())
+        }
         _ => true, // checked again at execution time
     }
 }
 
 fn table_path(s: &Schema, filters: &[Expr]) -> TablePath {
-    let preds: Vec<Pred> = filters.iter().filter_map(analyze).filter(|p| p.path.is_empty()).collect();
+    let preds: Vec<Pred> = filters
+        .iter()
+        .filter_map(analyze)
+        .filter(|p| p.path.is_empty())
+        .collect();
     let preds: Vec<&Pred> = preds.iter().collect();
     let ty = |c: usize| s.cols[c].ty;
     let fits = |c: usize, e: &Expr| literal_fits(ty(c), e);
@@ -903,11 +1335,17 @@ fn table_path(s: &Schema, filters: &[Expr]) -> TablePath {
     // 1. full primary key equality, or an IN list on a single-column key
     let pk = s.pk_positions();
     if !pk.is_empty() {
-        if let Some(vals) = pk.iter().map(|c| eq(*c).cloned()).collect::<Option<Vec<_>>>() {
+        if let Some(vals) = pk
+            .iter()
+            .map(|c| eq(*c).cloned())
+            .collect::<Option<Vec<_>>>()
+        {
             return TablePath::PkPoints(vec![vals]);
         }
         if pk.len() == 1 {
-            if let Some(list) = in_of(&preds, pk[0], &[]).filter(|l| l.iter().all(|e| fits(pk[0], e))) {
+            if let Some(list) =
+                in_of(&preds, pk[0], &[]).filter(|l| l.iter().all(|e| fits(pk[0], e)))
+            {
                 return TablePath::PkPoints(list.iter().map(|e| vec![e.clone()]).collect());
             }
         }
@@ -929,7 +1367,10 @@ fn table_path(s: &Schema, filters: &[Expr]) -> TablePath {
         let k = eqs.len();
         let (lo, hi) = if k < cols.len() {
             let (lo, hi) = range_of(&preds, cols[k], &[]);
-            (lo.filter(|b| fits(cols[k], &b.expr)), hi.filter(|b| fits(cols[k], &b.expr)))
+            (
+                lo.filter(|b| fits(cols[k], &b.expr)),
+                hi.filter(|b| fits(cols[k], &b.expr)),
+            )
         } else {
             (None, None)
         };
@@ -943,16 +1384,32 @@ fn table_path(s: &Schema, filters: &[Expr]) -> TablePath {
             50 + 2 * k + usize::from(lo.is_some() || hi.is_some())
         } else if lo.is_some() || hi.is_some() {
             40
-        } else if let Some(list) = in_of(&preds, cols[0], &[]).filter(|l| l.iter().all(|e| fits(cols[0], e))) {
+        } else if let Some(list) =
+            in_of(&preds, cols[0], &[]).filter(|l| l.iter().all(|e| fits(cols[0], e)))
+        {
             if best.as_ref().is_none_or(|b| b.0 < 45) {
-                best = Some((45, TablePath::IndexIn { ix: ix.clone(), vals: list.clone() }));
+                best = Some((
+                    45,
+                    TablePath::IndexIn {
+                        ix: ix.clone(),
+                        vals: list.clone(),
+                    },
+                ));
             }
             continue;
         } else {
             continue;
         };
         if best.as_ref().is_none_or(|b| b.0 < score) {
-            best = Some((score, TablePath::Index { ix: ix.clone(), eq: eqs, lo, hi }));
+            best = Some((
+                score,
+                TablePath::Index {
+                    ix: ix.clone(),
+                    eq: eqs,
+                    lo,
+                    hi,
+                },
+            ));
         }
     }
     // 3. primary key prefix / range
@@ -967,9 +1424,17 @@ fn table_path(s: &Schema, filters: &[Expr]) -> TablePath {
         let k = eqs.len();
         if k < pk.len() {
             let (lo, hi) = range_of(&preds, pk[k], &[]);
-            let (lo, hi) = (lo.filter(|b| fits(pk[k], &b.expr)), hi.filter(|b| fits(pk[k], &b.expr)));
-            let score = if k > 0 { 50 + 2 * k + usize::from(lo.is_some() || hi.is_some()) } else { 41 };
-            if (k > 0 || lo.is_some() || hi.is_some()) && best.as_ref().is_none_or(|b| b.0 < score) {
+            let (lo, hi) = (
+                lo.filter(|b| fits(pk[k], &b.expr)),
+                hi.filter(|b| fits(pk[k], &b.expr)),
+            );
+            let score = if k > 0 {
+                50 + 2 * k + usize::from(lo.is_some() || hi.is_some())
+            } else {
+                41
+            };
+            if (k > 0 || lo.is_some() || hi.is_some()) && best.as_ref().is_none_or(|b| b.0 < score)
+            {
                 // a range on a single-column key must be over integers or text (the key encoding)
                 let ok = pk.len() > 1 || matches!(ty(pk[0]), Ty::Int | Ty::Text);
                 if ok {
@@ -982,35 +1447,62 @@ fn table_path(s: &Schema, filters: &[Expr]) -> TablePath {
 }
 
 fn doc_path(ctx: &Ctx, coll: &str, filters: &[Expr]) -> Result<DocPath> {
-    let preds: Vec<Pred> = filters.iter().filter_map(analyze).filter(|p| !p.path.is_empty()).collect();
+    let preds: Vec<Pred> = filters
+        .iter()
+        .filter_map(analyze)
+        .filter(|p| !p.path.is_empty())
+        .collect();
     let preds: Vec<&Pred> = preds.iter().collect();
     let id = vec!["_id".to_string()];
-    let id_ok = |e: &Expr| !matches!(e, Expr::Lit(v) if !matches!(v, Value::Int(_) | Value::Text(_)));
+    let id_ok =
+        |e: &Expr| !matches!(e, Expr::Lit(v) if !matches!(v, Value::Int(_) | Value::Text(_)));
     if let Some(e) = eq_of(&preds, 0, &id).filter(|e| id_ok(e)) {
         return Ok(DocPath::Ids(vec![e.clone()]));
     }
     if let Some(l) = in_of(&preds, 0, &id).filter(|l| l.iter().all(id_ok)) {
         return Ok(DocPath::Ids(l.clone()));
     }
-    let scalar = |e: &Expr| !matches!(e, Expr::Lit(Value::Null | Value::Array(_) | Value::Object(_)));
+    let scalar = |e: &Expr| {
+        !matches!(
+            e,
+            Expr::Lit(Value::Null | Value::Array(_) | Value::Object(_))
+        )
+    };
     let indexed = crate::doc::indexes(ctx, coll)?;
     let mut best: Option<DocPath> = None;
     for field in indexed {
         let path: Vec<String> = field.split('.').map(String::from).collect();
         if let Some(e) = eq_of(&preds, 0, &path).filter(|e| scalar(e)) {
-            return Ok(DocPath::Index { field, eq: Some(e.clone()), lo: None, hi: None });
+            return Ok(DocPath::Index {
+                field,
+                eq: Some(e.clone()),
+                lo: None,
+                hi: None,
+            });
         }
         let (lo, hi) = range_of(&preds, 0, &path);
-        let (lo, hi) = (lo.filter(|b| scalar(&b.expr)), hi.filter(|b| scalar(&b.expr)));
+        let (lo, hi) = (
+            lo.filter(|b| scalar(&b.expr)),
+            hi.filter(|b| scalar(&b.expr)),
+        );
         if (lo.is_some() || hi.is_some()) && best.is_none() {
-            best = Some(DocPath::Index { field, eq: None, lo, hi });
+            best = Some(DocPath::Index {
+                field,
+                eq: None,
+                lo,
+                hi,
+            });
         }
     }
     Ok(best.unwrap_or(DocPath::FullScan))
 }
 
 fn kv_path(filters: &[Expr]) -> KvPath {
-    let preds: Vec<Pred> = filters.iter().filter_map(analyze).filter(|p| p.col == 0 && p.path.is_empty()).collect();
+    let preds: Vec<Pred> = filters
+        .iter()
+        .filter_map(analyze)
+        .filter(|p| p.col == 0 && p.path.is_empty())
+        .collect();
     let preds: Vec<&Pred> = preds.iter().collect();
     if let Some(e) = eq_of(&preds, 0, &[]) {
         return KvPath::Keys(vec![e.clone()]);
@@ -1070,7 +1562,10 @@ fn equi_keys(on: &[Expr], left_width: usize) -> (Vec<Expr>, Vec<Expr>) {
 }
 
 fn is_free_of_outer_subs(e: &Expr) -> bool {
-    !matches!(e, Expr::Exists(..) | Expr::ScalarQuery(_) | Expr::InQuery(..)) && children(e).into_iter().all(is_free_of_outer_subs)
+    !matches!(
+        e,
+        Expr::Exists(..) | Expr::ScalarQuery(_) | Expr::InQuery(..)
+    ) && children(e).into_iter().all(is_free_of_outer_subs)
 }
 
 impl<'c, 'a> PhysPlanner<'c, 'a> {
@@ -1080,14 +1575,26 @@ impl<'c, 'a> PhysPlanner<'c, 'a> {
 
     fn node(&mut self, op: PhysOp) -> Node {
         self.next_id += 1;
-        Node { id: self.next_id - 1, op }
+        Node {
+            id: self.next_id - 1,
+            op,
+        }
     }
 
     fn access(&self, src: &SourceKind, filters: &[Expr]) -> Result<Access> {
         Ok(match src {
-            SourceKind::Table(s) => Access::Table { schema: s.clone(), path: table_path(s, filters) },
-            SourceKind::Collection(c) => Access::Doc { coll: c.clone(), path: doc_path(self.ctx, c, filters)? },
-            SourceKind::Kv(ns) => Access::Kv { ns: ns.clone(), path: kv_path(filters) },
+            SourceKind::Table(s) => Access::Table {
+                schema: s.clone(),
+                path: table_path(s, filters),
+            },
+            SourceKind::Collection(c) => Access::Doc {
+                coll: c.clone(),
+                path: doc_path(self.ctx, c, filters)?,
+            },
+            SourceKind::Kv(ns) => Access::Kv {
+                ns: ns.clone(),
+                path: kv_path(filters),
+            },
         })
     }
 
@@ -1102,7 +1609,12 @@ impl<'c, 'a> PhysPlanner<'c, 'a> {
             Logical::Scan { src, alias, filter } => {
                 let access = self.access(&src, &filter)?;
                 let filter = and_all(filter);
-                self.node(PhysOp::Scan { access, alias, filter, limit })
+                self.node(PhysOp::Scan {
+                    access,
+                    alias,
+                    filter,
+                    limit,
+                })
             }
             Logical::Derived { input, alias } => {
                 let input = Box::new(self.plan(*input)?);
@@ -1112,7 +1624,13 @@ impl<'c, 'a> PhysPlanner<'c, 'a> {
                 let input = Box::new(self.plan(*input)?);
                 self.node(PhysOp::Filter { input, pred })
             }
-            Logical::Join { left, right, kind, on, right_width } => {
+            Logical::Join {
+                left,
+                right,
+                kind,
+                on,
+                right_width,
+            } => {
                 let outer = kind == JoinKind::Left;
                 let left_width = width_of(&left);
                 let left = Box::new(self.plan(*left)?);
@@ -1133,28 +1651,64 @@ impl<'c, 'a> PhysPlanner<'c, 'a> {
                             Access::Kv { path, .. } => matches!(path, KvPath::Keys(_)),
                         };
                         if keyed && uses_outer(&access) {
-                            let rfilter = and_all(filter.iter().cloned().map(|e| shift_levels(e, 1, 1)).collect());
+                            let rfilter = and_all(
+                                filter
+                                    .iter()
+                                    .cloned()
+                                    .map(|e| shift_levels(e, 1, 1))
+                                    .collect(),
+                            );
                             let right = Box::new(self.node(PhysOp::Scan {
                                 access,
                                 alias: alias.clone(),
                                 filter: rfilter,
                                 limit: None,
                             }));
-                            return Ok(self.node(PhysOp::LookupJoin { left, right, on: and_all(on), outer, right_width }));
+                            return Ok(self.node(PhysOp::LookupJoin {
+                                left,
+                                right,
+                                on: and_all(on),
+                                outer,
+                                right_width,
+                            }));
                         }
                     }
                 }
                 let (lk, rk) = equi_keys(&on, left_width);
                 let right = Box::new(self.plan(*right)?);
                 if !lk.is_empty() {
-                    self.node(PhysOp::HashJoin { left, right, lkeys: lk, rkeys: rk, on: and_all(on), outer, right_width })
+                    self.node(PhysOp::HashJoin {
+                        left,
+                        right,
+                        lkeys: lk,
+                        rkeys: rk,
+                        on: and_all(on),
+                        outer,
+                        right_width,
+                    })
                 } else {
-                    self.node(PhysOp::NestedLoopJoin { left, right, on: and_all(on), outer, right_width })
+                    self.node(PhysOp::NestedLoopJoin {
+                        left,
+                        right,
+                        on: and_all(on),
+                        outer,
+                        right_width,
+                    })
                 }
             }
-            Logical::Aggregate { input, group, aggs, width } => {
+            Logical::Aggregate {
+                input,
+                group,
+                aggs,
+                width,
+            } => {
                 let input = Box::new(self.plan(*input)?);
-                self.node(PhysOp::HashAggregate { input, group, aggs, width })
+                self.node(PhysOp::HashAggregate {
+                    input,
+                    group,
+                    aggs,
+                    width,
+                })
             }
             Logical::Project { input, exprs } => {
                 // projection streams: a limit above it can be pushed below it
@@ -1169,10 +1723,18 @@ impl<'c, 'a> PhysPlanner<'c, 'a> {
                 let input = Box::new(self.plan(*input)?);
                 self.node(PhysOp::Sort { input, keys })
             }
-            Logical::Limit { input, limit: n, offset } => {
+            Logical::Limit {
+                input,
+                limit: n,
+                offset,
+            } => {
                 let want = n.map(|n| n.saturating_add(offset));
                 let input = Box::new(self.plan_limited(*input, want)?);
-                self.node(PhysOp::Limit { input, limit: n, offset })
+                self.node(PhysOp::Limit {
+                    input,
+                    limit: n,
+                    offset,
+                })
             }
             Logical::Union { left, right, all } => {
                 let left = Box::new(self.plan(*left)?);
@@ -1186,7 +1748,8 @@ impl<'c, 'a> PhysPlanner<'c, 'a> {
 fn uses_outer(a: &Access) -> bool {
     let has = |e: &Expr| -> bool {
         fn walk(e: &Expr) -> bool {
-            matches!(e, Expr::Slot { level, .. } if *level >= 1) || children(e).into_iter().any(walk)
+            matches!(e, Expr::Slot { level, .. } if *level >= 1)
+                || children(e).into_iter().any(walk)
         }
         walk(e)
     };
@@ -1195,7 +1758,9 @@ fn uses_outer(a: &Access) -> bool {
         Access::Table { path, .. } => match path {
             TablePath::FullScan => false,
             TablePath::PkPoints(v) => v.iter().flatten().any(has),
-            TablePath::PkRange { eq, lo, hi } | TablePath::Index { eq, lo, hi, .. } => eq.iter().any(has) || b(lo) || b(hi),
+            TablePath::PkRange { eq, lo, hi } | TablePath::Index { eq, lo, hi, .. } => {
+                eq.iter().any(has) || b(lo) || b(hi)
+            }
             TablePath::IndexIn { vals, .. } => vals.iter().any(has),
         },
         Access::Doc { path, .. } => match path {
@@ -1215,9 +1780,14 @@ pub fn width_of(l: &Logical) -> usize {
     match l {
         Logical::Unit => 0,
         Logical::Scan { src, alias, .. } => src.scope(alias).len(),
-        Logical::Derived { input, .. } | Logical::Filter { input, .. } | Logical::Distinct { input }
-        | Logical::Sort { input, .. } | Logical::Limit { input, .. } => width_of(input),
-        Logical::Join { left, right_width, .. } => width_of(left) + right_width,
+        Logical::Derived { input, .. }
+        | Logical::Filter { input, .. }
+        | Logical::Distinct { input }
+        | Logical::Sort { input, .. }
+        | Logical::Limit { input, .. } => width_of(input),
+        Logical::Join {
+            left, right_width, ..
+        } => width_of(left) + right_width,
         Logical::Aggregate { width, aggs, .. } => width + aggs.len(),
         Logical::Project { exprs, .. } => exprs.len(),
         Logical::Union { left, .. } => width_of(left),
@@ -1235,20 +1805,39 @@ impl<'c, 'a> Planner<'c, 'a> {
         let root = pp.plan(logical)?;
         let mut subs = Vec::new();
         for (l, correlated) in std::mem::take(&mut b.subs) {
-            subs.push(SubPlan { root: pp.plan(l)?, correlated });
+            subs.push(SubPlan {
+                root: pp.plan(l)?,
+                correlated,
+            });
         }
-        Ok(Plan { root, subs, columns, docs_output, node_count: pp.next_id })
+        Ok(Plan {
+            root,
+            subs,
+            columns,
+            docs_output,
+            node_count: pp.next_id,
+        })
     }
 
     /// Bind an expression against a single source (UPDATE / DELETE), returning
     /// any subqueries it planned.
-    pub fn bind_single(ctx: &'c Ctx<'a>, scope: &Scope, exprs: Vec<Expr>) -> Result<(Vec<Expr>, Vec<SubPlan>, usize)> {
+    pub fn bind_single(
+        ctx: &'c Ctx<'a>,
+        scope: &Scope,
+        exprs: Vec<Expr>,
+    ) -> Result<(Vec<Expr>, Vec<SubPlan>, usize)> {
         let mut b = Planner::new(ctx);
-        let bound = exprs.into_iter().map(|e| b.bind(e, scope)).collect::<Result<Vec<_>>>()?;
+        let bound = exprs
+            .into_iter()
+            .map(|e| b.bind(e, scope))
+            .collect::<Result<Vec<_>>>()?;
         let mut pp = PhysPlanner::new(ctx);
         let mut subs = Vec::new();
         for (l, correlated) in std::mem::take(&mut b.subs) {
-            subs.push(SubPlan { root: pp.plan(l)?, correlated });
+            subs.push(SubPlan {
+                root: pp.plan(l)?,
+                correlated,
+            });
         }
         Ok((bound, subs, pp.next_id))
     }
@@ -1256,7 +1845,11 @@ impl<'c, 'a> Planner<'c, 'a> {
     /// Physical access for a single source with filters (bound to its scope),
     /// used by UPDATE / DELETE to find their target rows through indexes.
     pub fn access_for(ctx: &'c Ctx<'a>, src: &SourceKind, filters: &[Expr]) -> Result<Access> {
-        let usable: Vec<Expr> = filters.iter().filter(|f| refs(f, &[]).is_some()).cloned().collect();
+        let usable: Vec<Expr> = filters
+            .iter()
+            .filter(|f| refs(f, &[]).is_some())
+            .cloned()
+            .collect();
         PhysPlanner::new(ctx).access(src, &usable)
     }
 }

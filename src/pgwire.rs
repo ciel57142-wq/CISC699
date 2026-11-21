@@ -10,8 +10,8 @@
 //! dialect is polydb's, so tools that inspect `pg_catalog` will not work.
 
 use crate::error::Error;
-use crate::value::Value;
 use crate::server::Limits;
+use crate::value::Value;
 use crate::{Database, Output};
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
@@ -40,7 +40,12 @@ fn sqlstate(e: &Error) -> &'static str {
 
 fn error(out: &mut Vec<u8>, code: &str, message: &str) {
     let mut body = Vec::new();
-    for (field, text) in [(b'S', "ERROR"), (b'V', "ERROR"), (b'C', code), (b'M', message)] {
+    for (field, text) in [
+        (b'S', "ERROR"),
+        (b'V', "ERROR"),
+        (b'C', code),
+        (b'M', message),
+    ] {
         body.push(field);
         body.extend_from_slice(text.as_bytes());
         body.push(0);
@@ -70,7 +75,11 @@ fn cell(v: &Value) -> (Option<String>, i32) {
 fn result_set(out: &mut Vec<u8>, columns: &[String], rows: &[Vec<Value>]) {
     let mut body = (columns.len() as i16).to_be_bytes().to_vec();
     for (i, name) in columns.iter().enumerate() {
-        let oid = rows.iter().map(|r| cell(&r[i])).find(|c| c.0.is_some()).map_or(25, |c| c.1);
+        let oid = rows
+            .iter()
+            .map(|r| cell(&r[i]))
+            .find(|c| c.0.is_some())
+            .map_or(25, |c| c.1);
         body.extend_from_slice(name.as_bytes());
         body.push(0);
         body.extend_from_slice(&0i32.to_be_bytes()); // table oid
@@ -125,13 +134,30 @@ fn split_statements(q: &str) -> Vec<&str> {
         }
     }
     out.push(&q[start..]);
-    out.into_iter().map(str::trim).filter(|s| !s.is_empty()).collect()
+    out.into_iter()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 const SESSION_SETTINGS: &[&str] = &[
-    "client_encoding", "datestyle", "extra_float_digits", "application_name", "search_path", "session",
-    "statement_timeout", "timezone", "time", "standard_conforming_strings", "names", "client_min_messages",
-    "intervalstyle", "bytea_output", "lock_timeout", "idle_in_transaction_session_timeout", "transaction",
+    "client_encoding",
+    "datestyle",
+    "extra_float_digits",
+    "application_name",
+    "search_path",
+    "session",
+    "statement_timeout",
+    "timezone",
+    "time",
+    "standard_conforming_strings",
+    "names",
+    "client_min_messages",
+    "intervalstyle",
+    "bytea_output",
+    "lock_timeout",
+    "idle_in_transaction_session_timeout",
+    "transaction",
 ];
 
 /// Run one statement; returns false if it failed.
@@ -171,7 +197,10 @@ fn run_statement(db: &mut Database, stmt: &str, out: &mut Vec<u8>) -> bool {
             true
         }
         Ok(Output::Docs(docs)) => {
-            let rows: Vec<Vec<Value>> = docs.into_iter().map(|d| vec![Value::Text(d.to_json())]).collect();
+            let rows: Vec<Vec<Value>> = docs
+                .into_iter()
+                .map(|d| vec![Value::Text(d.to_json())])
+                .collect();
             result_set(out, &["document".to_string()], &rows);
             true
         }
@@ -180,7 +209,11 @@ fn run_statement(db: &mut Database, stmt: &str, out: &mut Vec<u8>) -> bool {
             true
         }
         Ok(Output::Done(m)) => {
-            let n = m.split_whitespace().next().and_then(|w| w.parse::<u64>().ok()).unwrap_or(0);
+            let n = m
+                .split_whitespace()
+                .next()
+                .and_then(|w| w.parse::<u64>().ok())
+                .unwrap_or(0);
             let tag = match (first.as_str(), second) {
                 ("insert", _) => format!("INSERT 0 {n}"),
                 ("update", _) => format!("UPDATE {n}"),

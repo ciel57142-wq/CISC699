@@ -11,9 +11,10 @@ use crate::error::Result;
 use crate::value::Value;
 
 const RESERVED: &[&str] = &[
-    "where", "join", "inner", "left", "outer", "cross", "on", "group", "order", "by", "limit", "offset", "having",
-    "as", "set", "values", "from", "and", "or", "not", "asc", "desc", "union", "select", "when", "then", "else",
-    "end", "case", "in", "is", "like", "between", "exists", "all", "distinct",
+    "where", "join", "inner", "left", "outer", "cross", "on", "group", "order", "by", "limit",
+    "offset", "having", "as", "set", "values", "from", "and", "or", "not", "asc", "desc", "union",
+    "select", "when", "then", "else", "end", "case", "in", "is", "like", "between", "exists",
+    "all", "distinct",
 ];
 
 /// Limits on one expression. The parser, binder and evaluator are recursive,
@@ -34,11 +35,19 @@ fn bx(e: Expr) -> Box<Expr> {
 
 /// Parse exactly one statement (a trailing `;` is allowed).
 pub fn parse(src: &str) -> Result<Stmt> {
-    let mut p = Parser { t: lex(src)?, i: 0, nest: 0, ops: 0 };
+    let mut p = Parser {
+        t: lex(src)?,
+        i: 0,
+        nest: 0,
+        ops: 0,
+    };
     let st = p.statement()?;
     p.sym(";");
     if p.peek().is_some() {
-        return perr(format!("unexpected {} after the end of the statement", p.found()));
+        return perr(format!(
+            "unexpected {} after the end of the statement",
+            p.found()
+        ));
     }
     Ok(st)
 }
@@ -85,7 +94,11 @@ impl Parser {
         if self.kw(k) {
             Ok(())
         } else {
-            perr(format!("expected {}, found {}", k.to_uppercase(), self.found()))
+            perr(format!(
+                "expected {}, found {}",
+                k.to_uppercase(),
+                self.found()
+            ))
         }
     }
 
@@ -172,7 +185,10 @@ impl Parser {
                 self.i += 1;
                 Ok(n as usize)
             }
-            _ => perr(format!("expected a non-negative integer, found {}", self.found())),
+            _ => perr(format!(
+                "expected a non-negative integer, found {}",
+                self.found()
+            )),
         }
     }
 
@@ -181,19 +197,26 @@ impl Parser {
         let model = match self.peek() {
             Some(Tok::Word { lower, .. }) => match lower.as_str() {
                 "relational" if self.peek_at(1) == Some(&Tok::Sym(".")) => Some(Model::Relational),
-                "document" | "doc" if self.peek_at(1) == Some(&Tok::Sym(".")) => Some(Model::Document),
+                "document" | "doc" if self.peek_at(1) == Some(&Tok::Sym(".")) => {
+                    Some(Model::Document)
+                }
                 "kv" => Some(Model::Kv),
                 _ => None,
             },
             _ => None,
         };
         let Some(model) = model else {
-            return Ok(ObjectName { model: default, name: self.ident()? });
+            return Ok(ObjectName {
+                model: default,
+                name: self.ident()?,
+            });
         };
         self.i += 1;
         match model {
             Model::Kv => {
-                let name = if self.peek_sym(".") && matches!(self.peek_at(1), Some(Tok::Word { .. } | Tok::Ident(_))) {
+                let name = if self.peek_sym(".")
+                    && matches!(self.peek_at(1), Some(Tok::Word { .. } | Tok::Ident(_)))
+                {
                     self.i += 1;
                     self.ident()?
                 } else {
@@ -203,12 +226,17 @@ impl Parser {
             }
             Model::Relational => {
                 self.expect_sym(".")?;
-                Ok(ObjectName { model, name: self.ident()? })
+                Ok(ObjectName {
+                    model,
+                    name: self.ident()?,
+                })
             }
             Model::Document => {
                 self.expect_sym(".")?;
                 let mut name = self.ident_orig()?;
-                if self.peek_sym(".") && matches!(self.peek_at(1), Some(Tok::Word { .. } | Tok::Ident(_))) {
+                if self.peek_sym(".")
+                    && matches!(self.peek_at(1), Some(Tok::Word { .. } | Tok::Ident(_)))
+                {
                     self.i += 1;
                     name = format!("{name}.{}", self.ident_orig()?);
                 }
@@ -221,7 +249,10 @@ impl Parser {
         if self.kw("explain") {
             let analyze = self.kw("analyze");
             let stmt = self.statement()?;
-            return Ok(Stmt::Explain { analyze, stmt: Box::new(stmt) });
+            return Ok(Stmt::Explain {
+                analyze,
+                stmt: Box::new(stmt),
+            });
         }
         if self.peek_kw("select") || self.peek_sym("(") {
             return self.query().map(Stmt::Query);
@@ -235,7 +266,11 @@ impl Parser {
                 None
             };
             if self.peek_kw("select") || self.peek_sym("(") {
-                return Ok(Stmt::Insert { target, cols, source: InsertSource::Query(Box::new(self.query()?)) });
+                return Ok(Stmt::Insert {
+                    target,
+                    cols,
+                    source: InsertSource::Query(Box::new(self.query()?)),
+                });
             }
             self.expect_kw("values")?;
             let mut rows = Vec::new();
@@ -257,7 +292,11 @@ impl Parser {
                     break;
                 }
             }
-            return Ok(Stmt::Insert { target, cols, source: InsertSource::Values(rows) });
+            return Ok(Stmt::Insert {
+                target,
+                cols,
+                source: InsertSource::Values(rows),
+            });
         }
         if self.kw("update") {
             let target = self.object_name(Model::Relational)?;
@@ -275,15 +314,32 @@ impl Parser {
                     break;
                 }
             }
-            let filter = if self.kw("where") { Some(self.expr()?) } else { None };
-            return Ok(Stmt::Update { target, alias, sets, filter });
+            let filter = if self.kw("where") {
+                Some(self.expr()?)
+            } else {
+                None
+            };
+            return Ok(Stmt::Update {
+                target,
+                alias,
+                sets,
+                filter,
+            });
         }
         if self.kw("delete") {
             self.expect_kw("from")?;
             let target = self.object_name(Model::Relational)?;
             let alias = self.alias()?.unwrap_or_else(|| default_alias(&target));
-            let filter = if self.kw("where") { Some(self.expr()?) } else { None };
-            return Ok(Stmt::Delete { target, alias, filter });
+            let filter = if self.kw("where") {
+                Some(self.expr()?)
+            } else {
+                None
+            };
+            return Ok(Stmt::Delete {
+                target,
+                alias,
+                filter,
+            });
         }
         if self.kw("create") {
             return self.create();
@@ -292,7 +348,10 @@ impl Parser {
             if self.kw("index") {
                 let name = self.ident()?;
                 self.expect_kw("on")?;
-                return Ok(Stmt::DropIndex { name, table: self.ident()? });
+                return Ok(Stmt::DropIndex {
+                    name,
+                    table: self.ident()?,
+                });
             }
             self.expect_kw("table")?;
             let if_exists = if self.kw("if") {
@@ -301,7 +360,10 @@ impl Parser {
             } else {
                 false
             };
-            return Ok(Stmt::DropTable { name: self.ident()?, if_exists });
+            return Ok(Stmt::DropTable {
+                name: self.ident()?,
+                if_exists,
+            });
         }
         if self.kw("alter") {
             self.expect_kw("table")?;
@@ -322,7 +384,10 @@ impl Parser {
                     AlterOp::RenameColumn(from, self.ident()?)
                 }
             } else {
-                return perr(format!("expected ADD, DROP or RENAME after ALTER TABLE, found {}", self.found()));
+                return perr(format!(
+                    "expected ADD, DROP or RENAME after ALTER TABLE, found {}",
+                    self.found()
+                ));
             };
             return Ok(Stmt::AlterTable { table, op });
         }
@@ -330,28 +395,45 @@ impl Parser {
         if self.kw("get") {
             self.expect_kw("from")?;
             let ns = self.kv_name()?;
-            return Ok(Stmt::KvGet { ns, key: self.expr()? });
+            return Ok(Stmt::KvGet {
+                ns,
+                key: self.expr()?,
+            });
         }
         if self.peek_kw("set") && Self::word_is(self.peek_at(1), "kv") {
             self.i += 1;
             let ns = self.kv_name()?;
             let key = self.add_expr_top()?;
             self.expect_sym("=")?;
-            return Ok(Stmt::KvSet { ns, key, value: self.expr()? });
+            return Ok(Stmt::KvSet {
+                ns,
+                key,
+                value: self.expr()?,
+            });
         }
         if self.peek_kw("exists") && Self::word_is(self.peek_at(1), "kv") {
             self.i += 1;
             let ns = self.kv_name()?;
-            return Ok(Stmt::KvExists { ns, key: self.expr()? });
+            return Ok(Stmt::KvExists {
+                ns,
+                key: self.expr()?,
+            });
         }
         if self.kw("increment") {
             self.expect_kw("kv")?;
             let ns = self.kv_name_after_kw()?;
             let key = self.add_expr_top()?;
-            let by = if self.kw("by") { self.expr()? } else { Expr::Lit(Value::Int(1)) };
+            let by = if self.kw("by") {
+                self.expr()?
+            } else {
+                Expr::Lit(Value::Int(1))
+            };
             return Ok(Stmt::KvIncr { ns, key, by });
         }
-        perr(format!("unsupported statement starting at {}", self.found()))
+        perr(format!(
+            "unsupported statement starting at {}",
+            self.found()
+        ))
     }
 
     /// After `KV` has been consumed (or not, for `INCREMENT 'k'`): optional `.ns`.
@@ -415,7 +497,13 @@ impl Parser {
                 }
             }
             self.expect_sym(")")?;
-            return Ok(Stmt::CreateIndex { name, target, cols, unique, if_not_exists });
+            return Ok(Stmt::CreateIndex {
+                name,
+                target,
+                cols,
+                unique,
+                if_not_exists,
+            });
         }
         self.expect_kw("table")?;
         let if_not_exists = self.if_not_exists()?;
@@ -444,7 +532,12 @@ impl Parser {
             }
         }
         self.expect_sym(")")?;
-        Ok(Stmt::CreateTable { name, cols, constraints, if_not_exists })
+        Ok(Stmt::CreateTable {
+            name,
+            cols,
+            constraints,
+            if_not_exists,
+        })
     }
 
     fn if_not_exists(&mut self) -> Result<bool> {
@@ -461,7 +554,11 @@ impl Parser {
     fn references(&mut self, cols: Vec<String>) -> Result<FkDef> {
         self.expect_kw("references")?;
         let table = self.ident()?;
-        let ref_cols = if self.peek_sym("(") { self.ident_list()? } else { Vec::new() };
+        let ref_cols = if self.peek_sym("(") {
+            self.ident_list()?
+        } else {
+            Vec::new()
+        };
         let mut on_delete = FkAction::Restrict;
         while self.kw("on") {
             let is_delete = if self.kw("delete") {
@@ -481,7 +578,10 @@ impl Parser {
                 self.expect_kw("action")?;
                 FkAction::Restrict
             } else {
-                return perr(format!("expected CASCADE, RESTRICT, SET NULL or NO ACTION, found {}", self.found()));
+                return perr(format!(
+                    "expected CASCADE, RESTRICT, SET NULL or NO ACTION, found {}",
+                    self.found()
+                ));
             };
             if is_delete {
                 on_delete = action;
@@ -489,7 +589,12 @@ impl Parser {
                 return perr("only ON UPDATE RESTRICT / NO ACTION is supported");
             }
         }
-        Ok(FkDef { cols, table, ref_cols, on_delete })
+        Ok(FkDef {
+            cols,
+            table,
+            ref_cols,
+            on_delete,
+        })
     }
 
     fn column_def(&mut self) -> Result<ColumnDef> {
@@ -509,7 +614,15 @@ impl Parser {
             }
             self.expect_sym(")")?;
         }
-        let mut col = ColumnDef { name, ty, pk: false, not_null: false, unique: false, default: None, references: None };
+        let mut col = ColumnDef {
+            name,
+            ty,
+            pk: false,
+            not_null: false,
+            unique: false,
+            default: None,
+            references: None,
+        };
         loop {
             if self.kw("primary") {
                 self.expect_kw("key")?;
@@ -550,11 +663,17 @@ impl Parser {
             let Some(alias) = self.alias()? else {
                 return perr("a subquery in FROM needs an alias");
             };
-            return Ok(TableRef { source: Source::Subquery(Box::new(q)), alias });
+            return Ok(TableRef {
+                source: Source::Subquery(Box::new(q)),
+                alias,
+            });
         }
         let name = self.object_name(Model::Relational)?;
         let alias = self.alias()?.unwrap_or_else(|| default_alias(&name));
-        Ok(TableRef { source: Source::Named(name), alias })
+        Ok(TableRef {
+            source: Source::Named(name),
+            alias,
+        })
     }
 
     /// `select_core (UNION [ALL] select_core)* [ORDER BY ..] [LIMIT n] [OFFSET n]`
@@ -568,7 +687,12 @@ impl Parser {
             let right = self.set_term()?;
             body = SetExpr::Union(Box::new(body), Box::new(right), all);
         }
-        let mut q = Query { body, order_by: Vec::new(), limit: None, offset: 0 };
+        let mut q = Query {
+            body,
+            order_by: Vec::new(),
+            limit: None,
+            offset: 0,
+        };
         if self.kw("order") {
             self.expect_kw("by")?;
             loop {
@@ -606,7 +730,10 @@ impl Parser {
                 let sel = Select {
                     distinct: false,
                     items: vec![Item::Star],
-                    from: Some(TableRef { source: Source::Subquery(Box::new(q)), alias: "_branch".into() }),
+                    from: Some(TableRef {
+                        source: Source::Subquery(Box::new(q)),
+                        alias: "_branch".into(),
+                    }),
                     joins: vec![],
                     filter: None,
                     group_by: vec![],
@@ -643,13 +770,24 @@ impl Parser {
                 break;
             }
         }
-        let mut s =
-            Select { distinct, items, from: None, joins: Vec::new(), filter: None, group_by: Vec::new(), having: None };
+        let mut s = Select {
+            distinct,
+            items,
+            from: None,
+            joins: Vec::new(),
+            filter: None,
+            group_by: Vec::new(),
+            having: None,
+        };
         if self.kw("from") {
             s.from = Some(self.table_ref()?);
             loop {
                 if self.sym(",") {
-                    s.joins.push(Join { table: self.table_ref()?, on: None, kind: JoinKind::Cross });
+                    s.joins.push(Join {
+                        table: self.table_ref()?,
+                        on: None,
+                        kind: JoinKind::Cross,
+                    });
                     continue;
                 }
                 let kind = if self.kw("left") {
@@ -708,7 +846,9 @@ impl Parser {
 
     fn enter(&mut self) -> Result<()> {
         if self.nest >= MAX_SQL_NESTING {
-            return perr(format!("expression is nested deeper than {MAX_SQL_NESTING} levels"));
+            return perr(format!(
+                "expression is nested deeper than {MAX_SQL_NESTING} levels"
+            ));
         }
         self.nest += 1;
         if self.nest > 1 {
@@ -817,9 +957,15 @@ impl Parser {
         if neg {
             return perr("expected LIKE, IN or BETWEEN after NOT");
         }
-        for (s, op) in
-            [("=", Op::Eq), ("!=", Op::Ne), ("<>", Op::Ne), ("<=", Op::Le), (">=", Op::Ge), ("<", Op::Lt), (">", Op::Gt)]
-        {
+        for (s, op) in [
+            ("=", Op::Eq),
+            ("!=", Op::Ne),
+            ("<>", Op::Ne),
+            ("<=", Op::Le),
+            (">=", Op::Ge),
+            ("<", Op::Lt),
+            (">", Op::Gt),
+        ] {
             if self.sym(s) {
                 return Ok(Expr::Bin(bx(l), op, bx(self.add_expr()?)));
             }
@@ -921,19 +1067,28 @@ impl Parser {
                     Ok(Expr::Cast(bx(e), ty))
                 }
                 // typed literals: DATE '2024-01-31', TIME '10:00', TIMESTAMP '2024-01-31 10:00:00'
-                "date" | "time" | "timestamp" | "datetime" if matches!(self.peek(), Some(Tok::Str(_))) => {
-                    let Some(Tok::Str(s)) = self.peek().cloned() else { unreachable!() };
+                "date" | "time" | "timestamp" | "datetime"
+                    if matches!(self.peek(), Some(Tok::Str(_))) =>
+                {
+                    let Some(Tok::Str(s)) = self.peek().cloned() else {
+                        unreachable!()
+                    };
                     self.i += 1;
                     let ty = Ty::from_name(&lower).unwrap_or(Ty::Text);
                     let v = crate::query::eval::coerce_type(ty, Value::Text(s))?;
                     Ok(Expr::Lit(v))
                 }
-                "current_date" | "current_time" | "current_timestamp" | "localtimestamp" if !self.peek_sym("(") => {
+                "current_date" | "current_time" | "current_timestamp" | "localtimestamp"
+                    if !self.peek_sym("(") =>
+                {
                     Ok(Expr::Func(lower, vec![]))
                 }
                 _ if RESERVED.contains(&lower.as_str()) => {
                     self.i -= 1;
-                    perr(format!("expected an expression, found keyword {}", lower.to_uppercase()))
+                    perr(format!(
+                        "expected an expression, found keyword {}",
+                        lower.to_uppercase()
+                    ))
                 }
                 _ if self.sym("(") => self.call(lower),
                 _ => self.column(orig),
@@ -947,9 +1102,12 @@ impl Parser {
     }
 
     fn case(&mut self) -> Result<Expr> {
-        
         (|| {
-            let operand = if self.peek_kw("when") { None } else { Some(bx(self.expr()?)) };
+            let operand = if self.peek_kw("when") {
+                None
+            } else {
+                Some(bx(self.expr()?))
+            };
             let mut whens = Vec::new();
             while self.kw("when") {
                 let w = self.expr()?;
@@ -959,9 +1117,17 @@ impl Parser {
             if whens.is_empty() {
                 return perr("CASE needs at least one WHEN");
             }
-            let otherwise = if self.kw("else") { Some(bx(self.expr()?)) } else { None };
+            let otherwise = if self.kw("else") {
+                Some(bx(self.expr()?))
+            } else {
+                None
+            };
             self.expect_kw("end")?;
-            Ok(Expr::Case { operand, whens, otherwise })
+            Ok(Expr::Case {
+                operand,
+                whens,
+                otherwise,
+            })
         })()
     }
 
@@ -989,7 +1155,7 @@ impl Parser {
             "max" => Some(AggFn::Max),
             _ => None,
         };
-        
+
         (|| {
             if let Some(f) = agg {
                 if f == AggFn::Count && self.sym("*") {

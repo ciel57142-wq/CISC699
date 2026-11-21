@@ -92,12 +92,20 @@ pub fn encode_id(v: &Value) -> Result<Vec<u8>> {
             // MongoDB ObjectId, kept in extended-JSON form {"$oid": "<24 hex>"}
             Some(Value::Text(h)) if h.len() == 24 && h.bytes().all(|b| b.is_ascii_hexdigit()) => {
                 let mut out = vec![7u8];
-                out.extend((0..12).map(|i| u8::from_str_radix(&h[i * 2..i * 2 + 2], 16).unwrap_or(0)));
+                out.extend(
+                    (0..12).map(|i| u8::from_str_radix(&h[i * 2..i * 2 + 2], 16).unwrap_or(0)),
+                );
                 Ok(out)
             }
-            _ => Err(Error::Type(format!("keys must be integers, strings or ObjectIds, got {}", v.to_json()))),
+            _ => Err(Error::Type(format!(
+                "keys must be integers, strings or ObjectIds, got {}",
+                v.to_json()
+            ))),
         },
-        other => Err(Error::Type(format!("keys must be integers or strings, got {}", other.to_json()))),
+        other => Err(Error::Type(format!(
+            "keys must be integers or strings, got {}",
+            other.to_json()
+        ))),
     }
 }
 
@@ -122,7 +130,11 @@ pub fn encode_index_value(v: &Value) -> Option<Vec<u8>> {
             let f = v.as_f64()?;
             let f = if f == 0.0 { 0.0 } else { f };
             let bits = f.to_bits();
-            let ordered = if bits >> 63 == 1 { !bits } else { bits ^ (1 << 63) };
+            let ordered = if bits >> 63 == 1 {
+                !bits
+            } else {
+                bits ^ (1 << 63)
+            };
             let mut out = vec![2u8];
             out.extend_from_slice(&ordered.to_be_bytes());
             Some(out)

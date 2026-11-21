@@ -39,7 +39,9 @@ pub fn incr(ctx: &mut Ctx, key: &str, by: i64) -> Result<i64> {
             .ok_or_else(|| Error::Type(format!("value at '{key}' is not an integer")))?,
         None => 0,
     };
-    let next = cur.checked_add(by).ok_or_else(|| Error::Type("integer overflow".into()))?;
+    let next = cur
+        .checked_add(by)
+        .ok_or_else(|| Error::Type("integer overflow".into()))?;
     set(ctx, key, next.to_string().as_bytes());
     Ok(next)
 }

@@ -156,7 +156,12 @@ pub enum Expr {
     Col(Vec<String>),
     /// Resolved reference: column `idx` of the row `level` scopes out
     /// (0 = current row, 1 = enclosing query's row, ...), then a JSON path into it.
-    Slot { level: usize, idx: usize, path: Vec<String>, name: String },
+    Slot {
+        level: usize,
+        idx: usize,
+        path: Vec<String>,
+        name: String,
+    },
     Bin(Box<Expr>, Op, Box<Expr>),
     Not(Box<Expr>),
     Neg(Box<Expr>),
@@ -168,7 +173,11 @@ pub enum Expr {
     ScalarQuery(SubRef),
     Agg(AggFn, Option<Box<Expr>>, bool),
     Func(String, Vec<Expr>),
-    Case { operand: Option<Box<Expr>>, whens: Vec<(Expr, Expr)>, otherwise: Option<Box<Expr>> },
+    Case {
+        operand: Option<Box<Expr>>,
+        whens: Vec<(Expr, Expr)>,
+        otherwise: Option<Box<Expr>>,
+    },
     Cast(Box<Expr>, Ty),
     /// `DEFAULT` inside an INSERT's VALUES list.
     Default,
@@ -292,18 +301,71 @@ pub enum InsertSource {
 #[derive(Debug, Clone)]
 pub enum Stmt {
     Query(Query),
-    Explain { analyze: bool, stmt: Box<Stmt> },
-    CreateTable { name: String, cols: Vec<ColumnDef>, constraints: Vec<TableConstraint>, if_not_exists: bool },
-    DropTable { name: String, if_exists: bool },
-    CreateIndex { name: String, target: ObjectName, cols: Vec<String>, unique: bool, if_not_exists: bool },
-    DropIndex { name: String, table: String },
-    AlterTable { table: String, op: AlterOp },
-    Insert { target: ObjectName, cols: Option<Vec<String>>, source: InsertSource },
-    Update { target: ObjectName, alias: String, sets: Vec<(Vec<String>, Expr)>, filter: Option<Expr> },
-    Delete { target: ObjectName, alias: String, filter: Option<Expr> },
-    KvGet { ns: String, key: Expr },
-    KvSet { ns: String, key: Expr, value: Expr },
-    KvExists { ns: String, key: Expr },
-    KvIncr { ns: String, key: Expr, by: Expr },
-    KvDel { ns: String, key: Expr },
+    Explain {
+        analyze: bool,
+        stmt: Box<Stmt>,
+    },
+    CreateTable {
+        name: String,
+        cols: Vec<ColumnDef>,
+        constraints: Vec<TableConstraint>,
+        if_not_exists: bool,
+    },
+    DropTable {
+        name: String,
+        if_exists: bool,
+    },
+    CreateIndex {
+        name: String,
+        target: ObjectName,
+        cols: Vec<String>,
+        unique: bool,
+        if_not_exists: bool,
+    },
+    DropIndex {
+        name: String,
+        table: String,
+    },
+    AlterTable {
+        table: String,
+        op: AlterOp,
+    },
+    Insert {
+        target: ObjectName,
+        cols: Option<Vec<String>>,
+        source: InsertSource,
+    },
+    Update {
+        target: ObjectName,
+        alias: String,
+        sets: Vec<(Vec<String>, Expr)>,
+        filter: Option<Expr>,
+    },
+    Delete {
+        target: ObjectName,
+        alias: String,
+        filter: Option<Expr>,
+    },
+    KvGet {
+        ns: String,
+        key: Expr,
+    },
+    KvSet {
+        ns: String,
+        key: Expr,
+        value: Expr,
+    },
+    KvExists {
+        ns: String,
+        key: Expr,
+    },
+    KvIncr {
+        ns: String,
+        key: Expr,
+        by: Expr,
+    },
+    KvDel {
+        ns: String,
+        key: Expr,
+    },
 }

@@ -20,8 +20,8 @@
 
 use crate::doc::{self, FindOptions};
 use crate::error::Error;
-use crate::value::Value;
 use crate::server::Limits;
+use crate::value::Value;
 use crate::Database;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{self, Read, Write};
@@ -35,7 +35,9 @@ fn bad(msg: &str) -> io::Error {
 }
 
 fn rd_i32(b: &[u8], pos: usize) -> io::Result<i32> {
-    b.get(pos..pos + 4).map(|s| i32::from_le_bytes([s[0], s[1], s[2], s[3]])).ok_or_else(|| bad("truncated"))
+    b.get(pos..pos + 4)
+        .map(|s| i32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+        .ok_or_else(|| bad("truncated"))
 }
 
 fn rd_i64(b: &[u8], pos: usize) -> io::Result<i64> {
@@ -47,7 +49,10 @@ fn rd_i64(b: &[u8], pos: usize) -> io::Result<i64> {
 
 fn rd_cstr(b: &[u8], pos: usize) -> io::Result<(String, usize)> {
     let rest = b.get(pos..).ok_or_else(|| bad("truncated"))?;
-    let end = rest.iter().position(|c| *c == 0).ok_or_else(|| bad("unterminated name"))?;
+    let end = rest
+        .iter()
+        .position(|c| *c == 0)
+        .ok_or_else(|| bad("unterminated name"))?;
     Ok((String::from_utf8_lossy(&rest[..end]).into_owned(), end + 1))
 }
 
@@ -87,7 +92,13 @@ fn decode_elems(b: &[u8], depth: usize) -> io::Result<(Vec<(String, Value)>, usi
         let ty = b[pos];
         let (name, n) = rd_cstr(b, pos + 1)?;
         pos += 1 + n;
-        let need = |len: usize| if pos + len <= total { Ok(()) } else { Err(bad("truncated value")) };
+        let need = |len: usize| {
+            if pos + len <= total {
+                Ok(())
+            } else {
+                Err(bad("truncated value"))
+            }
+        };
         let v = match ty {
             0x01 => {
                 let v = Value::Float(f64::from_bits(rd_i64(b, pos)? as u64));
@@ -100,7 +111,9 @@ fn decode_elems(b: &[u8], depth: usize) -> io::Result<(Vec<(String, Value)>, usi
                 if len == 0 {
                     return Err(bad("bad string length"));
                 }
-                let v = Value::Text(String::from_utf8_lossy(&b[pos + 4..pos + 4 + len - 1]).into_owned());
+                let v = Value::Text(
+                    String::from_utf8_lossy(&b[pos + 4..pos + 4 + len - 1]).into_owned(),
+                );
                 pos += 4 + len;
                 v
             }
@@ -216,9 +229,16 @@ fn encode_elem(out: &mut Vec<u8>, key: &str, v: &Value) {
             // extended-JSON wrappers turn back into native BSON types
             if o.len() == 1 {
                 match o.iter().next() {
-                    Some((k, Value::Text(h))) if k == "$oid" && h.len() == 24 && h.bytes().all(|b| b.is_ascii_hexdigit()) => {
+                    Some((k, Value::Text(h)))
+                        if k == "$oid"
+                            && h.len() == 24
+                            && h.bytes().all(|b| b.is_ascii_hexdigit()) =>
+                    {
                         head(0x07, out);
-                        out.extend((0..12).map(|i| u8::from_str_radix(&h[i * 2..i * 2 + 2], 16).unwrap_or(0)));
+                        out.extend(
+                            (0..12)
+                                .map(|i| u8::from_str_radix(&h[i * 2..i * 2 + 2], 16).unwrap_or(0)),
+                        );
                         return;
                     }
                     Some((k, Value::Int(ms))) if k == "$date" => {
@@ -231,11 +251,18 @@ fn encode_elem(out: &mut Vec<u8>, key: &str, v: &Value) {
                         out.extend_from_slice(&n.to_le_bytes());
                         return;
                     }
-                    Some((k, Value::Text(h))) if k == "$binary" && h.len() % 2 == 0 && h.bytes().all(|b| b.is_ascii_hexdigit()) => {
+                    Some((k, Value::Text(h)))
+                        if k == "$binary"
+                            && h.len() % 2 == 0
+                            && h.bytes().all(|b| b.is_ascii_hexdigit()) =>
+                    {
                         head(0x05, out);
                         out.extend_from_slice(&(h.len() as i32 / 2).to_le_bytes());
                         out.push(0);
-                        out.extend((0..h.len() / 2).map(|i| u8::from_str_radix(&h[i * 2..i * 2 + 2], 16).unwrap_or(0)));
+                        out.extend(
+                            (0..h.len() / 2)
+                                .map(|i| u8::from_str_radix(&h[i * 2..i * 2 + 2], 16).unwrap_or(0)),
+                        );
                         return;
                     }
                     _ => {}
@@ -309,11 +336,22 @@ fn fail_with(e: &Error) -> Value {
 }
 
 fn write_error(index: usize, e: &Error) -> Value {
-    obj(vec![("index", Value::Int(index as i64)), ("code", Value::Int(error_code(e).0)), ("errmsg", e.to_string().into())])
+    obj(vec![
+        ("index", Value::Int(index as i64)),
+        ("code", Value::Int(error_code(e).0)),
+        ("errmsg", e.to_string().into()),
+    ])
 }
 
 fn cursor(ns: &str, batch: Vec<Value>) -> Value {
-    ok(vec![("cursor", obj(vec![("firstBatch", Value::Array(batch)), ("id", long(0)), ("ns", ns.into())]))])
+    ok(vec![(
+        "cursor",
+        obj(vec![
+            ("firstBatch", Value::Array(batch)),
+            ("id", long(0)),
+            ("ns", ns.into()),
+        ]),
+    )])
 }
 
 fn truthy(v: Option<&Value>) -> bool {
@@ -325,7 +363,9 @@ fn truthy(v: Option<&Value>) -> bool {
 }
 
 fn count_of(v: Option<&Value>) -> Option<usize> {
-    v.and_then(Value::as_f64).filter(|n| *n > 0.0).map(|n| n as usize)
+    v.and_then(Value::as_f64)
+        .filter(|n| *n > 0.0)
+        .map(|n| n as usize)
 }
 
 fn list<'a>(cmd: &'a Value, key: &str) -> &'a [Value] {
@@ -336,7 +376,10 @@ fn list<'a>(cmd: &'a Value, key: &str) -> &'a [Value] {
 }
 
 fn now_ms() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// Open cursors of one connection.
@@ -363,12 +406,17 @@ const DEFAULT_FIRST_BATCH: usize = 101;
 
 impl Cursors {
     pub fn new(default_db: &str) -> Cursors {
-        Cursors { open: HashMap::new(), next: 1, default_db: default_db.to_string() }
+        Cursors {
+            open: HashMap::new(),
+            next: 1,
+            default_db: default_db.to_string(),
+        }
     }
 
     fn expire(&mut self) {
         let now = Instant::now();
-        self.open.retain(|_, c| now.duration_since(c.touched) < CURSOR_TIMEOUT);
+        self.open
+            .retain(|_, c| now.duration_since(c.touched) < CURSOR_TIMEOUT);
     }
 
     /// Storage name of a collection in a database: bare for the default
@@ -390,7 +438,13 @@ impl Cursors {
     }
 
     /// Take one batch; returns (batch, cursor id or 0 when exhausted).
-    fn batch(&mut self, ns: &str, mut docs: VecDeque<Value>, size: Option<usize>, existing: Option<i64>) -> (Vec<Value>, i64) {
+    fn batch(
+        &mut self,
+        ns: &str,
+        mut docs: VecDeque<Value>,
+        size: Option<usize>,
+        existing: Option<i64>,
+    ) -> (Vec<Value>, i64) {
         let limit = size.unwrap_or(usize::MAX).max(1);
         let mut out = Vec::new();
         let mut bytes = 0;
@@ -415,11 +469,23 @@ impl Cursors {
             id
         });
         if self.open.len() >= MAX_CURSORS && !self.open.contains_key(&id) {
-            if let Some(oldest) = self.open.iter().min_by_key(|(_, c)| c.touched).map(|(k, _)| *k) {
+            if let Some(oldest) = self
+                .open
+                .iter()
+                .min_by_key(|(_, c)| c.touched)
+                .map(|(k, _)| *k)
+            {
                 self.open.remove(&oldest);
             }
         }
-        self.open.insert(id, Cursor { ns: ns.to_string(), docs, touched: Instant::now() });
+        self.open.insert(
+            id,
+            Cursor {
+                ns: ns.to_string(),
+                docs,
+                touched: Instant::now(),
+            },
+        );
         (out, id)
     }
 }
@@ -432,21 +498,61 @@ fn first_batch(cursors: &mut Cursors, ns: &str, docs: Vec<Value>, cmd: &Value) -
         .or_else(|| count_of(cmd.get("batchSize")))
         .unwrap_or(DEFAULT_FIRST_BATCH);
     let size = (!single).then_some(size);
-    let (batch, id) = if single { (docs, 0) } else { cursors.batch(ns, docs.into(), size, None) };
-    ok(vec![("cursor", obj(vec![("firstBatch", Value::Array(batch)), ("id", long(id)), ("ns", ns.into())]))])
+    let (batch, id) = if single {
+        (docs, 0)
+    } else {
+        cursors.batch(ns, docs.into(), size, None)
+    };
+    ok(vec![(
+        "cursor",
+        obj(vec![
+            ("firstBatch", Value::Array(batch)),
+            ("id", long(id)),
+            ("ns", ns.into()),
+        ]),
+    )])
 }
 
 const COMMANDS: &[&str] = &[
-    "hello", "ismaster", "ping", "endsessions", "abortsessions", "getmore", "killcursors", "dropdatabase", "buildinfo",
-    "whatsmyuri", "insert", "find", "aggregate", "count", "distinct", "update", "delete", "drop", "create",
-    "listcollections", "listdatabases", "createindexes",
+    "hello",
+    "ismaster",
+    "ping",
+    "endsessions",
+    "abortsessions",
+    "getmore",
+    "killcursors",
+    "dropdatabase",
+    "buildinfo",
+    "whatsmyuri",
+    "insert",
+    "find",
+    "aggregate",
+    "count",
+    "distinct",
+    "update",
+    "delete",
+    "drop",
+    "create",
+    "listcollections",
+    "listdatabases",
+    "createindexes",
 ];
 
 /// Execute one database command and build its reply document.
-fn command(db: &mut Database, cursors: &mut Cursors, name: &str, cmd: &Value, conn_id: i64) -> Value {
+fn command(
+    db: &mut Database,
+    cursors: &mut Cursors,
+    name: &str,
+    cmd: &Value,
+    conn_id: i64,
+) -> Value {
     cursors.expire();
     let empty = Value::Object(BTreeMap::new());
-    let dbname = cmd.get("$db").and_then(Value::as_str).unwrap_or(cursors.default_db.as_str()).to_string();
+    let dbname = cmd
+        .get("$db")
+        .and_then(Value::as_str)
+        .unwrap_or(cursors.default_db.as_str())
+        .to_string();
     let short = cmd.get(name).and_then(Value::as_str).unwrap_or("");
     let stored = cursors.coll(&dbname, short);
     let coll = stored.as_str();
@@ -478,12 +584,24 @@ fn command(db: &mut Database, cursors: &mut Cursors, name: &str, cmd: &Value, co
                 let ns = format!("{dbname}.{short}");
                 match cursors.open.remove(&id) {
                     Some(c) if c.ns == ns => {
-                        let (batch, next) = cursors.batch(&ns, c.docs, count_of(cmd.get("batchSize")), Some(id));
-                        ok(vec![("cursor", obj(vec![("nextBatch", Value::Array(batch)), ("id", long(next)), ("ns", ns.as_str().into())]))])
+                        let (batch, next) =
+                            cursors.batch(&ns, c.docs, count_of(cmd.get("batchSize")), Some(id));
+                        ok(vec![(
+                            "cursor",
+                            obj(vec![
+                                ("nextBatch", Value::Array(batch)),
+                                ("id", long(next)),
+                                ("ns", ns.as_str().into()),
+                            ]),
+                        )])
                     }
                     Some(c) => {
                         cursors.open.insert(id, c);
-                        fail(13, "Unauthorized", "cursor belongs to a different namespace")
+                        fail(
+                            13,
+                            "Unauthorized",
+                            "cursor belongs to a different namespace",
+                        )
                     }
                     None => fail(43, "CursorNotFound", &format!("cursor id {id} not found")),
                 }
@@ -492,14 +610,20 @@ fn command(db: &mut Database, cursors: &mut Cursors, name: &str, cmd: &Value, co
                 let mut killed = Vec::new();
                 let mut missing = Vec::new();
                 for c in list(cmd, "cursors") {
-                    let id = c.as_i64().or_else(|| c.get("$numberLong").and_then(Value::as_i64)).unwrap_or(0);
+                    let id = c
+                        .as_i64()
+                        .or_else(|| c.get("$numberLong").and_then(Value::as_i64))
+                        .unwrap_or(0);
                     if cursors.open.remove(&id).is_some() {
                         killed.push(long(id));
                     } else {
                         missing.push(long(id));
                     }
                 }
-                ok(vec![("cursorsKilled", Value::Array(killed)), ("cursorsNotFound", Value::Array(missing))])
+                ok(vec![
+                    ("cursorsKilled", Value::Array(killed)),
+                    ("cursorsNotFound", Value::Array(missing)),
+                ])
             }
             "dropdatabase" => {
                 let mut n = 0;
@@ -509,12 +633,26 @@ fn command(db: &mut Database, cursors: &mut Cursors, name: &str, cmd: &Value, co
                         n += 1;
                     }
                 }
-                ok(vec![("dropped", dbname.as_str().into()), ("collections", Value::Int(n))])
+                ok(vec![
+                    ("dropped", dbname.as_str().into()),
+                    ("collections", Value::Int(n)),
+                ])
             }
             "buildinfo" => ok(vec![
                 ("version", "6.0.0".into()),
-                ("versionArray", Value::Array(vec![Value::Int(6), Value::Int(0), Value::Int(0), Value::Int(0)])),
-                ("gitVersion", format!("polydb-{}", env!("CARGO_PKG_VERSION")).into()),
+                (
+                    "versionArray",
+                    Value::Array(vec![
+                        Value::Int(6),
+                        Value::Int(0),
+                        Value::Int(0),
+                        Value::Int(0),
+                    ]),
+                ),
+                (
+                    "gitVersion",
+                    format!("polydb-{}", env!("CARGO_PKG_VERSION")).into(),
+                ),
                 ("maxBsonObjectSize", Value::Int(16 << 20)),
             ]),
             "whatsmyuri" => ok(vec![("you", "127.0.0.1:0".into())]),
@@ -540,7 +678,10 @@ fn command(db: &mut Database, cursors: &mut Cursors, name: &str, cmd: &Value, co
             }
             "find" => {
                 let opts = FindOptions {
-                    sort: cmd.get("sort").filter(|s| matches!(s, Value::Object(o) if !o.is_empty())).cloned(),
+                    sort: cmd
+                        .get("sort")
+                        .filter(|s| matches!(s, Value::Object(o) if !o.is_empty()))
+                        .cloned(),
                     skip: count_of(cmd.get("skip")).unwrap_or(0),
                     limit: count_of(cmd.get("limit")),
                 };
@@ -555,20 +696,33 @@ fn command(db: &mut Database, cursors: &mut Cursors, name: &str, cmd: &Value, co
                 first_batch(cursors, &ns, docs, cmd)
             }
             "count" => {
-                let n = db.doc_find(coll, cmd.get("query").unwrap_or(&empty), &FindOptions::default())?.len();
+                let n = db
+                    .doc_find(
+                        coll,
+                        cmd.get("query").unwrap_or(&empty),
+                        &FindOptions::default(),
+                    )?
+                    .len();
                 ok(vec![("n", Value::Int(n as i64))])
             }
             "distinct" => {
                 let key = cmd.get("key").and_then(Value::as_str).unwrap_or("");
                 let mut values: Vec<Value> = Vec::new();
-                for d in db.doc_find(coll, cmd.get("query").unwrap_or(&empty), &FindOptions::default())? {
+                for d in db.doc_find(
+                    coll,
+                    cmd.get("query").unwrap_or(&empty),
+                    &FindOptions::default(),
+                )? {
                     let found = match doc::get_path(&d, key) {
                         Some(Value::Array(a)) => a.clone(),
                         Some(v) => vec![v.clone()],
                         None => vec![],
                     };
                     for v in found {
-                        if !values.iter().any(|x| x.total_cmp(&v) == std::cmp::Ordering::Equal) {
+                        if !values
+                            .iter()
+                            .any(|x| x.total_cmp(&v) == std::cmp::Ordering::Equal)
+                        {
                             values.push(v);
                         }
                     }
@@ -587,14 +741,17 @@ fn command(db: &mut Database, cursors: &mut Cursors, name: &str, cmd: &Value, co
                             truthy(u.get("multi")),
                             truthy(u.get("upsert")),
                         ),
-                        _ => Err(Error::Parse("pipeline-style updates are not supported".into())),
+                        _ => Err(Error::Parse(
+                            "pipeline-style updates are not supported".into(),
+                        )),
                     };
                     match res {
                         Ok((changed, new_id)) => {
                             n += changed as i64;
                             if let Some(id) = new_id {
                                 n += 1;
-                                upserted.push(obj(vec![("index", Value::Int(i as i64)), ("_id", id)]));
+                                upserted
+                                    .push(obj(vec![("index", Value::Int(i as i64)), ("_id", id)]));
                             }
                         }
                         Err(e) => {
@@ -637,7 +794,10 @@ fn command(db: &mut Database, cursors: &mut Cursors, name: &str, cmd: &Value, co
             }
             "drop" => {
                 if db.doc_drop(coll)? {
-                    ok(vec![("ns", ns.as_str().into()), ("nIndexesWas", Value::Int(1))])
+                    ok(vec![
+                        ("ns", ns.as_str().into()),
+                        ("nIndexesWas", Value::Int(1)),
+                    ])
                 } else {
                     fail(26, "NamespaceNotFound", "ns not found")
                 }
@@ -663,27 +823,50 @@ fn command(db: &mut Database, cursors: &mut Cursors, name: &str, cmd: &Value, co
                 cursor(&format!("{dbname}.$cmd.listCollections"), batch)
             }
             "listdatabases" => {
-                let mut names: Vec<String> = db.doc_collections()?.iter().map(|c| cursors.split(c).0.to_string()).collect();
+                let mut names: Vec<String> = db
+                    .doc_collections()?
+                    .iter()
+                    .map(|c| cursors.split(c).0.to_string())
+                    .collect();
                 names.push(cursors.default_db.clone());
                 names.sort();
                 names.dedup();
                 let dbs = names
                     .into_iter()
-                    .map(|n| obj(vec![("name", n.into()), ("sizeOnDisk", Value::Int(0)), ("empty", false.into())]))
+                    .map(|n| {
+                        obj(vec![
+                            ("name", n.into()),
+                            ("sizeOnDisk", Value::Int(0)),
+                            ("empty", false.into()),
+                        ])
+                    })
                     .collect();
-                ok(vec![("databases", Value::Array(dbs)), ("totalSize", Value::Int(0))])
+                ok(vec![
+                    ("databases", Value::Array(dbs)),
+                    ("totalSize", Value::Int(0)),
+                ])
             }
             "createindexes" => {
                 let mut created = 0;
                 for ix in list(cmd, "indexes") {
                     match ix.get("key") {
                         Some(Value::Object(k)) if k.len() == 1 => {
-                            created += db.doc_create_index(coll, k.keys().next().map(String::as_str).unwrap_or(""))? as i64;
+                            created += db.doc_create_index(
+                                coll,
+                                k.keys().next().map(String::as_str).unwrap_or(""),
+                            )? as i64;
                         }
-                        _ => return Err(Error::Parse("only single-field indexes are supported".into())),
+                        _ => {
+                            return Err(Error::Parse(
+                                "only single-field indexes are supported".into(),
+                            ))
+                        }
                     }
                 }
-                ok(vec![("numIndexesBefore", Value::Int(1)), ("numIndexesAfter", Value::Int(1 + created))])
+                ok(vec![
+                    ("numIndexesBefore", Value::Int(1)),
+                    ("numIndexesAfter", Value::Int(1 + created)),
+                ])
             }
             _ => fail(59, "CommandNotFound", &format!("no such command: '{name}'")),
         })
@@ -693,7 +876,13 @@ fn command(db: &mut Database, cursors: &mut Cursors, name: &str, cmd: &Value, co
 
 // ----------------------------------------------------------------------- wire
 
-fn send(s: &mut TcpStream, request_id: i32, response_to: i32, opcode: i32, body: &[u8]) -> io::Result<()> {
+fn send(
+    s: &mut TcpStream,
+    request_id: i32,
+    response_to: i32,
+    opcode: i32,
+    body: &[u8],
+) -> io::Result<()> {
     let mut out = Vec::with_capacity(16 + body.len());
     out.extend_from_slice(&(16 + body.len() as i32).to_le_bytes());
     out.extend_from_slice(&request_id.to_le_bytes());
@@ -725,7 +914,9 @@ fn session(s: &mut TcpStream, db: &mut Database, limits: &Limits) -> io::Result<
             // OP_MSG
             2013 => {
                 let flags = rd_i32(&body, 0)? as u32;
-                let end = body.len().saturating_sub(if flags & 1 != 0 { 4 } else { 0 });
+                let end = body
+                    .len()
+                    .saturating_sub(if flags & 1 != 0 { 4 } else { 0 });
                 let mut pos = 4;
                 let mut cmd: Option<(BTreeMap<String, Value>, String)> = None;
                 let mut sequences: Vec<(String, Vec<Value>)> = Vec::new();
@@ -765,7 +956,9 @@ fn session(s: &mut TcpStream, db: &mut Database, limits: &Limits) -> io::Result<
                 };
                 if name.starts_with('$') {
                     // the command is the first field; tolerate clients that put `$db` first
-                    if let Some(k) = doc.keys().find(|k| !k.starts_with('$') && COMMANDS.contains(&k.to_ascii_lowercase().as_str())) {
+                    if let Some(k) = doc.keys().find(|k| {
+                        !k.starts_with('$') && COMMANDS.contains(&k.to_ascii_lowercase().as_str())
+                    }) {
                         name = k.clone();
                     }
                 }
@@ -783,7 +976,10 @@ fn session(s: &mut TcpStream, db: &mut Database, limits: &Limits) -> io::Result<
             // OP_QUERY: only used by drivers for the initial handshake
             2004 => {
                 let (_, n) = rd_cstr(&body, 4)?;
-                let (doc, first, _) = decode_doc(body.get(4 + n + 8..).ok_or_else(|| bad("truncated OP_QUERY"))?)?;
+                let (doc, first, _) = decode_doc(
+                    body.get(4 + n + 8..)
+                        .ok_or_else(|| bad("truncated OP_QUERY"))?,
+                )?;
                 let reply = command(db, &mut cursors, &first.unwrap_or_default(), &doc, conn_id);
                 let mut out = Vec::new();
                 out.extend_from_slice(&8i32.to_le_bytes()); // AwaitCapable

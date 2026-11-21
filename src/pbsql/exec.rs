@@ -10,7 +10,8 @@ use crate::keys;
 use crate::query::eval::{coerce_type, eval, is_true, Env, NoSubs, SubRunner};
 use crate::query::exec::{explain, run, run_analyze, Executor, Row};
 use crate::query::plan::{
-    self, constant, source_scope, split_conjuncts, valid_collection, Planner, Scope, SourceKind, SubPlan,
+    self, constant, source_scope, split_conjuncts, valid_collection, Planner, Scope, SourceKind,
+    SubPlan,
 };
 use crate::rel::{self, Column, DefaultVal, Enc, ForeignKey, Index, Schema};
 use crate::storage::Ctx;
@@ -28,7 +29,10 @@ pub fn is_read_only(src: &str) -> bool {
     match parser::parse(src) {
         Ok(Stmt::Query(_)) | Ok(Stmt::KvGet { .. }) | Ok(Stmt::KvExists { .. }) => true,
         Ok(Stmt::Explain { analyze: false, .. }) => true,
-        Ok(Stmt::Explain { analyze: true, stmt }) => matches!(*stmt, Stmt::Query(_)),
+        Ok(Stmt::Explain {
+            analyze: true,
+            stmt,
+        }) => matches!(*stmt, Stmt::Query(_)),
         _ => false,
     }
 }
@@ -37,14 +41,38 @@ pub fn run_stmt(ctx: &mut Ctx, st: Stmt) -> Result<Output> {
     match st {
         Stmt::Query(q) => query(ctx, q),
         Stmt::Explain { analyze, stmt } => explain_stmt(ctx, *stmt, analyze),
-        Stmt::CreateTable { name, cols, constraints, if_not_exists } => create_table(ctx, name, cols, constraints, if_not_exists),
+        Stmt::CreateTable {
+            name,
+            cols,
+            constraints,
+            if_not_exists,
+        } => create_table(ctx, name, cols, constraints, if_not_exists),
         Stmt::DropTable { name, if_exists } => drop_table(ctx, &name, if_exists),
-        Stmt::CreateIndex { name, target, cols, unique, if_not_exists } => create_index(ctx, name, target, cols, unique, if_not_exists),
+        Stmt::CreateIndex {
+            name,
+            target,
+            cols,
+            unique,
+            if_not_exists,
+        } => create_index(ctx, name, target, cols, unique, if_not_exists),
         Stmt::DropIndex { name, table } => drop_index(ctx, &name, &table),
         Stmt::AlterTable { table, op } => alter(ctx, &table, op),
-        Stmt::Insert { target, cols, source } => insert(ctx, target, cols, source),
-        Stmt::Update { target, alias, sets, filter } => update(ctx, target, alias, sets, filter),
-        Stmt::Delete { target, alias, filter } => delete(ctx, target, alias, filter),
+        Stmt::Insert {
+            target,
+            cols,
+            source,
+        } => insert(ctx, target, cols, source),
+        Stmt::Update {
+            target,
+            alias,
+            sets,
+            filter,
+        } => update(ctx, target, alias, sets, filter),
+        Stmt::Delete {
+            target,
+            alias,
+            filter,
+        } => delete(ctx, target, alias, filter),
         Stmt::KvGet { ns, key } => {
             let k = kv_key(&constant(&key)?)?;
             Ok(Output::Scalar(match ctx.get(&keys::kv_ns(&ns, &k)) {
@@ -54,11 +82,16 @@ pub fn run_stmt(ctx: &mut Ctx, st: Stmt) -> Result<Output> {
         }
         Stmt::KvExists { ns, key } => {
             let k = kv_key(&constant(&key)?)?;
-            Ok(Output::Scalar(Value::Bool(ctx.get(&keys::kv_ns(&ns, &k)).is_some())))
+            Ok(Output::Scalar(Value::Bool(
+                ctx.get(&keys::kv_ns(&ns, &k)).is_some(),
+            )))
         }
         Stmt::KvSet { ns, key, value } => {
             let k = kv_key(&constant(&key)?)?;
-            ctx.put(keys::kv_ns(&ns, &k), kv_value(constant(&value)?).into_bytes());
+            ctx.put(
+                keys::kv_ns(&ns, &k),
+                kv_value(constant(&value)?).into_bytes(),
+            );
             Ok(Output::Done("OK".into()))
         }
         Stmt::KvDel { ns, key } => {
@@ -71,7 +104,9 @@ pub fn run_stmt(ctx: &mut Ctx, st: Stmt) -> Result<Output> {
         }
         Stmt::KvIncr { ns, key, by } => {
             let k = kv_key(&constant(&key)?)?;
-            let by = constant(&by)?.as_i64().ok_or_else(|| Error::Type("INCREMENT ... BY needs an integer".into()))?;
+            let by = constant(&by)?
+                .as_i64()
+                .ok_or_else(|| Error::Type("INCREMENT ... BY needs an integer".into()))?;
             let full = keys::kv_ns(&ns, &k);
             let cur = match ctx.get(&full) {
                 Some(raw) => std::str::from_utf8(&raw)
@@ -80,7 +115,9 @@ pub fn run_stmt(ctx: &mut Ctx, st: Stmt) -> Result<Output> {
                     .ok_or_else(|| Error::Type(format!("value at '{k}' is not an integer")))?,
                 None => 0,
             };
-            let next = cur.checked_add(by).ok_or_else(|| Error::Type("integer overflow".into()))?;
+            let next = cur
+                .checked_add(by)
+                .ok_or_else(|| Error::Type("integer overflow".into()))?;
             ctx.put(full, next.to_string().into_bytes());
             Ok(Output::Scalar(Value::Int(next)))
         }
@@ -91,7 +128,10 @@ fn kv_key(v: &Value) -> Result<String> {
     match v {
         Value::Text(s) => Ok(s.clone()),
         Value::Int(i) => Ok(i.to_string()),
-        other => Err(Error::Type(format!("a key-value key must be text, got {}", other.to_json()))),
+        other => Err(Error::Type(format!(
+            "a key-value key must be text, got {}",
+            other.to_json()
+        ))),
     }
 }
 
@@ -116,7 +156,10 @@ fn rows_output(plan: &plan::Plan, rows: Vec<Row>) -> Output {
     if plan.docs_output {
         return Output::Docs(rows.into_iter().map(|mut r| r.swap_remove(0)).collect());
     }
-    Output::Rows { columns: plan.columns.clone(), rows }
+    Output::Rows {
+        columns: plan.columns.clone(),
+        rows,
+    }
 }
 
 fn explain_stmt(ctx: &mut Ctx, st: Stmt, analyze: bool) -> Result<Output> {
@@ -133,15 +176,35 @@ fn explain_stmt(ctx: &mut Ctx, st: Stmt, analyze: bool) -> Result<Output> {
                 explain(&plan, None)
             }
         }
-        Stmt::Update { ref target, ref alias, ref filter, .. } | Stmt::Delete { ref target, ref alias, ref filter } => {
-            let kind = if matches!(st, Stmt::Update { .. }) { "Update" } else { "Delete" };
+        Stmt::Update {
+            ref target,
+            ref alias,
+            ref filter,
+            ..
+        }
+        | Stmt::Delete {
+            ref target,
+            ref alias,
+            ref filter,
+        } => {
+            let kind = if matches!(st, Stmt::Update { .. }) {
+                "Update"
+            } else {
+                "Delete"
+            };
             let src = resolve_source(ctx, target)?;
             let scope = source_scope(&src, alias);
-            let (filters, _, _) = Planner::bind_single(ctx, &scope, split_conjuncts(filter.clone()))?;
+            let (filters, _, _) =
+                Planner::bind_single(ctx, &scope, split_conjuncts(filter.clone()))?;
             let access = Planner::access_for(ctx, &src, &filters)?;
             let node = plan::Node {
                 id: 0,
-                op: plan::PhysOp::Scan { access, alias: alias.clone(), filter: plan_and(filters), limit: None },
+                op: plan::PhysOp::Scan {
+                    access,
+                    alias: alias.clone(),
+                    filter: plan_and(filters),
+                    limit: None,
+                },
             };
             let mut lines = vec![format!("{kind} on {}", target_name(target))];
             crate::query::exec::render(&node, 0, None, &mut lines, 1);
@@ -149,18 +212,29 @@ fn explain_stmt(ctx: &mut Ctx, st: Stmt, analyze: bool) -> Result<Output> {
                 let t = std::time::Instant::now();
                 let out = run_stmt(ctx, st)?;
                 lines.push(format!("Result: {out}"));
-                lines.push(format!("Execution time: {:.3} ms", t.elapsed().as_nanos() as f64 / 1e6));
+                lines.push(format!(
+                    "Execution time: {:.3} ms",
+                    t.elapsed().as_nanos() as f64 / 1e6
+                ));
             }
             lines
         }
         other => {
             if analyze {
-                return Err(Error::Parse("EXPLAIN ANALYZE supports SELECT, UPDATE and DELETE".into()));
+                return Err(Error::Parse(
+                    "EXPLAIN ANALYZE supports SELECT, UPDATE and DELETE".into(),
+                ));
             }
-            vec![format!("{} (no query plan: executes directly)", stmt_kind(&other))]
+            vec![format!(
+                "{} (no query plan: executes directly)",
+                stmt_kind(&other)
+            )]
         }
     };
-    Ok(Output::Rows { columns: vec!["QUERY PLAN".into()], rows: lines.into_iter().map(|l| vec![Value::Text(l)]).collect() })
+    Ok(Output::Rows {
+        columns: vec!["QUERY PLAN".into()],
+        rows: lines.into_iter().map(|l| vec![Value::Text(l)]).collect(),
+    })
 }
 
 fn plan_and(v: Vec<Expr>) -> Option<Expr> {
@@ -200,7 +274,10 @@ fn resolve_source(ctx: &Ctx, o: &ObjectName) -> Result<SourceKind> {
         Model::Relational => SourceKind::Table(Schema::load(ctx, &o.name)?),
         Model::Document => {
             if !valid_collection(&o.name) {
-                return Err(Error::Schema(format!("invalid collection name '{}'", o.name)));
+                return Err(Error::Schema(format!(
+                    "invalid collection name '{}'",
+                    o.name
+                )));
             }
             SourceKind::Collection(o.name.clone())
         }
@@ -211,19 +288,35 @@ fn resolve_source(ctx: &Ctx, o: &ObjectName) -> Result<SourceKind> {
 // ====================================================================== DDL
 
 fn default_of(col: &ColumnDef) -> Result<Option<DefaultVal>> {
-    let Some(e) = &col.default else { return Ok(None) };
+    let Some(e) = &col.default else {
+        return Ok(None);
+    };
     if let Expr::Func(name, args) = e {
-        if args.is_empty() && matches!(name.as_str(), "now" | "current_timestamp" | "current_date" | "current_time" | "localtimestamp") {
+        if args.is_empty()
+            && matches!(
+                name.as_str(),
+                "now" | "current_timestamp" | "current_date" | "current_time" | "localtimestamp"
+            )
+        {
             if !matches!(col.ty, Ty::Timestamp | Ty::Date | Ty::Time | Ty::Text) {
-                return Err(Error::Type(format!("DEFAULT {name} needs a date/time column, '{}' is {}", col.name, col.ty.name())));
+                return Err(Error::Type(format!(
+                    "DEFAULT {name} needs a date/time column, '{}' is {}",
+                    col.name,
+                    col.ty.name()
+                )));
             }
             return Ok(Some(DefaultVal::Now(name.clone())));
         }
     }
-    let v = constant(e).map_err(|_| Error::Schema(format!("DEFAULT for '{}' must be a constant", col.name)))?;
-    let v = coerce_type(col.ty, v).map_err(|e| Error::Type(format!("DEFAULT for column '{}': {e}", col.name)))?;
+    let v = constant(e)
+        .map_err(|_| Error::Schema(format!("DEFAULT for '{}' must be a constant", col.name)))?;
+    let v = coerce_type(col.ty, v)
+        .map_err(|e| Error::Type(format!("DEFAULT for column '{}': {e}", col.name)))?;
     if v.is_null() && (col.not_null || col.pk) {
-        return Err(Error::Schema(format!("column '{}' is NOT NULL but its DEFAULT is NULL", col.name)));
+        return Err(Error::Schema(format!(
+            "column '{}' is NOT NULL but its DEFAULT is NULL",
+            col.name
+        )));
     }
     Ok(Some(DefaultVal::Lit(v)))
 }
@@ -239,19 +332,34 @@ fn fresh_index(s: &Schema, base: &str, cols: &[String], unique: bool) -> Index {
         n += 1;
         name = format!("{base}_{n}");
     }
-    Index { field: format!("{name}\u{1}"), name, cols: cols.to_vec(), unique, enc: Enc::Exact }
+    Index {
+        field: format!("{name}\u{1}"),
+        name,
+        cols: cols.to_vec(),
+        unique,
+        enc: Enc::Exact,
+    }
 }
 
 fn validate_fk(ctx: &Ctx, s: &Schema, fk: &mut ForeignKey) -> Result<()> {
-    let parent = if fk.table == s.name { s.clone() } else { Schema::load(ctx, &fk.table)? };
+    let parent = if fk.table == s.name {
+        s.clone()
+    } else {
+        Schema::load(ctx, &fk.table)?
+    };
     if fk.ref_cols.is_empty() {
         if parent.pk.is_empty() {
-            return Err(Error::Schema(format!("table '{}' has no primary key to reference", parent.name)));
+            return Err(Error::Schema(format!(
+                "table '{}' has no primary key to reference",
+                parent.name
+            )));
         }
         fk.ref_cols = parent.pk.clone();
     }
     if fk.ref_cols.len() != fk.cols.len() {
-        return Err(Error::Schema("a foreign key must name as many columns as it references".into()));
+        return Err(Error::Schema(
+            "a foreign key must name as many columns as it references".into(),
+        ));
     }
     for (c, rc) in fk.cols.iter().zip(&fk.ref_cols) {
         let ci = s.col_index(c)?;
@@ -259,11 +367,21 @@ fn validate_fk(ctx: &Ctx, s: &Schema, fk: &mut ForeignKey) -> Result<()> {
         let (a, b) = (s.cols[ci].ty, parent.cols[ri].ty);
         let numeric = |t: Ty| matches!(t, Ty::Int | Ty::Float);
         if a != b && !(numeric(a) && numeric(b)) {
-            return Err(Error::Schema(format!("foreign key column '{c}' ({}) does not match '{}.{rc}' ({})", a.name(), parent.name, b.name())));
+            return Err(Error::Schema(format!(
+                "foreign key column '{c}' ({}) does not match '{}.{rc}' ({})",
+                a.name(),
+                parent.name,
+                b.name()
+            )));
         }
     }
-    let is_pk = parent.pk.len() == fk.ref_cols.len() && parent.pk.iter().all(|p| fk.ref_cols.contains(p));
-    let is_unique = parent.indexes.iter().any(|i| i.unique && i.cols.len() == fk.ref_cols.len() && i.cols.iter().all(|c| fk.ref_cols.contains(c)));
+    let is_pk =
+        parent.pk.len() == fk.ref_cols.len() && parent.pk.iter().all(|p| fk.ref_cols.contains(p));
+    let is_unique = parent.indexes.iter().any(|i| {
+        i.unique
+            && i.cols.len() == fk.ref_cols.len()
+            && i.cols.iter().all(|c| fk.ref_cols.contains(c))
+    });
     if !is_pk && !is_unique {
         return Err(Error::Schema(format!(
             "foreign key must reference the primary key or a UNIQUE column set of '{}'",
@@ -273,7 +391,13 @@ fn validate_fk(ctx: &Ctx, s: &Schema, fk: &mut ForeignKey) -> Result<()> {
     Ok(())
 }
 
-fn create_table(ctx: &mut Ctx, name: String, defs: Vec<ColumnDef>, constraints: Vec<TableConstraint>, if_not_exists: bool) -> Result<Output> {
+fn create_table(
+    ctx: &mut Ctx,
+    name: String,
+    defs: Vec<ColumnDef>,
+    constraints: Vec<TableConstraint>,
+    if_not_exists: bool,
+) -> Result<Output> {
     if !keys::valid_name(&name) {
         return Err(Error::Schema(format!("invalid table name '{name}'")));
     }
@@ -287,23 +411,37 @@ fn create_table(ctx: &mut Ctx, name: String, defs: Vec<ColumnDef>, constraints: 
     let mut seen = HashSet::new();
     for c in &defs {
         if c.name.contains('\0') || c.name.contains('\u{1}') {
-            return Err(Error::Schema("column names cannot contain control characters".into()));
+            return Err(Error::Schema(
+                "column names cannot contain control characters".into(),
+            ));
         }
         if !seen.insert(c.name.as_str()) {
             return Err(Error::Schema(format!("duplicate column '{}'", c.name)));
         }
     }
-    let mut pk: Vec<String> = defs.iter().filter(|c| c.pk).map(|c| c.name.clone()).collect();
+    let mut pk: Vec<String> = defs
+        .iter()
+        .filter(|c| c.pk)
+        .map(|c| c.name.clone())
+        .collect();
     if pk.len() > 1 {
-        return Err(Error::Schema("use PRIMARY KEY (a, b) for a composite primary key".into()));
+        return Err(Error::Schema(
+            "use PRIMARY KEY (a, b) for a composite primary key".into(),
+        ));
     }
-    let mut uniques: Vec<Vec<String>> = defs.iter().filter(|c| c.unique).map(|c| vec![c.name.clone()]).collect();
+    let mut uniques: Vec<Vec<String>> = defs
+        .iter()
+        .filter(|c| c.unique)
+        .map(|c| vec![c.name.clone()])
+        .collect();
     let mut fk_defs: Vec<FkDef> = defs.iter().filter_map(|c| c.references.clone()).collect();
     for c in constraints {
         match c {
             TableConstraint::PrimaryKey(cols) => {
                 if !pk.is_empty() {
-                    return Err(Error::Schema("a table can have only one PRIMARY KEY".into()));
+                    return Err(Error::Schema(
+                        "a table can have only one PRIMARY KEY".into(),
+                    ));
                 }
                 pk = cols;
             }
@@ -313,17 +451,36 @@ fn create_table(ctx: &mut Ctx, name: String, defs: Vec<ColumnDef>, constraints: 
     }
     let mut cols = Vec::new();
     for d in &defs {
-        cols.push(Column { name: d.name.clone(), ty: d.ty, not_null: d.not_null || pk.contains(&d.name), default: default_of(d)? });
+        cols.push(Column {
+            name: d.name.clone(),
+            ty: d.ty,
+            not_null: d.not_null || pk.contains(&d.name),
+            default: default_of(d)?,
+        });
     }
-    let mut schema = Schema { name: name.clone(), cols, pk: Vec::new(), indexes: Vec::new(), fks: Vec::new() };
+    let mut schema = Schema {
+        name: name.clone(),
+        cols,
+        pk: Vec::new(),
+        indexes: Vec::new(),
+        fks: Vec::new(),
+    };
     let mut pk_seen = HashSet::new();
     for p in &pk {
-        let ci = schema.col_index(p).map_err(|_| Error::Schema(format!("PRIMARY KEY names unknown column '{p}'")))?;
+        let ci = schema
+            .col_index(p)
+            .map_err(|_| Error::Schema(format!("PRIMARY KEY names unknown column '{p}'")))?;
         if !pk_seen.insert(p.clone()) {
-            return Err(Error::Schema(format!("column '{p}' appears twice in the PRIMARY KEY")));
+            return Err(Error::Schema(format!(
+                "column '{p}' appears twice in the PRIMARY KEY"
+            )));
         }
         let ty = schema.cols[ci].ty;
-        let ok = if pk.len() == 1 { matches!(ty, Ty::Int | Ty::Text) } else { !matches!(ty, Ty::Json) };
+        let ok = if pk.len() == 1 {
+            matches!(ty, Ty::Int | Ty::Text)
+        } else {
+            !matches!(ty, Ty::Json)
+        };
         if !ok {
             return Err(Error::Schema(if pk.len() == 1 {
                 "a primary key must be INT or TEXT".into()
@@ -342,20 +499,35 @@ fn create_table(ctx: &mut Ctx, name: String, defs: Vec<ColumnDef>, constraints: 
         schema.indexes.push(ix);
     }
     for f in fk_defs {
-        let mut fk = ForeignKey { cols: f.cols, table: f.table, ref_cols: f.ref_cols, on_delete: f.on_delete };
+        let mut fk = ForeignKey {
+            cols: f.cols,
+            table: f.table,
+            ref_cols: f.ref_cols,
+            on_delete: f.on_delete,
+        };
         if fk.on_delete == FkAction::SetNull {
             for c in &fk.cols {
                 if schema.is_pk(c) || schema.cols[schema.col_index(c)?].not_null {
-                    return Err(Error::Schema(format!("ON DELETE SET NULL needs nullable column '{c}'")));
+                    return Err(Error::Schema(format!(
+                        "ON DELETE SET NULL needs nullable column '{c}'"
+                    )));
                 }
             }
         }
         validate_fk(ctx, &schema, &mut fk)?;
         // index the referencing columns so parent deletes find children without a scan
-        let covered = schema.indexes.iter().any(|i| i.cols.len() >= fk.cols.len() && i.cols[..fk.cols.len()] == fk.cols[..])
+        let covered = schema
+            .indexes
+            .iter()
+            .any(|i| i.cols.len() >= fk.cols.len() && i.cols[..fk.cols.len()] == fk.cols[..])
             || (schema.pk.len() >= fk.cols.len() && schema.pk[..fk.cols.len()] == fk.cols[..]);
         if !covered {
-            let ix = fresh_index(&schema, &format!("{name}_{}_fkey", fk.cols.join("_")), &fk.cols, false);
+            let ix = fresh_index(
+                &schema,
+                &format!("{name}_{}_fkey", fk.cols.join("_")),
+                &fk.cols,
+                false,
+            );
             schema.indexes.push(ix);
         }
         schema.fks.push(fk);
@@ -367,54 +539,92 @@ fn create_table(ctx: &mut Ctx, name: String, defs: Vec<ColumnDef>, constraints: 
 fn drop_table(ctx: &mut Ctx, name: &str, if_exists: bool) -> Result<Output> {
     if ctx.get(&keys::table_meta(name)).is_none() {
         return if if_exists {
-            Ok(Output::Done(format!("table '{name}' does not exist, nothing dropped")))
+            Ok(Output::Done(format!(
+                "table '{name}' does not exist, nothing dropped"
+            )))
         } else {
             Err(Error::Schema(format!("no such table '{name}'")))
         };
     }
     for (child, _) in rel::referencing(ctx, name)? {
         if child.name != name {
-            return Err(Error::Constraint(format!("cannot drop '{name}': table '{}' has a foreign key referencing it", child.name)));
+            return Err(Error::Constraint(format!(
+                "cannot drop '{name}': table '{}' has a foreign key referencing it",
+                child.name
+            )));
         }
     }
     rel::drop_table_data(ctx, name);
     Ok(Output::Done(format!("table '{name}' dropped")))
 }
 
-fn create_index(ctx: &mut Ctx, name: String, target: ObjectName, cols: Vec<String>, unique: bool, if_not_exists: bool) -> Result<Output> {
+fn create_index(
+    ctx: &mut Ctx,
+    name: String,
+    target: ObjectName,
+    cols: Vec<String>,
+    unique: bool,
+    if_not_exists: bool,
+) -> Result<Output> {
     if target.model == Model::Document {
         if cols.len() != 1 || unique {
-            return Err(Error::Schema("document indexes are single-field and non-unique".into()));
+            return Err(Error::Schema(
+                "document indexes are single-field and non-unique".into(),
+            ));
         }
         let created = doc::create_index(ctx, &target.name, &cols[0])?;
         return Ok(Output::Done(if created {
-            format!("index '{name}' created on DOCUMENT.{}({})", target.name, cols[0])
+            format!(
+                "index '{name}' created on DOCUMENT.{}({})",
+                target.name, cols[0]
+            )
         } else {
             format!("DOCUMENT.{}.{} is already indexed", target.name, cols[0])
         }));
     }
     if target.model == Model::Kv {
-        return Err(Error::Schema("key-value data is already ordered by key; it takes no secondary indexes".into()));
+        return Err(Error::Schema(
+            "key-value data is already ordered by key; it takes no secondary indexes".into(),
+        ));
     }
     let table = target.name;
     let mut schema = Schema::load(ctx, &table)?;
     let cols: Vec<String> = cols
         .iter()
-        .map(|c| schema.find_col(c).map(|i| schema.cols[i].name.clone()).ok_or_else(|| Error::Schema(format!("table '{table}' has no column '{c}'"))))
+        .map(|c| {
+            schema
+                .find_col(c)
+                .map(|i| schema.cols[i].name.clone())
+                .ok_or_else(|| Error::Schema(format!("table '{table}' has no column '{c}'")))
+        })
         .collect::<Result<_>>()?;
     if !index_name_free(&schema, &name) {
         return if if_not_exists {
             Ok(Output::Done(format!("index '{name}' already exists")))
         } else {
-            Err(Error::Schema(format!("index '{name}' already exists on table '{table}'")))
+            Err(Error::Schema(format!(
+                "index '{name}' already exists on table '{table}'"
+            )))
         };
     }
     // A plain single-column index keeps the original entry layout, so it can
     // share entries with an existing index on the same column.
     let ix = if cols.len() == 1 && !unique {
-        Index { name: name.clone(), cols: cols.clone(), unique: false, field: cols[0].clone(), enc: Enc::Legacy }
+        Index {
+            name: name.clone(),
+            cols: cols.clone(),
+            unique: false,
+            field: cols[0].clone(),
+            enc: Enc::Legacy,
+        }
     } else {
-        Index { field: format!("{name}\u{1}"), name: name.clone(), cols: cols.clone(), unique, enc: Enc::Exact }
+        Index {
+            field: format!("{name}\u{1}"),
+            name: name.clone(),
+            cols: cols.clone(),
+            unique,
+            enc: Enc::Exact,
+        }
     };
     let shared = schema.indexes.iter().any(|i| i.field == ix.field);
     if !shared {
@@ -422,13 +632,19 @@ fn create_index(ctx: &mut Ctx, name: String, target: ObjectName, cols: Vec<Strin
     }
     schema.indexes.push(ix);
     schema.save(ctx);
-    Ok(Output::Done(format!("{}index '{name}' created on {table}({})", if unique { "unique " } else { "" }, cols.join(", "))))
+    Ok(Output::Done(format!(
+        "{}index '{name}' created on {table}({})",
+        if unique { "unique " } else { "" },
+        cols.join(", ")
+    )))
 }
 
 fn drop_index(ctx: &mut Ctx, name: &str, table: &str) -> Result<Output> {
     let mut schema = Schema::load(ctx, table)?;
     let Some(pos) = schema.indexes.iter().position(|i| i.name == name) else {
-        return Err(Error::Schema(format!("no index '{name}' on table '{table}'")));
+        return Err(Error::Schema(format!(
+            "no index '{name}' on table '{table}'"
+        )));
     };
     let ix = schema.indexes.remove(pos);
     rel::drop_index_entries(ctx, &schema, &ix);
@@ -441,25 +657,48 @@ fn alter(ctx: &mut Ctx, table: &str, op: AlterOp) -> Result<Output> {
     match op {
         AlterOp::AddColumn(def) => {
             if s.find_col(&def.name).is_some() {
-                return Err(Error::Schema(format!("table '{table}' already has a column '{}'", def.name)));
+                return Err(Error::Schema(format!(
+                    "table '{table}' already has a column '{}'",
+                    def.name
+                )));
             }
             if def.pk {
-                return Err(Error::Schema("ALTER TABLE ADD COLUMN cannot add a primary key column".into()));
+                return Err(Error::Schema(
+                    "ALTER TABLE ADD COLUMN cannot add a primary key column".into(),
+                ));
             }
-            let col = Column { name: def.name.clone(), ty: def.ty, not_null: def.not_null, default: default_of(&def)? };
+            let col = Column {
+                name: def.name.clone(),
+                ty: def.ty,
+                not_null: def.not_null,
+                default: default_of(&def)?,
+            };
             let fill = rel::default_value(&col);
             let rows = rel::scan_rows(ctx, &s)?;
             if col.not_null && fill.is_null() && !rows.is_empty() {
-                return Err(Error::Constraint(format!("column '{}' is NOT NULL: give it a DEFAULT for the existing rows", col.name)));
+                return Err(Error::Constraint(format!(
+                    "column '{}' is NOT NULL: give it a DEFAULT for the existing rows",
+                    col.name
+                )));
             }
             s.cols.push(col);
             let ci = s.cols.len() - 1;
             if def.unique {
-                let ix = fresh_index(&s, &format!("{table}_{}_key", def.name), std::slice::from_ref(&def.name), true);
+                let ix = fresh_index(
+                    &s,
+                    &format!("{table}_{}_key", def.name),
+                    std::slice::from_ref(&def.name),
+                    true,
+                );
                 s.indexes.push(ix);
             }
             if let Some(f) = def.references {
-                let mut fk = ForeignKey { cols: f.cols, table: f.table, ref_cols: f.ref_cols, on_delete: f.on_delete };
+                let mut fk = ForeignKey {
+                    cols: f.cols,
+                    table: f.table,
+                    ref_cols: f.ref_cols,
+                    on_delete: f.on_delete,
+                };
                 validate_fk(ctx, &s, &mut fk)?;
                 s.fks.push(fk);
             }
@@ -474,35 +713,66 @@ fn alter(ctx: &mut Ctx, table: &str, op: AlterOp) -> Result<Output> {
             if let Some(fk) = s.fks.last().filter(|f| f.cols == [def.name.clone()]) {
                 if !fill.is_null() {
                     let parent = Schema::load(ctx, &fk.table)?;
-                    if rel::rows_where(ctx, &parent, &fk.ref_cols, std::slice::from_ref(&fill))?.is_empty() && !rel::scan_rows(ctx, &s)?.is_empty() {
-                        return Err(Error::Constraint(format!("DEFAULT {} has no matching row in '{}'", fill.to_json(), fk.table)));
+                    if rel::rows_where(ctx, &parent, &fk.ref_cols, std::slice::from_ref(&fill))?
+                        .is_empty()
+                        && !rel::scan_rows(ctx, &s)?.is_empty()
+                    {
+                        return Err(Error::Constraint(format!(
+                            "DEFAULT {} has no matching row in '{}'",
+                            fill.to_json(),
+                            fk.table
+                        )));
                     }
                 }
             }
             s.save(ctx);
-            Ok(Output::Done(format!("column '{}' added to '{table}'", def.name)))
+            Ok(Output::Done(format!(
+                "column '{}' added to '{table}'",
+                def.name
+            )))
         }
         AlterOp::DropColumn(name) => {
             let ci = s.col_index(&name)?;
             let name = s.cols[ci].name.clone();
             if s.is_pk(&name) {
-                return Err(Error::Schema(format!("cannot drop primary key column '{name}'")));
+                return Err(Error::Schema(format!(
+                    "cannot drop primary key column '{name}'"
+                )));
             }
             if s.cols.len() == 1 {
-                return Err(Error::Schema("cannot drop the only column of a table".into()));
+                return Err(Error::Schema(
+                    "cannot drop the only column of a table".into(),
+                ));
             }
             if s.fks.iter().any(|f| f.cols.contains(&name)) {
-                return Err(Error::Schema(format!("cannot drop '{name}': it is part of a foreign key")));
+                return Err(Error::Schema(format!(
+                    "cannot drop '{name}': it is part of a foreign key"
+                )));
             }
             for (child, fk) in rel::referencing(ctx, table)? {
                 if fk.ref_cols.contains(&name) {
-                    return Err(Error::Schema(format!("cannot drop '{name}': table '{}' references it", child.name)));
+                    return Err(Error::Schema(format!(
+                        "cannot drop '{name}': table '{}' references it",
+                        child.name
+                    )));
                 }
             }
-            if let Some(ix) = s.indexes.iter().find(|i| i.cols.len() > 1 && i.cols.contains(&name)) {
-                return Err(Error::Schema(format!("cannot drop '{name}': it is part of multi-column index '{}'", ix.name)));
+            if let Some(ix) = s
+                .indexes
+                .iter()
+                .find(|i| i.cols.len() > 1 && i.cols.contains(&name))
+            {
+                return Err(Error::Schema(format!(
+                    "cannot drop '{name}': it is part of multi-column index '{}'",
+                    ix.name
+                )));
             }
-            let doomed: Vec<Index> = s.indexes.iter().filter(|i| i.cols == [name.clone()]).cloned().collect();
+            let doomed: Vec<Index> = s
+                .indexes
+                .iter()
+                .filter(|i| i.cols == [name.clone()])
+                .cloned()
+                .collect();
             for ix in &doomed {
                 rel::drop_index_entries(ctx, &s, ix);
                 s.indexes.retain(|i| i.name != ix.name);
@@ -515,16 +785,24 @@ fn alter(ctx: &mut Ctx, table: &str, op: AlterOp) -> Result<Output> {
             }
             s.cols.remove(ci);
             s.save(ctx);
-            Ok(Output::Done(format!("column '{name}' dropped from '{table}'")))
+            Ok(Output::Done(format!(
+                "column '{name}' dropped from '{table}'"
+            )))
         }
         AlterOp::RenameColumn(from, to) => {
             let ci = s.col_index(&from)?;
             let from = s.cols[ci].name.clone();
             if s.find_col(&to).is_some() {
-                return Err(Error::Schema(format!("table '{table}' already has a column '{to}'")));
+                return Err(Error::Schema(format!(
+                    "table '{table}' already has a column '{to}'"
+                )));
             }
             s.cols[ci].name = to.clone();
-            let ren = |v: &mut Vec<String>| v.iter_mut().filter(|c| **c == from).for_each(|c| *c = to.clone());
+            let ren = |v: &mut Vec<String>| {
+                v.iter_mut()
+                    .filter(|c| **c == from)
+                    .for_each(|c| *c = to.clone())
+            };
             ren(&mut s.pk);
             for ix in s.indexes.iter_mut() {
                 ren(&mut ix.cols); // entries are stored under the index's fixed field: no rebuild
@@ -604,14 +882,26 @@ impl SubRunner for Subs<'_, '_, '_> {
     }
 }
 
-fn insert(ctx: &mut Ctx, target: ObjectName, cols: Option<Vec<String>>, source: InsertSource) -> Result<Output> {
+fn insert(
+    ctx: &mut Ctx,
+    target: ObjectName,
+    cols: Option<Vec<String>>,
+    source: InsertSource,
+) -> Result<Output> {
     // 1. compute the rows to insert (reads only)
     // `None` marks a DEFAULT written in a VALUES list
     let rows: Vec<Vec<Option<Value>>> = match source {
         InsertSource::Values(rows) => {
-            let flat: Vec<Expr> = rows.iter().flatten().filter(|e| !matches!(e, Expr::Default)).cloned().collect();
+            let flat: Vec<Expr> = rows
+                .iter()
+                .flatten()
+                .filter(|e| !matches!(e, Expr::Default))
+                .cloned()
+                .collect();
             let (bound, subs, _) = Planner::bind_single(ctx, &Scope::new(), flat)?;
-            let runner = Subs { ex: Executor::new(ctx, &subs) };
+            let runner = Subs {
+                ex: Executor::new(ctx, &subs),
+            };
             let mut it = bound.into_iter();
             let mut out = Vec::with_capacity(rows.len());
             for r in &rows {
@@ -619,7 +909,10 @@ fn insert(ctx: &mut Ctx, target: ObjectName, cols: Option<Vec<String>>, source: 
                 for e in r {
                     vals.push(match e {
                         Expr::Default => None,
-                        _ => Some(eval(&it.next().expect("bound in order"), &Env::new(&[], &[], &runner))?),
+                        _ => Some(eval(
+                            &it.next().expect("bound in order"),
+                            &Env::new(&[], &[], &runner),
+                        )?),
                     });
                 }
                 out.push(vals);
@@ -628,7 +921,10 @@ fn insert(ctx: &mut Ctx, target: ObjectName, cols: Option<Vec<String>>, source: 
         }
         InsertSource::Query(q) => {
             let plan = Planner::plan_query(ctx, *q, vec![])?;
-            run(ctx, &plan)?.into_iter().map(|r| r.into_iter().map(Some).collect()).collect()
+            run(ctx, &plan)?
+                .into_iter()
+                .map(|r| r.into_iter().map(Some).collect())
+                .collect()
         }
     };
     let n = rows.len();
@@ -637,7 +933,10 @@ fn insert(ctx: &mut Ctx, target: ObjectName, cols: Option<Vec<String>>, source: 
             let schema = Schema::load(ctx, &target.name)?;
             let targets: Vec<usize> = match &cols {
                 Some(names) => {
-                    let t = names.iter().map(|c| schema.col_index(c)).collect::<Result<Vec<_>>>()?;
+                    let t = names
+                        .iter()
+                        .map(|c| schema.col_index(c))
+                        .collect::<Result<Vec<_>>>()?;
                     let mut seen = HashSet::new();
                     if !t.iter().all(|i| seen.insert(*i)) {
                         return Err(Error::Schema("a column is named twice in INSERT".into()));
@@ -648,7 +947,11 @@ fn insert(ctx: &mut Ctx, target: ObjectName, cols: Option<Vec<String>>, source: 
             };
             for vals in rows {
                 if vals.len() != targets.len() {
-                    return Err(Error::Parse(format!("expected {} value(s) per row, got {}", targets.len(), vals.len())));
+                    return Err(Error::Parse(format!(
+                        "expected {} value(s) per row, got {}",
+                        targets.len(),
+                        vals.len()
+                    )));
                 }
                 let mut row: Vec<Option<Value>> = vec![None; schema.cols.len()];
                 for (v, &ci) in vals.into_iter().zip(&targets) {
@@ -665,7 +968,10 @@ fn insert(ctx: &mut Ctx, target: ObjectName, cols: Option<Vec<String>>, source: 
         }
         Model::Document => {
             if !valid_collection(&target.name) {
-                return Err(Error::Schema(format!("invalid collection name '{}'", target.name)));
+                return Err(Error::Schema(format!(
+                    "invalid collection name '{}'",
+                    target.name
+                )));
             }
             let mut ids = Vec::new();
             for vals in rows {
@@ -684,7 +990,12 @@ fn insert(ctx: &mut Ctx, target: ObjectName, cols: Option<Vec<String>>, source: 
                         }
                         Value::Object(o)
                     }
-                    _ => return Err(Error::Type("INSERT INTO DOCUMENT needs one JSON object per row, or a column list".into())),
+                    _ => {
+                        return Err(Error::Type(
+                            "INSERT INTO DOCUMENT needs one JSON object per row, or a column list"
+                                .into(),
+                        ))
+                    }
                 };
                 ids.push(doc::insert(ctx, &target.name, d)?);
             }
@@ -697,16 +1008,25 @@ fn insert(ctx: &mut Ctx, target: ObjectName, cols: Option<Vec<String>>, source: 
                     let pos = |w: &str| names.iter().position(|c| c.eq_ignore_ascii_case(w));
                     match (pos("key"), pos("value")) {
                         (Some(k), Some(v)) if names.len() == 2 => (k, v),
-                        _ => return Err(Error::Schema("INSERT INTO KV takes the columns (key, value)".into())),
+                        _ => {
+                            return Err(Error::Schema(
+                                "INSERT INTO KV takes the columns (key, value)".into(),
+                            ))
+                        }
                     }
                 }
             };
             for vals in rows {
                 if vals.len() != 2 {
-                    return Err(Error::Parse("INSERT INTO KV needs (key, value) rows".into()));
+                    return Err(Error::Parse(
+                        "INSERT INTO KV needs (key, value) rows".into(),
+                    ));
                 }
                 let k = kv_key(vals[ki].as_ref().unwrap_or(&Value::Null))?;
-                ctx.put(keys::kv_ns(&target.name, &k), kv_value(vals[vi].clone().unwrap_or(Value::Null)).into_bytes());
+                ctx.put(
+                    keys::kv_ns(&target.name, &k),
+                    kv_value(vals[vi].clone().unwrap_or(Value::Null)).into_bytes(),
+                );
             }
             Ok(Output::Done(format!("{n} key(s) set")))
         }
@@ -728,25 +1048,45 @@ fn targets(
     let nf = cs.len();
     let mut all = cs;
     all.extend(extra);
-    let (bound, subs, _): (Vec<Expr>, Vec<SubPlan>, usize) = Planner::bind_single(ctx, &scope, all)?;
+    let (bound, subs, _): (Vec<Expr>, Vec<SubPlan>, usize) =
+        Planner::bind_single(ctx, &scope, all)?;
     let (filters, extra) = bound.split_at(nf);
     let access = Planner::access_for(ctx, src, filters)?;
     let ex = Executor::new(ctx, &subs);
     let pred = plan_and(filters.to_vec());
     let mut out = Vec::new();
     let (mut examined, mut fb) = (0, false);
-    ex.scan(&access, pred.as_ref(), None, &[], &mut examined, &mut fb, &mut |k, r| {
-        out.push((k, r));
-        Ok(())
-    })?;
+    ex.scan(
+        &access,
+        pred.as_ref(),
+        None,
+        &[],
+        &mut examined,
+        &mut fb,
+        &mut |k, r| {
+            out.push((k, r));
+            Ok(())
+        },
+    )?;
     let mut computed = Vec::with_capacity(out.len());
     for (_, r) in &out {
-        computed.push(extra.iter().map(|e| eval(e, &Env::new(r, &[], &ex))).collect::<Result<Vec<_>>>()?);
+        computed.push(
+            extra
+                .iter()
+                .map(|e| eval(e, &Env::new(r, &[], &ex)))
+                .collect::<Result<Vec<_>>>()?,
+        );
     }
     Ok((out, computed))
 }
 
-fn update(ctx: &mut Ctx, target: ObjectName, alias: String, sets: Vec<(Vec<String>, Expr)>, filter: Option<Expr>) -> Result<Output> {
+fn update(
+    ctx: &mut Ctx,
+    target: ObjectName,
+    alias: String,
+    sets: Vec<(Vec<String>, Expr)>,
+    filter: Option<Expr>,
+) -> Result<Output> {
     let src = resolve_source(ctx, &target)?;
     let exprs: Vec<Expr> = sets.iter().map(|(_, e)| e.clone()).collect();
     let (hits, new_vals) = targets(ctx, &src, &alias, filter, exprs)?;
@@ -755,9 +1095,16 @@ fn update(ctx: &mut Ctx, target: ObjectName, alias: String, sets: Vec<(Vec<Strin
         SourceKind::Table(schema) => {
             let mut cols = Vec::new();
             for (path, _) in &sets {
-                let path: Vec<&String> = if path.len() > 1 && path[0].eq_ignore_ascii_case(&alias) { path[1..].iter().collect() } else { path.iter().collect() };
+                let path: Vec<&String> = if path.len() > 1 && path[0].eq_ignore_ascii_case(&alias) {
+                    path[1..].iter().collect()
+                } else {
+                    path.iter().collect()
+                };
                 if path.len() != 1 {
-                    return Err(Error::Schema(format!("cannot SET a path inside column '{}'", path[0])));
+                    return Err(Error::Schema(format!(
+                        "cannot SET a path inside column '{}'",
+                        path[0]
+                    )));
                 }
                 cols.push(schema.col_index(path[0])?);
             }
@@ -780,7 +1127,11 @@ fn update(ctx: &mut Ctx, target: ObjectName, alias: String, sets: Vec<(Vec<Strin
                 let mut new = old.clone();
                 for ((path, _), v) in sets.iter().zip(vals) {
                     let path: Vec<&str> = path.iter().map(String::as_str).collect();
-                    let p = if path.len() > 1 && path[0].eq_ignore_ascii_case(&alias) { &path[1..] } else { &path[..] };
+                    let p = if path.len() > 1 && path[0].eq_ignore_ascii_case(&alias) {
+                        &path[1..]
+                    } else {
+                        &path[..]
+                    };
                     doc::set_path(&mut new, &p.join("."), v)?;
                 }
                 doc::replace(ctx, &coll, key, &old, new)?;
@@ -795,7 +1146,11 @@ fn update(ctx: &mut Ctx, target: ObjectName, alias: String, sets: Vec<(Vec<Strin
                     match path.last().map(|s| s.to_lowercase()).as_deref() {
                         Some("value") => v = val,
                         Some("key") => k = kv_key(&val)?,
-                        _ => return Err(Error::Schema("a key-value entry has only the columns key and value".into())),
+                        _ => {
+                            return Err(Error::Schema(
+                                "a key-value entry has only the columns key and value".into(),
+                            ))
+                        }
                     }
                 }
                 ctx.delete(key);
@@ -806,7 +1161,12 @@ fn update(ctx: &mut Ctx, target: ObjectName, alias: String, sets: Vec<(Vec<Strin
     }
 }
 
-fn delete(ctx: &mut Ctx, target: ObjectName, alias: String, filter: Option<Expr>) -> Result<Output> {
+fn delete(
+    ctx: &mut Ctx,
+    target: ObjectName,
+    alias: String,
+    filter: Option<Expr>,
+) -> Result<Output> {
     let src = resolve_source(ctx, &target)?;
     let (hits, _) = targets(ctx, &src, &alias, filter, vec![])?;
     let mut n = 0u64;

@@ -23,7 +23,10 @@ fn check_name(coll: &str) -> Result<()> {
 /// BSON, or from an update with a long dotted path).
 fn check_depth(doc: &Value) -> Result<()> {
     if doc.deeper_than(crate::value::MAX_DOC_DEPTH) {
-        return Err(Error::Type(format!("document nesting is deeper than {} levels", crate::value::MAX_DOC_DEPTH)));
+        return Err(Error::Type(format!(
+            "document nesting is deeper than {} levels",
+            crate::value::MAX_DOC_DEPTH
+        )));
     }
     Ok(())
 }
@@ -45,7 +48,11 @@ fn owner(coll: &str) -> String {
 
 /// Extended-JSON wrappers (`{"$oid": ..}`, `{"$date": ..}`) are values, not operators.
 fn is_literal_object(o: &BTreeMap<String, Value>) -> bool {
-    o.len() == 1 && matches!(o.keys().next().map(String::as_str), Some("$oid" | "$date" | "$numberLong"))
+    o.len() == 1
+        && matches!(
+            o.keys().next().map(String::as_str),
+            Some("$oid" | "$date" | "$numberLong")
+        )
 }
 
 // ---------------------------------------------------------------- indexes
@@ -55,7 +62,10 @@ pub fn indexes(ctx: &Ctx, coll: &str) -> Result<Vec<String>> {
     Ok(match ctx.get(&keys::coll_meta(coll)) {
         None => vec![],
         Some(raw) => match decode(&raw)?.get("indexes") {
-            Some(Value::Array(a)) => a.iter().filter_map(|v| v.as_str().map(String::from)).collect(),
+            Some(Value::Array(a)) => a
+                .iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect(),
             _ => vec![],
         },
     })
@@ -63,8 +73,14 @@ pub fn indexes(ctx: &Ctx, coll: &str) -> Result<Vec<String>> {
 
 fn write_meta(ctx: &mut Ctx, coll: &str, fields: &[String]) {
     let mut o = BTreeMap::new();
-    o.insert("indexes".to_string(), Value::Array(fields.iter().map(|f| Value::Text(f.clone())).collect()));
-    ctx.put(keys::coll_meta(coll), Value::Object(o).to_json().into_bytes());
+    o.insert(
+        "indexes".to_string(),
+        Value::Array(fields.iter().map(|f| Value::Text(f.clone())).collect()),
+    );
+    ctx.put(
+        keys::coll_meta(coll),
+        Value::Object(o).to_json().into_bytes(),
+    );
 }
 
 /// Index entries for one document. Array fields get one entry per scalar element.
@@ -141,7 +157,10 @@ pub fn insert(ctx: &mut Ctx, coll: &str, doc: Value) -> Result<Value> {
         Some(id) => id.clone(),
         None => {
             let n = keys::next_seq(ctx, &owner(coll))?;
-            let ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+            let ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
             let id = Value::Text(format!("{ms:012x}{n:08x}"));
             obj.insert("_id".into(), id.clone());
             id
@@ -149,7 +168,10 @@ pub fn insert(ctx: &mut Ctx, coll: &str, doc: Value) -> Result<Value> {
     };
     let key = doc_key(coll, &id)?;
     if ctx.get(&key).is_some() {
-        return Err(Error::Constraint(format!("duplicate _id {} in collection '{coll}'", id.to_json())));
+        return Err(Error::Constraint(format!(
+            "duplicate _id {} in collection '{coll}'",
+            id.to_json()
+        )));
     }
     let fields = indexes(ctx, coll)?;
     put_doc(ctx, coll, &fields, key, &Value::Object(obj));
@@ -202,7 +224,10 @@ fn candidates(ctx: &Ctx, coll: &str, filter: &Value) -> Result<Vec<(Vec<u8>, Val
             return Ok(out);
         }
     }
-    ctx.scan(&keys::doc_prefix(coll)).into_iter().map(|(k, raw)| Ok((k, decode(&raw)?))).collect()
+    ctx.scan(&keys::doc_prefix(coll))
+        .into_iter()
+        .map(|(k, raw)| Ok((k, decode(&raw)?)))
+        .collect()
 }
 
 #[derive(Default)]
@@ -222,13 +247,20 @@ pub fn find(ctx: &Ctx, coll: &str, filter: &Value, opts: &FindOptions) -> Result
     }
     if let Some(sort) = &opts.sort {
         let Value::Object(spec) = sort else {
-            return Err(Error::Type("sort must be an object like {\"field\": 1}".into()));
+            return Err(Error::Type(
+                "sort must be an object like {\"field\": 1}".into(),
+            ));
         };
-        let spec: Vec<(&String, bool)> =
-            spec.iter().map(|(k, v)| (k, v.as_f64().is_some_and(|n| n < 0.0))).collect();
+        let spec: Vec<(&String, bool)> = spec
+            .iter()
+            .map(|(k, v)| (k, v.as_f64().is_some_and(|n| n < 0.0)))
+            .collect();
         docs.sort_by(|a, b| {
             for (path, desc) in &spec {
-                let (x, y) = (get_path(a, path).unwrap_or(&Value::Null), get_path(b, path).unwrap_or(&Value::Null));
+                let (x, y) = (
+                    get_path(a, path).unwrap_or(&Value::Null),
+                    get_path(b, path).unwrap_or(&Value::Null),
+                );
                 let o = x.total_cmp(y);
                 if o != Ordering::Equal {
                     return if *desc { o.reverse() } else { o };
@@ -237,7 +269,11 @@ pub fn find(ctx: &Ctx, coll: &str, filter: &Value, opts: &FindOptions) -> Result
             Ordering::Equal
         });
     }
-    Ok(docs.into_iter().skip(opts.skip).take(opts.limit.unwrap_or(usize::MAX)).collect())
+    Ok(docs
+        .into_iter()
+        .skip(opts.skip)
+        .take(opts.limit.unwrap_or(usize::MAX))
+        .collect())
 }
 
 /// Update matching documents (all of them, or only the first when `multi`
@@ -276,7 +312,9 @@ pub fn update(
         if let Value::Object(f) = filter {
             for (k, cond) in f {
                 let plain = match cond {
-                    Value::Object(o) => is_literal_object(o) || !o.keys().any(|k| k.starts_with('$')),
+                    Value::Object(o) => {
+                        is_literal_object(o) || !o.keys().any(|k| k.starts_with('$'))
+                    }
                     _ => true,
                 };
                 if !k.starts_with('$') && plain {
@@ -330,7 +368,10 @@ pub fn drop(ctx: &mut Ctx, coll: &str) -> Result<bool> {
     check_name(coll)?;
     let meta = keys::coll_meta(coll);
     let existed = ctx.get(&meta).is_some();
-    for prefix in [keys::doc_prefix(coll), keys::index_owner_prefix(&owner(coll))] {
+    for prefix in [
+        keys::doc_prefix(coll),
+        keys::index_owner_prefix(&owner(coll)),
+    ] {
         for (k, _) in ctx.scan(&prefix) {
             ctx.delete(k);
         }
@@ -353,7 +394,9 @@ pub fn project(doc: Value, projection: &Value) -> Value {
     let (Value::Object(mut d), Value::Object(p)) = (doc.clone(), projection) else {
         return doc;
     };
-    let on = |v: &Value| !matches!(v, Value::Bool(false) | Value::Int(0) | Value::Null) && v.as_f64() != Some(0.0);
+    let on = |v: &Value| {
+        !matches!(v, Value::Bool(false) | Value::Int(0) | Value::Null) && v.as_f64() != Some(0.0)
+    };
     if p.is_empty() {
         return doc;
     }
@@ -410,7 +453,9 @@ pub fn matches(doc: &Value, filter: &Value) -> Result<bool> {
                     _ => !any,
                 }
             }
-            _ if k.starts_with('$') => return Err(Error::Parse(format!("unknown filter operator {k}"))),
+            _ if k.starts_with('$') => {
+                return Err(Error::Parse(format!("unknown filter operator {k}")))
+            }
             _ => field_matches(get_path(doc, k), cond)?,
         };
         if !ok {
@@ -467,7 +512,9 @@ fn op_matches(v: Option<&Value>, op: &str, arg: &Value) -> Result<bool> {
             };
             items.iter().any(|a| eq_match(v, a)) == (op == "$in")
         }
-        "$exists" => v.is_some() == !matches!(arg, Value::Bool(false) | Value::Null | Value::Int(0)),
+        "$exists" => {
+            v.is_some() == !matches!(arg, Value::Bool(false) | Value::Null | Value::Int(0))
+        }
         "$not" => !field_matches(v, arg)?,
         _ => return Err(Error::Parse(format!("unknown filter operator {op}"))),
     })
@@ -481,13 +528,19 @@ pub fn set_path(doc: &mut Value, path: &str, v: Value) -> Result<()> {
     let mut cur = doc;
     for p in parents {
         cur = match cur {
-            Value::Object(o) => o.entry(p.to_string()).or_insert_with(|| Value::Object(BTreeMap::new())),
+            Value::Object(o) => o
+                .entry(p.to_string())
+                .or_insert_with(|| Value::Object(BTreeMap::new())),
             Value::Array(a) => p
                 .parse::<usize>()
                 .ok()
                 .and_then(|i| a.get_mut(i))
                 .ok_or_else(|| Error::Type(format!("no array element '{p}' in path '{path}'")))?,
-            _ => return Err(Error::Type(format!("cannot descend into a scalar at '{p}' in path '{path}'"))),
+            _ => {
+                return Err(Error::Type(format!(
+                    "cannot descend into a scalar at '{p}' in path '{path}'"
+                )))
+            }
         };
     }
     match cur {
@@ -504,9 +557,13 @@ pub fn set_path(doc: &mut Value, path: &str, v: Value) -> Result<()> {
                 a.push(v);
                 Ok(())
             }
-            _ => Err(Error::Type(format!("bad array index '{last}' in path '{path}'"))),
+            _ => Err(Error::Type(format!(
+                "bad array index '{last}' in path '{path}'"
+            ))),
         },
-        _ => Err(Error::Type(format!("cannot set '{last}' on a scalar in path '{path}'"))),
+        _ => Err(Error::Type(format!(
+            "cannot set '{last}' on a scalar in path '{path}'"
+        ))),
     }
 }
 
@@ -575,12 +632,15 @@ fn apply_update(doc: &mut Value, upd: &Value, inserting: bool) -> Result<()> {
                 "$inc" => {
                     let cur = get_path(doc, path).cloned().unwrap_or(Value::Int(0));
                     let new = match (&cur, v) {
-                        (Value::Int(a), Value::Int(b)) => {
-                            Value::Int(a.checked_add(*b).ok_or_else(|| Error::Type("integer overflow".into()))?)
-                        }
+                        (Value::Int(a), Value::Int(b)) => Value::Int(
+                            a.checked_add(*b)
+                                .ok_or_else(|| Error::Type("integer overflow".into()))?,
+                        ),
                         _ => match (cur.as_f64(), v.as_f64()) {
                             (Some(a), Some(b)) => Value::Float(a + b),
-                            _ => return Err(Error::Type(format!("$inc needs numbers at '{path}'"))),
+                            _ => {
+                                return Err(Error::Type(format!("$inc needs numbers at '{path}'")))
+                            }
                         },
                     };
                     set_path(doc, path, new)?;
@@ -591,7 +651,9 @@ fn apply_update(doc: &mut Value, upd: &Value, inserting: bool) -> Result<()> {
                             a.push(v.clone())
                         }
                     }
-                    Some(_) => return Err(Error::Type(format!("{op} target '{path}' is not an array"))),
+                    Some(_) => {
+                        return Err(Error::Type(format!("{op} target '{path}' is not an array")))
+                    }
                     None => set_path(doc, path, Value::Array(vec![v.clone()]))?,
                 },
                 "$pull" => {
