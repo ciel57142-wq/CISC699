@@ -2,14 +2,20 @@
 //!
 //! Speaks OP_MSG (and the legacy OP_QUERY handshake) with a BSON codec, so
 //! MongoDB drivers can connect. Supported commands: hello / isMaster, ping,
-//! buildInfo, insert, find, update (multi, upsert), delete, count,
-//! aggregate (`$match $sort $skip $limit $count`, and the `$group` form
-//! drivers use for countDocuments), distinct, drop, listCollections,
-//! listDatabases, createIndexes (single field).
+//! buildInfo, insert, find, getMore, killCursors, update (multi, upsert),
+//! delete, count, aggregate (see [`crate::aggregate`] for the stages),
+//! distinct, drop, dropDatabase, listCollections, listDatabases,
+//! createIndexes (single field).
 //!
-//! Differences from MongoDB: there is one database (the `$db` name is
-//! ignored), `find` returns its whole result in the first batch, field
-//! order inside documents is not preserved, and there is no authentication.
+//! Databases are isolated: collections of database `d` are stored as
+//! `d.<coll>`, except the default database (`--mongo-default-db`, "test"
+//! unless configured), whose collections are the bare names the native
+//! `db.<coll>` API uses. `find` and `aggregate` return results in batches
+//! through server-side cursors (first batch 101 documents unless
+//! `batchSize` says otherwise; idle cursors expire after 10 minutes).
+//!
+//! Differences from MongoDB: field order inside documents is not
+//! preserved, and there is no authentication.
 //! ObjectIds and dates are kept as `{"$oid": ...}` / `{"$date": ...}`.
 
 use crate::doc::{self, FindOptions};
@@ -17,10 +23,10 @@ use crate::error::Error;
 use crate::value::Value;
 use crate::server::Limits;
 use crate::Database;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // ----------------------------------------------------------------------- BSON
 
@@ -333,101 +339,118 @@ fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
-fn aggregate(db: &mut Database, coll: &str, pipeline: &[Value]) -> Result<Vec<Value>, Error> {
-    let empty = Value::Object(BTreeMap::new());
-    let mut docs: Option<Vec<Value>> = None;
-    for (i, stage) in pipeline.iter().enumerate() {
-        let Value::Object(st) = stage else {
-            return Err(Error::Parse("pipeline stages must be objects".into()));
-        };
-        let Some((name, arg)) = st.iter().next() else {
-            continue;
-        };
-        if name == "$match" && i == 0 {
-            docs = Some(db.doc_find(coll, arg, &FindOptions::default())?);
-            continue;
-        }
-        let mut cur = match docs.take() {
-            Some(d) => d,
-            None => db.doc_find(coll, &empty, &FindOptions::default())?,
-        };
-        match name.as_str() {
-            "$match" => {
-                let mut kept = Vec::new();
-                for d in cur {
-                    if doc::matches(&d, arg)? {
-                        kept.push(d);
-                    }
-                }
-                cur = kept;
-            }
-            "$sort" => {
-                let Value::Object(spec) = arg else {
-                    return Err(Error::Type("$sort expects an object".into()));
-                };
-                cur.sort_by(|a, b| {
-                    for (path, dir) in spec {
-                        let (x, y) =
-                            (doc::get_path(a, path).unwrap_or(&Value::Null), doc::get_path(b, path).unwrap_or(&Value::Null));
-                        let o = x.total_cmp(y);
-                        if o != std::cmp::Ordering::Equal {
-                            return if dir.as_f64().is_some_and(|n| n < 0.0) { o.reverse() } else { o };
-                        }
-                    }
-                    std::cmp::Ordering::Equal
-                });
-            }
-            "$skip" => cur = cur.into_iter().skip(count_of(Some(arg)).unwrap_or(0)).collect(),
-            "$limit" => cur.truncate(count_of(Some(arg)).unwrap_or(0)),
-            "$count" => {
-                let field = arg.as_str().unwrap_or("count");
-                cur = if cur.is_empty() { vec![] } else { vec![obj(vec![(field, Value::Int(cur.len() as i64))])] };
-            }
-            "$group" => {
-                // Only the whole-set count that drivers send for countDocuments:
-                // {$group: {_id: <constant>, n: {$sum: 1}}}
-                let constant_id = !matches!(arg.get("_id"), Some(Value::Text(s)) if s.starts_with('$'));
-                let counters: Vec<&String> = match arg {
-                    Value::Object(g) => g
-                        .iter()
-                        .filter(|(k, v)| *k != "_id" && v.get("$sum").and_then(Value::as_f64) == Some(1.0))
-                        .map(|(k, _)| k)
-                        .collect(),
-                    _ => vec![],
-                };
-                let fields = match arg {
-                    Value::Object(g) => g.len(),
-                    _ => 0,
-                };
-                if !constant_id || counters.len() + 1 != fields {
-                    return Err(Error::Parse("$group is only supported for counting ({_id: 1, n: {$sum: 1}})".into()));
-                }
-                cur = if cur.is_empty() {
-                    vec![]
-                } else {
-                    let mut g = BTreeMap::new();
-                    g.insert("_id".to_string(), arg.get("_id").cloned().unwrap_or(Value::Null));
-                    for c in counters {
-                        g.insert(c.clone(), Value::Int(cur.len() as i64));
-                    }
-                    vec![Value::Object(g)]
-                };
-            }
-            other => return Err(Error::Parse(format!("unsupported aggregation stage {other}"))),
-        }
-        docs = Some(cur);
+/// Open cursors of one connection.
+pub struct Cursors {
+    open: HashMap<i64, Cursor>,
+    next: i64,
+    /// MongoDB database whose collections are stored under their bare names.
+    default_db: String,
+}
+
+struct Cursor {
+    ns: String,
+    docs: VecDeque<Value>,
+    touched: Instant,
+}
+
+/// Idle cursors are dropped after this long.
+const CURSOR_TIMEOUT: Duration = Duration::from_secs(600);
+/// Most cursors one connection may keep open (the oldest is dropped beyond this).
+const MAX_CURSORS: usize = 256;
+/// A batch stops growing once it holds this many bytes of documents.
+const MAX_BATCH_BYTES: usize = 8 << 20;
+const DEFAULT_FIRST_BATCH: usize = 101;
+
+impl Cursors {
+    pub fn new(default_db: &str) -> Cursors {
+        Cursors { open: HashMap::new(), next: 1, default_db: default_db.to_string() }
     }
-    match docs {
-        Some(d) => Ok(d),
-        None => db.doc_find(coll, &empty, &FindOptions::default()),
+
+    fn expire(&mut self) {
+        let now = Instant::now();
+        self.open.retain(|_, c| now.duration_since(c.touched) < CURSOR_TIMEOUT);
+    }
+
+    /// Storage name of a collection in a database: bare for the default
+    /// database (compatible with the native `db.<coll>` API), `db.coll` otherwise.
+    fn coll(&self, db: &str, coll: &str) -> String {
+        if db.is_empty() || db == self.default_db {
+            coll.to_string()
+        } else {
+            format!("{db}.{coll}")
+        }
+    }
+
+    /// Split a stored collection name into (database, collection).
+    fn split<'a>(&'a self, stored: &'a str) -> (&'a str, &'a str) {
+        match stored.split_once('.') {
+            Some((d, c)) => (d, c),
+            None => (self.default_db.as_str(), stored),
+        }
+    }
+
+    /// Take one batch; returns (batch, cursor id or 0 when exhausted).
+    fn batch(&mut self, ns: &str, mut docs: VecDeque<Value>, size: Option<usize>, existing: Option<i64>) -> (Vec<Value>, i64) {
+        let limit = size.unwrap_or(usize::MAX).max(1);
+        let mut out = Vec::new();
+        let mut bytes = 0;
+        while out.len() < limit {
+            let Some(d) = docs.front() else { break };
+            let n = d.to_json().len();
+            if !out.is_empty() && bytes + n > MAX_BATCH_BYTES {
+                break;
+            }
+            bytes += n;
+            out.push(docs.pop_front().expect("front exists"));
+        }
+        if docs.is_empty() {
+            if let Some(id) = existing {
+                self.open.remove(&id);
+            }
+            return (out, 0);
+        }
+        let id = existing.unwrap_or_else(|| {
+            let id = self.next;
+            self.next += 1;
+            id
+        });
+        if self.open.len() >= MAX_CURSORS && !self.open.contains_key(&id) {
+            if let Some(oldest) = self.open.iter().min_by_key(|(_, c)| c.touched).map(|(k, _)| *k) {
+                self.open.remove(&oldest);
+            }
+        }
+        self.open.insert(id, Cursor { ns: ns.to_string(), docs, touched: Instant::now() });
+        (out, id)
     }
 }
 
+fn first_batch(cursors: &mut Cursors, ns: &str, docs: Vec<Value>, cmd: &Value) -> Value {
+    let single = truthy(cmd.get("singleBatch"));
+    let size = cmd
+        .get("cursor")
+        .and_then(|c| count_of(c.get("batchSize")))
+        .or_else(|| count_of(cmd.get("batchSize")))
+        .unwrap_or(DEFAULT_FIRST_BATCH);
+    let size = (!single).then_some(size);
+    let (batch, id) = if single { (docs, 0) } else { cursors.batch(ns, docs.into(), size, None) };
+    ok(vec![("cursor", obj(vec![("firstBatch", Value::Array(batch)), ("id", long(id)), ("ns", ns.into())]))])
+}
+
+const COMMANDS: &[&str] = &[
+    "hello", "ismaster", "ping", "endsessions", "abortsessions", "getmore", "killcursors", "dropdatabase", "buildinfo",
+    "whatsmyuri", "insert", "find", "aggregate", "count", "distinct", "update", "delete", "drop", "create",
+    "listcollections", "listdatabases", "createindexes",
+];
+
 /// Execute one database command and build its reply document.
-fn command(db: &mut Database, name: &str, cmd: &Value, conn_id: i64) -> Value {
+fn command(db: &mut Database, cursors: &mut Cursors, name: &str, cmd: &Value, conn_id: i64) -> Value {
+    cursors.expire();
     let empty = Value::Object(BTreeMap::new());
-    let coll = cmd.get(name).and_then(Value::as_str).unwrap_or("");
-    let ns = format!("polydb.{coll}");
+    let dbname = cmd.get("$db").and_then(Value::as_str).unwrap_or(cursors.default_db.as_str()).to_string();
+    let short = cmd.get(name).and_then(Value::as_str).unwrap_or("");
+    let stored = cursors.coll(&dbname, short);
+    let coll = stored.as_str();
+    let ns = format!("{dbname}.{short}");
     let res: Result<Value, Error> = (|| {
         Ok(match name.to_ascii_lowercase().as_str() {
             "hello" | "ismaster" => ok(vec![
@@ -443,7 +466,51 @@ fn command(db: &mut Database, name: &str, cmd: &Value, conn_id: i64) -> Value {
                 ("readOnly", false.into()),
                 ("connectionId", Value::Int(conn_id)),
             ]),
-            "ping" | "endsessions" | "killcursors" | "abortsessions" => ok(vec![]),
+            "ping" | "endsessions" | "abortsessions" => ok(vec![]),
+            "getmore" => {
+                let id = match cmd.get("getMore") {
+                    Some(Value::Object(o)) => o.get("$numberLong").and_then(Value::as_i64),
+                    Some(v) => v.as_i64(),
+                    None => None,
+                }
+                .unwrap_or(0);
+                let short = cmd.get("collection").and_then(Value::as_str).unwrap_or("");
+                let ns = format!("{dbname}.{short}");
+                match cursors.open.remove(&id) {
+                    Some(c) if c.ns == ns => {
+                        let (batch, next) = cursors.batch(&ns, c.docs, count_of(cmd.get("batchSize")), Some(id));
+                        ok(vec![("cursor", obj(vec![("nextBatch", Value::Array(batch)), ("id", long(next)), ("ns", ns.as_str().into())]))])
+                    }
+                    Some(c) => {
+                        cursors.open.insert(id, c);
+                        fail(13, "Unauthorized", "cursor belongs to a different namespace")
+                    }
+                    None => fail(43, "CursorNotFound", &format!("cursor id {id} not found")),
+                }
+            }
+            "killcursors" => {
+                let mut killed = Vec::new();
+                let mut missing = Vec::new();
+                for c in list(cmd, "cursors") {
+                    let id = c.as_i64().or_else(|| c.get("$numberLong").and_then(Value::as_i64)).unwrap_or(0);
+                    if cursors.open.remove(&id).is_some() {
+                        killed.push(long(id));
+                    } else {
+                        missing.push(long(id));
+                    }
+                }
+                ok(vec![("cursorsKilled", Value::Array(killed)), ("cursorsNotFound", Value::Array(missing))])
+            }
+            "dropdatabase" => {
+                let mut n = 0;
+                for c in db.doc_collections()? {
+                    if cursors.split(&c).0 == dbname {
+                        db.doc_drop(&c)?;
+                        n += 1;
+                    }
+                }
+                ok(vec![("dropped", dbname.as_str().into()), ("collections", Value::Int(n))])
+            }
             "buildinfo" => ok(vec![
                 ("version", "6.0.0".into()),
                 ("versionArray", Value::Array(vec![Value::Int(6), Value::Int(0), Value::Int(0), Value::Int(0)])),
@@ -481,9 +548,12 @@ fn command(db: &mut Database, name: &str, cmd: &Value, conn_id: i64) -> Value {
                 if let Some(p) = cmd.get("projection") {
                     docs = docs.into_iter().map(|d| doc::project(d, p)).collect();
                 }
-                cursor(&ns, docs)
+                first_batch(cursors, &ns, docs, cmd)
             }
-            "aggregate" => cursor(&ns, aggregate(db, coll, list(cmd, "pipeline"))?),
+            "aggregate" => {
+                let docs = db.doc_aggregate(coll, list(cmd, "pipeline"))?;
+                first_batch(cursors, &ns, docs, cmd)
+            }
             "count" => {
                 let n = db.doc_find(coll, cmd.get("query").unwrap_or(&empty), &FindOptions::default())?.len();
                 ok(vec![("n", Value::Int(n as i64))])
@@ -576,7 +646,11 @@ fn command(db: &mut Database, name: &str, cmd: &Value, conn_id: i64) -> Value {
             "listcollections" => {
                 let batch = db
                     .doc_collections()?
-                    .into_iter()
+                    .iter()
+                    .filter_map(|c| {
+                        let (d, name) = cursors.split(c);
+                        (d == dbname).then(|| name.to_string())
+                    })
                     .map(|c| {
                         obj(vec![
                             ("name", c.into()),
@@ -586,12 +660,19 @@ fn command(db: &mut Database, name: &str, cmd: &Value, conn_id: i64) -> Value {
                         ])
                     })
                     .collect();
-                cursor("polydb.$cmd.listCollections", batch)
+                cursor(&format!("{dbname}.$cmd.listCollections"), batch)
             }
-            "listdatabases" => ok(vec![(
-                "databases",
-                Value::Array(vec![obj(vec![("name", "polydb".into()), ("sizeOnDisk", Value::Int(0)), ("empty", false.into())])]),
-            )]),
+            "listdatabases" => {
+                let mut names: Vec<String> = db.doc_collections()?.iter().map(|c| cursors.split(c).0.to_string()).collect();
+                names.push(cursors.default_db.clone());
+                names.sort();
+                names.dedup();
+                let dbs = names
+                    .into_iter()
+                    .map(|n| obj(vec![("name", n.into()), ("sizeOnDisk", Value::Int(0)), ("empty", false.into())]))
+                    .collect();
+                ok(vec![("databases", Value::Array(dbs)), ("totalSize", Value::Int(0))])
+            }
             "createindexes" => {
                 let mut created = 0;
                 for ix in list(cmd, "indexes") {
@@ -624,6 +705,7 @@ fn send(s: &mut TcpStream, request_id: i32, response_to: i32, opcode: i32, body:
 
 fn session(s: &mut TcpStream, db: &mut Database, limits: &Limits) -> io::Result<()> {
     let conn_id = s.peer_addr().map(|a| a.port() as i64).unwrap_or(0);
+    let mut cursors = Cursors::new(&limits.mongo_default_db);
     let mut reply_id = 0i32;
     loop {
         let mut hdr = [0u8; 16];
@@ -678,13 +760,19 @@ fn session(s: &mut TcpStream, db: &mut Database, limits: &Limits) -> io::Result<
                         _ => return Err(bad("unknown OP_MSG section")),
                     }
                 }
-                let Some((mut doc, name)) = cmd else {
+                let Some((mut doc, mut name)) = cmd else {
                     return Err(bad("OP_MSG without a command"));
                 };
+                if name.starts_with('$') {
+                    // the command is the first field; tolerate clients that put `$db` first
+                    if let Some(k) = doc.keys().find(|k| !k.starts_with('$') && COMMANDS.contains(&k.to_ascii_lowercase().as_str())) {
+                        name = k.clone();
+                    }
+                }
                 for (ident, docs) in sequences {
                     doc.insert(ident, Value::Array(docs));
                 }
-                let reply = command(db, &name, &Value::Object(doc), conn_id);
+                let reply = command(db, &mut cursors, &name, &Value::Object(doc), conn_id);
                 if flags & 2 == 0 {
                     // not "moreToCome": the client expects an answer
                     let mut out = vec![0, 0, 0, 0, 0];
@@ -696,7 +784,7 @@ fn session(s: &mut TcpStream, db: &mut Database, limits: &Limits) -> io::Result<
             2004 => {
                 let (_, n) = rd_cstr(&body, 4)?;
                 let (doc, first, _) = decode_doc(body.get(4 + n + 8..).ok_or_else(|| bad("truncated OP_QUERY"))?)?;
-                let reply = command(db, &first.unwrap_or_default(), &doc, conn_id);
+                let reply = command(db, &mut cursors, &first.unwrap_or_default(), &doc, conn_id);
                 let mut out = Vec::new();
                 out.extend_from_slice(&8i32.to_le_bytes()); // AwaitCapable
                 out.extend_from_slice(&0i64.to_le_bytes()); // cursor id

@@ -9,8 +9,9 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// A collection name: `name` or `namespace.name` (a MongoDB database's collection).
 fn check_name(coll: &str) -> Result<()> {
-    if keys::valid_name(coll) {
+    if crate::query::plan::valid_collection(coll) {
         Ok(())
     } else {
         Err(Error::Schema(format!("invalid collection name '{coll}'")))

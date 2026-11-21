@@ -12,7 +12,9 @@ USAGE
   polydb serve [DIRECTORY]      network server for many clients (see SERVER below)
   polydb client [HOST:PORT]     shell connected to a server (default 127.0.0.1:7878)
 
-One command per line. Commands can also be piped in on stdin.
+One command per line; in the interactive shell SQL/PBSQL statements end
+with ';' and may span several lines. Commands can also be piped in on stdin
+(a line that is visibly unfinished, or ends with '\\', continues on the next).
 
 RELATIONAL (SQL)
   CREATE TABLE users (id INT PRIMARY KEY, name TEXT NOT NULL, age INT)
@@ -36,16 +38,29 @@ KEY-VALUE
   SET session:42 some value      GET session:42      DEL session:42
   EXISTS session:42              KEYS session:       INCR counter 5
 
+PBSQL (one language for all three models)
+  SELECT u.name, p.profile.city, s.value
+    FROM RELATIONAL.users u
+    JOIN DOCUMENT.profiles p ON p.user_id = u.id
+    LEFT JOIN KV.sessions s ON s.key = CONCAT('session:', u.id);
+  INSERT INTO DOCUMENT.users VALUES {name: 'Alice', profile: {city: 'Berlin'}};
+  UPDATE DOCUMENT.users SET profile.city = 'Paris' WHERE name = 'Alice';
+  SET KV 'user:1' = 'Alice';   GET FROM KV 'user:1';   EXISTS KV 'user:1';
+  INCREMENT KV 'hits' BY 2;    SELECT key, value FROM KV WHERE key LIKE 'user:%';
+  EXPLAIN SELECT ...;          EXPLAIN ANALYZE SELECT ...;
+  ALTER TABLE users ADD COLUMN email TEXT UNIQUE;   CREATE INDEX i ON users (city, age);
+  db.events.aggregate([{$match: {type: 'login'}}, {$group: {_id: '$user', n: {$sum: 1}}}])
+
 TRANSACTIONS (span all three models, serializable)
   BEGIN   COMMIT   ROLLBACK
 
 OTHER
-  SHOW TABLES   SHOW COLLECTIONS   CHECKPOINT   .help   .exit
+  SHOW TABLES   SHOW COLLECTIONS   CHECKPOINT   .timing on|off   .help   .exit
 
 SERVER
   polydb serve [DIRECTORY] [--memory] [--host ADDR]
                [--port N] [--redis-port N] [--pg-port N] [--mongo-port N]
-               [--max-request-bytes N] [--max-connections N]
+               [--max-request-bytes N] [--max-connections N] [--mongo-default-db NAME]
   Defaults: host 127.0.0.1, native 7878, Redis 6380, PostgreSQL 5433, MongoDB 27018.
   Requests larger than --max-request-bytes (default 64 MiB) close the connection.
   A port of 'off' disables that listener. There is no authentication:
@@ -65,7 +80,65 @@ fn open(path: Option<&str>, memory: bool) -> Database {
     Database::open(path).unwrap_or_else(|e| die(&format!("cannot open database at '{path}': {e}")))
 }
 
+/// Is the buffered text visibly unfinished (open quote/bracket, trailing
+/// backslash, or ending in a keyword or operator that needs more)?
+fn incomplete(buf: &str) -> bool {
+    let mut depth = 0i32;
+    let mut quote: Option<char> = None;
+    let mut chars = buf.chars().peekable();
+    while let Some(c) = chars.next() {
+        match quote {
+            Some(q) => {
+                if c == '\\' && q == '"' {
+                    chars.next();
+                } else if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                '\'' | '"' | '`' => quote = Some(c),
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth -= 1,
+                '-' if chars.peek() == Some(&'-') => {
+                    // comment to end of line
+                    for c in chars.by_ref() {
+                        if c == '\n' {
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            },
+        }
+    }
+    if quote.is_some() || depth > 0 {
+        return true;
+    }
+    let t = buf.trim_end();
+    if t.ends_with('\\') {
+        return true;
+    }
+    if t.ends_with(';') {
+        return false;
+    }
+    let last = t.rsplit(|c: char| c.is_whitespace()).next().unwrap_or("").to_ascii_lowercase();
+    matches!(
+        last.as_str(),
+        "select" | "from" | "where" | "and" | "or" | "not" | "join" | "on" | "by" | "set" | "values" | "into" | "as"
+            | "union" | "all" | "having" | "left" | "inner" | "cross" | "explain" | "analyze" | "then" | "else" | "when"
+            | "case" | "in" | "like" | "between" | "," | "=" | "+" | "-" | "*" | "/" | "||" | "<" | ">" | "<=" | ">="
+            | "<>" | "!="
+    ) || last.ends_with(',')
+}
+
+const SQL_WORDS: &[&str] =
+    &["select", "insert", "update", "delete", "create", "drop", "alter", "explain", "with", "increment"];
+
 /// Read commands from stdin, hand each to `run`, print what comes back.
+///
+/// Interactively, SQL/PBSQL statements end with `;` and may span lines;
+/// other commands end at the end of the line. In piped input every line is
+/// a command unless it is visibly incomplete (see [`incomplete`]).
 fn repl(prompt: &mut dyn FnMut() -> &'static str, run: &mut dyn FnMut(&str) -> Result<String, String>) {
     let interactive = io::stdin().is_terminal();
     if interactive {
@@ -73,9 +146,11 @@ fn repl(prompt: &mut dyn FnMut() -> &'static str, run: &mut dyn FnMut(&str) -> R
     }
     let stdin = io::stdin();
     let mut line = String::new();
+    let mut buf = String::new();
+    let mut timing = false;
     loop {
         if interactive {
-            print!("{}", prompt());
+            print!("{}", if buf.is_empty() { prompt() } else { "   ...> " });
             let _ = io::stdout().flush();
         }
         line.clear();
@@ -83,17 +158,44 @@ fn repl(prompt: &mut dyn FnMut() -> &'static str, run: &mut dyn FnMut(&str) -> R
             Ok(0) | Err(_) => break,
             Ok(_) => {}
         }
-        let cmd = line.trim();
-        if cmd.is_empty() || cmd.starts_with("--") {
+        let piece = line.trim();
+        if buf.is_empty() && (piece.is_empty() || piece.starts_with("--")) {
             continue;
         }
-        match cmd {
-            ".exit" | ".quit" | "exit" | "quit" => break,
-            ".help" | "help" => print!("{HELP}"),
-            _ => match run(cmd) {
-                Ok(out) => println!("{out}"),
-                Err(e) => println!("error: {e}"),
-            },
+        if buf.is_empty() && piece.starts_with('.') || buf.is_empty() && matches!(piece, "exit" | "quit" | "help") {
+            match piece {
+                ".exit" | ".quit" | "exit" | "quit" => break,
+                ".help" | "help" => print!("{HELP}"),
+                ".timing on" => timing = true,
+                ".timing off" => timing = false,
+                other => println!("error: unknown shell command '{other}' (try .help)"),
+            }
+            continue;
+        }
+        if !buf.is_empty() {
+            buf.push('\n');
+        }
+        buf.push_str(piece.strip_suffix('\\').unwrap_or(piece));
+        let first = buf.split(|c: char| !c.is_alphanumeric()).next().unwrap_or("").to_ascii_lowercase();
+        let needs_semicolon = interactive && SQL_WORDS.contains(&first.as_str());
+        let done = !incomplete(&buf) && !piece.ends_with('\\') && (!needs_semicolon || buf.trim_end().ends_with(';'));
+        if !done {
+            continue;
+        }
+        let cmd = std::mem::take(&mut buf);
+        let start = std::time::Instant::now();
+        match run(cmd.trim()) {
+            Ok(out) => println!("{out}"),
+            Err(e) => println!("error: {e}"),
+        }
+        if timing {
+            println!("Time: {:.3} ms", start.elapsed().as_secs_f64() * 1e3);
+        }
+    }
+    if !buf.trim().is_empty() {
+        match run(buf.trim()) {
+            Ok(out) => println!("{out}"),
+            Err(e) => println!("error: {e}"),
         }
     }
 }
@@ -133,6 +235,7 @@ fn main() {
                     limits.max_request_bytes =
                         v.parse().ok().filter(|n| *n >= 1024).unwrap_or_else(|| die(&format!("'{v}' is not a byte count >= 1024")));
                 }
+                "--mongo-default-db" => limits.mongo_default_db = value("--mongo-default-db"),
                 "--max-connections" => {
                     let v = value("--max-connections");
                     limits.max_connections =

@@ -160,4 +160,16 @@ cur.execute("INSERT INTO users VALUES (10, 'Txn', 1, 1, true)")
 pg.commit()
 check("one transaction, visible from redis and mongo", (r.get("audit:last"), mongo.app.audit.find_one({"_id": 1})["via"]), (b"cross-model", "postgres"))
 
+# --------------------------------------- cursors, aggregation, namespaces
+nums = mongo.app.nums
+nums.drop()
+nums.insert_many([{"_id": i, "v": i % 7} for i in range(250)])
+check("mongo cursor iterates every batch", len(list(nums.find({}, batch_size=40))), 250)
+check("mongo aggregate $group/$sort", list(nums.aggregate([{"$match": {"v": {"$lt": 2}}}, {"$group": {"_id": "$v", "n": {"$sum": 1}}}, {"$sort": {"_id": 1}}])), [{"_id": 0, "n": 36}, {"_id": 1, "n": 36}])
+check("mongo databases are isolated", (mongo.other.nums.count_documents({}), nums.count_documents({})), (0, 250))
+cur.execute("SELECT COUNT(*) FROM DOCUMENT.nums WHERE v = 3")
+check("PBSQL over postgres reads documents written by pymongo", cur.fetchone(), (36,))
+cur.execute("EXPLAIN SELECT name FROM users WHERE id = 1")
+check("EXPLAIN over postgres", any("PrimaryKeyLookup" in r[0] for r in cur.fetchall()), True)
+
 print("\nall driver checks passed")

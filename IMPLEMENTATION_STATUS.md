@@ -1,12 +1,10 @@
 # PolyDB implementation status
 
-Working branch: `claude-assist` (based on `nov-11`). GitHub push access was
-unavailable (HTTP 403) in the first session; commits are local until access is fixed.
+Working branch: `claude-assist` (based on `nov-11`), pushed to GitHub.
 
 ## Current stage
-Core engine expansion: storage hardening, relational constraints, ordered
-indexes, shared planner/executor, EXPLAIN, PBSQL. Next: document
-aggregation pipeline, Mongo cursors/namespaces, CLI multiline.
+Core engine expansion done for storage, relational, indexes, planner,
+EXPLAIN, PBSQL, document aggregation, Mongo cursors/namespaces, CLI.
 
 ## Architecture (where things live)
 - `src/storage.rs` – ordered KV store, WAL (torn-tail vs interior-corruption
@@ -37,12 +35,19 @@ aggregation pipeline, Mongo cursors/namespaces, CLI multiline.
   document INSERT/UPDATE/DELETE, KV GET/SET/EXISTS/INCREMENT, KV namespaces,
   cross-model joins, transactions across models.
 
+- Aggregation pipeline (`src/aggregate.rs`): $match $project $addFields/$set $unset
+  $sort $limit $skip $group $unwind $count $lookup $replaceRoot + accumulators;
+  native `db.c.aggregate([...])`, `Database::doc_aggregate`, Mongo `aggregate`.
+- Mongo cursors (getMore/killCursors, batchSize, 10 min expiry, per-connection cap),
+  database isolation (`--mongo-default-db`, `db.coll` storage names), listDatabases, dropDatabase.
+- CLI: multiline statements (`;` interactively, visibly-incomplete lines when piped), `.timing`.
+- Real-driver checks (`tests/drivers.py`, redis-py/psycopg2/pymongo) pass, incl. new cursor/aggregate/PBSQL checks.
+
 ## Remaining / next tasks
-1. Document aggregation pipeline (`$group`, `$unwind`, `$project`, `$lookup`, accumulators) in `doc.rs`, used by Mongo protocol and `db.c.aggregate([...])`.
-2. Mongo cursors (`getMore`, `killCursors`, batch sizes) and database namespaces (`db.coll` collection names).
-3. CLI: multiline statements, PBSQL help text; pgwire command tags for ALTER/EXPLAIN.
-4. KV TTL (not implemented).
-5. Update README/REFERENCE for PBSQL syntax.
+1. KV TTL (not implemented; Redis `EX/PX` still refused).
+2. Composite / unique document indexes; use document indexes for `$lookup`.
+3. Streaming (non-materialising) executor; simple statistics for join ordering.
+4. Extended PostgreSQL protocol (prepared statements) is still unsupported.
 
 ## Known limitations
 - Cross-model atomicity holds because all models share one WAL/transaction.
@@ -52,5 +57,6 @@ aggregation pipeline, Mongo cursors/namespaces, CLI multiline.
 - Ordering comparisons between different types (number vs text) evaluate to NULL.
 
 ## Tests
-`cargo test` – hardening (26), integration (22), engine (19), doctest (1): all passing.
+`cargo test` – hardening (26), integration (22), engine (19), documents (4), cli (1), doctest (1): all passing.
+`python3 tests/drivers.py` against `polydb serve --memory --port off --mongo-default-db app`: all passing.
 `cargo fmt --check` was already failing on the base branch (pre-existing formatting).

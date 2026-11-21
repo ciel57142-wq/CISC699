@@ -7,25 +7,55 @@ Command syntax, the library API and the wire-protocol subsets. For setup and run
 ### Relational
 
 ```
-CREATE TABLE [IF NOT EXISTS] t (col TYPE [PRIMARY KEY] [NOT NULL], ..., [PRIMARY KEY (col)])
+CREATE TABLE [IF NOT EXISTS] t (
+    col TYPE [PRIMARY KEY] [NOT NULL] [UNIQUE] [DEFAULT expr] [REFERENCES p [(col)] [ON DELETE CASCADE|RESTRICT|SET NULL]],
+    ..., [PRIMARY KEY (a, b)], [UNIQUE (a, b)], [FOREIGN KEY (a) REFERENCES p (x) [ON DELETE ...]])
 DROP TABLE [IF EXISTS] t
-CREATE INDEX [IF NOT EXISTS] name ON t (col)
+ALTER TABLE t ADD [COLUMN] col TYPE [constraints]  |  DROP [COLUMN] col
+ALTER TABLE t RENAME [COLUMN] a TO b               |  RENAME TO new_name
+CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON t (col [, col ...])
 DROP INDEX name ON t
-INSERT INTO t [(cols)] VALUES (...), (...)
-SELECT [DISTINCT] items FROM t [alias]
-       [[INNER | LEFT] JOIN t2 [alias] ON expr]...
+INSERT INTO t [(cols)] VALUES (..., DEFAULT, ...), (...)  |  INSERT INTO t [(cols)] SELECT ...
+SELECT [DISTINCT] items FROM source [alias]
+       [[INNER | LEFT | CROSS] JOIN source [alias] [ON expr]]...   (also FROM a, b)
        [WHERE expr] [GROUP BY exprs] [HAVING expr]
+       [UNION [ALL] SELECT ...]...
        [ORDER BY expr [ASC|DESC], ...] [LIMIT n] [OFFSET n]
 UPDATE t SET col = expr, ... [WHERE expr]
 DELETE FROM t [WHERE expr]
+EXPLAIN [ANALYZE] statement
 ```
 
-- Types: `INT`, `REAL`, `TEXT`, `BOOL` (common aliases such as `INTEGER`, `VARCHAR(n)`, `DOUBLE`, `BOOLEAN` are accepted).
+- Types: `INT`, `REAL`, `TEXT`, `BOOL`, `DATE`, `TIME`, `TIMESTAMP` (`DATETIME`), `JSON` (common aliases such as `INTEGER`, `VARCHAR(n)`, `DOUBLE`, `BOOLEAN` are accepted). Dates and times are stored as canonical ISO text (`2024-02-29`, `09:05:00`, `2024-02-29 10:00:00`), validated on write.
+- Subqueries: `x [NOT] IN (SELECT ...)`, `[NOT] EXISTS (SELECT ...)`, scalar `(SELECT ...)`, correlated references to outer queries, and derived tables `FROM (SELECT ...) AS s`.
+- Constraints are enforced on INSERT and UPDATE, inside transactions, and persist; foreign keys must reference a primary key or UNIQUE column set; ON UPDATE of a referenced key is RESTRICT.
+- More functions: `CONCAT`, `SUBSTR`, `TRIM`, `ROUND`, `NULLIF`, `CAST(x AS type)`, `CASE`, `NOW()`/`CURRENT_TIMESTAMP`/`CURRENT_DATE`, `YEAR MONTH DAY HOUR MINUTE SECOND`, `EXTRACT(field FROM x)`, `COUNT(DISTINCT x)`.
 - Expressions: `+ - * / %`, `||`, `= != <> < <= > >=`, `AND OR NOT`, `IS [NOT] NULL`, `[NOT] LIKE`, `[NOT] IN (...)`, `[NOT] BETWEEN`, with SQL three-valued NULL logic.
 - Aggregates: `COUNT(*)`, `COUNT(x)`, `SUM`, `AVG`, `MIN`, `MAX`. Functions: `LOWER`, `UPPER`, `LENGTH`, `ABS`, `COALESCE`.
 - Limits: an expression may nest 32 levels (parentheses, `NOT`, unary minus, function calls) and hold 100 chained operators and nested sub-expressions in total. Items of an `IN` list or of a function's arguments do not add up. Each row of `VALUES` and each `SELECT` item is its own expression.
 - Unquoted names are case-insensitive; `"Quoted"` names keep their case. Strings use single quotes.
-- `WHERE pk = literal` is a direct lookup and `WHERE indexed_col = literal` an index lookup; everything else scans the table.
+- Indexes are ordered: equality, `IN`, `<`/`<=`/`>`/`>=`/`BETWEEN` and `LIKE 'prefix%'` on an indexed column (or the leading columns of a composite index, with a range on the next one) are index scans, as are primary-key lookups and ranges. Joins use an index lookup on the inner side when one fits, otherwise a hash join (equality) or a nested loop. `EXPLAIN` shows the chosen plan; `EXPLAIN ANALYZE` runs it and reports rows, loops, rows examined and time per operator.
+
+### PBSQL (all models)
+
+PBSQL is the SQL above plus model-qualified sources: `RELATIONAL.t` (same as `t`), `DOCUMENT.coll` (or `DOCUMENT.db.coll`), `KV` and `KV.namespace`. A document source exposes its fields as dotted paths (`p.profile.address.city`; missing fields are NULL); a KV source has the columns `key` and `value` (a JSON value can be looked into: `value.name`). Any sources can be joined.
+
+```
+SELECT u.name, p.profile_data, s.value
+FROM RELATIONAL.users AS u
+JOIN DOCUMENT.profiles AS p ON p.user_id = u.id
+LEFT JOIN KV.user_sessions AS s ON s.key = CONCAT('session:', u.id)
+INSERT INTO DOCUMENT.users VALUES {"name": "Alice", "age": 30}, {...}
+INSERT INTO DOCUMENT.users (name, age) VALUES ('Bob', 25)
+UPDATE DOCUMENT.users SET profile.city = 'Paris' WHERE name = 'Alice'
+DELETE FROM DOCUMENT.users WHERE age < 18
+CREATE INDEX users_age ON DOCUMENT.users (age)
+SET KV[.ns] 'key' = value        GET FROM KV[.ns] 'key'        EXISTS KV[.ns] 'key'
+INCREMENT KV[.ns] 'key' [BY n]   SELECT key, value FROM KV WHERE key LIKE 'user:%'
+DELETE FROM KV WHERE key = 'k'   INSERT INTO KV (key, value) VALUES ('k', 'v')
+```
+
+PBSQL statements join the session's transaction, so one `BEGIN ... COMMIT` can change all three models atomically. Ordering comparisons between values of different types (a number and a text) are NULL.
 
 ### Document
 
@@ -116,7 +146,7 @@ The native protocol replies look like this:
 
 - **Redis:** strings only: `GET SET MGET MSET DEL EXISTS INCR DECR INCRBY DECRBY KEYS DBSIZE STRLEN APPEND GETSET SETNX TTL PING ECHO`. No expiry, lists, hashes, sets, pub/sub or `MULTI`.
 - **PostgreSQL:** the simple-query flow that psql, libpq and psycopg2 use. No server-side prepared statements (the extended protocol used by default in JDBC, asyncpg, node-postgres with parameters), no `COPY`, no `pg_catalog`, and the SQL is the subset listed below. Every polydb command works on this port, including `db.coll.find(...)` and `GET key`.
-- **MongoDB:** `insert find update delete count distinct drop createIndexes listCollections` and `aggregate` with `$match $sort $skip $limit $count`. One database (the database name is ignored), no cursors beyond the first batch, no change streams, no general `$group`. `mongosh` has not been tested.
+- **MongoDB:** `insert find getMore killCursors update delete count distinct drop dropDatabase createIndexes listCollections listDatabases` and `aggregate` with `$match $project $addFields $set $unset $sort $skip $limit $group $unwind $count $lookup $replaceRoot` (accumulators `$sum $avg $min $max $count $first $last $push $addToSet`). Results come in batches through server-side cursors (idle cursors expire after 10 minutes). Databases are isolated; the default database (`--mongo-default-db`, `test` unless set) holds the collections the native `db.<coll>` API sees, and database `d` is visible natively as `db.d.<coll>` / `DOCUMENT.d.coll`. No change streams. `mongosh` has not been tested.
 - **No authentication or TLS on any port.** The server binds to 127.0.0.1 by default; only expose it on a network you trust.
 
 ## Concurrency and correctness

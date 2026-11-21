@@ -188,12 +188,12 @@ polydb ships with **no dataset** and downloads none. Every test creates its own 
 - **All data is held in memory**; the disk is used for durability only. Startup time grows with data size.
 - **No authentication, TLS or replication.** Bind to localhost or a trusted network.
 - **Nesting limits.** A SQL expression may nest 32 levels (parentheses, `NOT`, unary minus, function calls) and contain 100 chained operators and nested sub-expressions in total. JSON text may nest 128 levels and a stored document 100. Anything deeper is an error. These limits are what fixed DEFECT-01, where deeply nested input overflowed the stack and stopped the process; see [docs/REPRODUCIBILITY.md](docs/REPRODUCIBILITY.md).
-- **Large-message allocation (open):** the Redis and PostgreSQL listeners accept a declared message length of up to 512 MB and 256 MB and allocate it before reading.
-- **Log damage:** recovery stops at the first log record that fails its checksum. A torn final record (the normal crash case) is handled correctly; damage in the middle of the log also drops the commits after it.
+- **Request limits:** every listener refuses requests larger than `--max-request-bytes` (default 64 MiB) before allocating them, and `--max-connections` caps clients per listener.
+- **Log damage:** a torn final record (the normal crash case) is dropped. Damage *followed by more log data* is reported as a `corrupt` error instead of silently dropping later commits; `Database::open_with(dir, &OpenOptions { salvage: true })` keeps the intact prefix (and saves the damaged log as `data.wal.corrupt`).
 - Commits wait for their own `fsync`, so write throughput is bounded by the disk.
-- Indexes serve equality only; range queries and joins scan.
-- SQL omits subqueries, `UNION`, `ALTER TABLE`, foreign keys, `UNIQUE`, defaults, composite keys and date/time types.
-- No lock file: do not open the same directory from two processes at once.
+- The planner is rule-based (no statistics); intermediate results of an operator are materialised.
+- Document indexes are single-field; key-value entries have no TTL.
+- A database directory is locked (`LOCK` file): a second process opening it gets an error.
 - Object keys in documents are stored sorted, not in insertion order.
 
 ## Repository layout
@@ -202,7 +202,10 @@ polydb ships with **no dataset** and downloads none. Every test creates its own 
 Cargo.toml, Cargo.lock      package manifest and lock file (no dependencies)
 src/                        the engine (about 5,600 lines)
   storage.rs keys.rs          ordered map, write-ahead log, snapshot, key layout
-  sql.rs doc.rs kv.rs         the three data models
+  rel.rs doc.rs kv.rs         the three data models (schemas/constraints, documents, keys)
+  pbsql/                      PBSQL lexer, AST, parser, statement execution (SQL is its subset)
+  query/                      shared planner, executor and expression evaluation; EXPLAIN
+  aggregate.rs                document aggregation pipelines
   lib.rs value.rs error.rs    sessions, transactions, value type, errors
   server.rs resp.rs           native and Redis listeners
   pgwire.rs mongo.rs          PostgreSQL and MongoDB listeners

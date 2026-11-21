@@ -25,7 +25,7 @@ fi
 .venv/bin/python -m pip install --quiet --disable-pip-version-check -r tests/requirements-drivers.txt
 
 log="$(mktemp)"
-./target/release/polydb serve --memory --port off > "$log" 2>&1 &
+./target/release/polydb serve --memory --port off --mongo-default-db app > "$log" 2>&1 &
 server=$!
 cleanup() { kill "$server" 2>/dev/null || true; wait "$server" 2>/dev/null || true; rm -f "$log"; }
 trap cleanup EXIT

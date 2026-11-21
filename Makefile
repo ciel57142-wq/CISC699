@@ -5,9 +5,9 @@
 help:
 	@echo "make check-env   show tool versions and what is missing"
 	@echo "make build       cargo build --release --locked"
-	@echo "make test        Rust tests: 22 integration + 23 hardening + 1 doc test"
+	@echo "make test        Rust tests: integration, hardening, engine, documents, cli + doc test"
 	@echo "make smoke       scripted run compared with tests/fixtures/smoke.expected"
-	@echo "make drivers     optional: 39 checks through redis-py, psycopg2, pymongo"
+	@echo "make drivers     optional: checks through redis-py, psycopg2, pymongo"
 	@echo "make lint        clippy and rustfmt report (advisory, does not fail)"
 	@echo "make serve       start the server from config/polydb.env"
 	@echo "make clean-run   full reproducibility pass in a fresh copy, with a log"

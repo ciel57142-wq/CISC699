@@ -22,6 +22,7 @@
 //! println!("{}", db.execute("SELECT * FROM users").unwrap());
 //! ```
 
+pub mod aggregate;
 pub mod doc;
 pub mod error;
 pub mod keys;
@@ -363,6 +364,11 @@ impl Database {
         self.run(true, |ctx| doc::delete(ctx, collection, filter, limit))
     }
 
+    /// Run a MongoDB-style aggregation pipeline over a collection.
+    pub fn doc_aggregate(&mut self, collection: &str, pipeline: &[Value]) -> Result<Vec<Value>> {
+        self.run(false, |ctx| aggregate::aggregate(ctx, collection, pipeline))
+    }
+
     pub fn doc_drop(&mut self, collection: &str) -> Result<bool> {
         self.run(true, |ctx| doc::drop(ctx, collection))
     }
@@ -389,7 +395,7 @@ impl Database {
         let s = command.trim().trim_end_matches(';').trim_end();
         if let Some(rest) = s.strip_prefix("db.") {
             let method = rest.split_once('.').map_or("", |(_, m)| m.split('(').next().unwrap_or("")).to_ascii_lowercase();
-            let read = matches!(method.trim(), "find" | "findone" | "count" | "countdocuments");
+            let read = matches!(method.trim(), "find" | "findone" | "count" | "countdocuments" | "aggregate");
             return self.run(!read, |ctx| doc_command(ctx, s));
         }
         let (word, rest) = match s.find(char::is_whitespace) {
@@ -589,7 +595,13 @@ fn parse_calls(s: &str) -> Result<Vec<(String, Vec<Value>)>> {
 
 fn doc_command(ctx: &mut Ctx, s: &str) -> Result<Output> {
     let rest = &s[3..];
-    let dot = rest.find('.').ok_or_else(|| Error::Parse("expected db.<collection>.<method>(...)".into()))?;
+    let mut dot = rest.find('.').ok_or_else(|| Error::Parse("expected db.<collection>.<method>(...)".into()))?;
+    // db.<namespace>.<collection>.<method>(...): the segment after the first dot is not a call
+    let after = &rest[dot + 1..];
+    let seg_end = after.find(|c: char| !(c.is_alphanumeric() || c == '_')).unwrap_or(after.len());
+    if after[seg_end..].starts_with('.') {
+        dot += 1 + seg_end;
+    }
     let coll = &rest[..dot];
     let calls = parse_calls(&rest[dot + 1..])?;
     let (method, args) = &calls[0];
@@ -605,6 +617,14 @@ fn doc_command(ctx: &mut Ctx, s: &str) -> Result<Output> {
             .ok_or_else(|| Error::Parse("expected a non-negative integer".into()))
     };
 
+    if method == "aggregate" {
+        let pipeline = match args.first() {
+            Some(Value::Array(p)) => p.clone(),
+            None => vec![],
+            Some(_) => return Err(Error::Parse("aggregate() takes an array of stages".into())),
+        };
+        return Ok(Output::Docs(aggregate::aggregate(ctx, coll, &pipeline)?));
+    }
     let is_find = matches!(method.as_str(), "find" | "findone");
     if !is_find && calls.len() > 1 {
         return Err(Error::Parse(format!("{method}() cannot be chained")));
@@ -678,7 +698,7 @@ fn doc_command(ctx: &mut Ctx, s: &str) -> Result<Output> {
             }))
         }
         other => Err(Error::Parse(format!(
-            "unknown collection method '{other}': use insert, find, update, delete, count, createIndex or drop"
+            "unknown collection method '{other}': use insert, find, aggregate, update, delete, count, createIndex or drop"
         ))),
     }
 }

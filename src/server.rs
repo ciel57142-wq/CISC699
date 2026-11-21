@@ -39,7 +39,7 @@ impl Default for Config {
 }
 
 /// Resource limits applied to every network connection.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Limits {
     /// Largest single request (command line, RESP command, PostgreSQL
     /// message or MongoDB message) accepted from a client, in bytes.
@@ -49,11 +49,14 @@ pub struct Limits {
     /// Most simultaneous connections per listener; further clients are
     /// disconnected immediately.
     pub max_connections: usize,
+    /// MongoDB database whose collections map to the bare collection names
+    /// of the native API; other databases are stored as `db.collection`.
+    pub mongo_default_db: String,
 }
 
 impl Default for Limits {
     fn default() -> Self {
-        Limits { max_request_bytes: 64 << 20, max_args: 1 << 20, max_connections: 1024 }
+        Limits { max_request_bytes: 64 << 20, max_args: 1 << 20, max_connections: 1024, mongo_default_db: "test".into() }
     }
 }
 
@@ -86,6 +89,7 @@ fn listen(db: &Database, host: &str, port: Option<u16>, limits: Limits, handler:
             let _ = stream.set_nodelay(true);
             let session = db.session();
             let open = open.clone();
+            let limits = limits.clone();
             open.fetch_add(1, AtomicOrdering::SeqCst);
             thread::spawn(move || {
                 handler(stream, session, &limits);
@@ -104,9 +108,9 @@ pub fn start(db: &Database, cfg: &Config) -> Result<Running> {
 /// [`start`] with explicit per-connection resource limits.
 pub fn start_with_limits(db: &Database, cfg: &Config, limits: Limits) -> Result<Running> {
     Ok(Running {
-        native: listen(db, &cfg.host, cfg.native, limits, handle_native)?,
-        redis: listen(db, &cfg.host, cfg.redis, limits, crate::resp::handle_with)?,
-        postgres: listen(db, &cfg.host, cfg.postgres, limits, crate::pgwire::handle_with)?,
+        native: listen(db, &cfg.host, cfg.native, limits.clone(), handle_native)?,
+        redis: listen(db, &cfg.host, cfg.redis, limits.clone(), crate::resp::handle_with)?,
+        postgres: listen(db, &cfg.host, cfg.postgres, limits.clone(), crate::pgwire::handle_with)?,
         mongo: listen(db, &cfg.host, cfg.mongo, limits, crate::mongo::handle_with)?,
     })
 }
