@@ -18,3 +18,7 @@ path = "src/main.rs"
 
 [profile.release]
 opt-level = 3
+
+[[bench]]
+name = "perf"
+harness = false

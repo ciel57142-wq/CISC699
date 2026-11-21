@@ -114,3 +114,43 @@ fn array_positions_in_dotted_paths() {
         vec![vec![Value::Float(3.5), Value::Float(0.25)]]
     );
 }
+
+/// A failing statement inside a transaction is undone through a per-statement
+/// journal (it used to copy the whole write set before every statement,
+/// which made long transactions quadratic). Keys the failed statement
+/// touched that earlier statements had already written must get their
+/// earlier uncommitted values back.
+#[test]
+fn failed_statement_in_a_transaction_restores_earlier_uncommitted_writes() {
+    let mut db = Database::in_memory();
+    ok(
+        &mut db,
+        "CREATE TABLE t (id INT PRIMARY KEY, v INT CHECK (v < 100))",
+    );
+    ok(&mut db, "INSERT INTO t VALUES (1, 1), (2, 2), (3, 3)");
+    ok(&mut db, "BEGIN");
+    ok(&mut db, "UPDATE t SET v = 50 WHERE id = 1");
+    ok(&mut db, "DELETE FROM t WHERE id = 3");
+    ok(&mut db, "INSERT INTO t VALUES (4, 4)");
+    // touches id 1 (written earlier), id 2 and id 4, then fails on the CHECK at id 4
+    assert!(db
+        .execute("UPDATE t SET v = CASE WHEN id = 4 THEN 1000 ELSE v + 1 END WHERE id IN (1, 2, 4)")
+        .is_err());
+    assert_eq!(
+        rows(&mut db, "SELECT id, v FROM t ORDER BY id"),
+        vec![
+            vec![Value::Int(1), Value::Int(50)],
+            vec![Value::Int(2), Value::Int(2)],
+            vec![Value::Int(4), Value::Int(4)]
+        ]
+    );
+    ok(&mut db, "COMMIT");
+    assert_eq!(
+        rows(&mut db, "SELECT id, v FROM t ORDER BY id"),
+        vec![
+            vec![Value::Int(1), Value::Int(50)],
+            vec![Value::Int(2), Value::Int(2)],
+            vec![Value::Int(4), Value::Int(4)]
+        ]
+    );
+}

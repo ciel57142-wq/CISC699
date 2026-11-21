@@ -20,7 +20,7 @@ use super::plan::*;
 use crate::error::{Error, Result};
 use crate::keys;
 use crate::pbsql::ast::{AggFn, Expr, JoinKind, Op, Ty};
-use crate::rel::{self, Enc, Schema};
+use crate::rel::{self, Schema};
 use crate::storage::Ctx;
 use crate::value::Value;
 use std::cell::{Cell, RefCell};
@@ -532,6 +532,8 @@ pub struct Executor<'p, 'c, 'a> {
     /// Which tree a node id belongs to: 0 = main plan, 1 + i = subplan i.
     tree: Cell<usize>,
     pub opts: ExecOpts,
+    /// Collect per-operator rows / time (EXPLAIN ANALYZE); off for normal queries.
+    pub analyze: bool,
 }
 
 impl SubRunner for Executor<'_, '_, '_> {
@@ -574,6 +576,7 @@ impl SubRunner for Executor<'_, '_, '_> {
 /// Counts rows and time of one operator and checks for cancellation.
 struct Counted<'e> {
     inner: RowIter<'e>,
+    timed: bool,
     stats: &'e RefCell<HashMap<(usize, usize), Stat>>,
     key: (usize, usize),
     cancel: Option<Arc<AtomicBool>>,
@@ -593,6 +596,13 @@ impl Iterator for Counted<'_> {
         {
             self.done = true;
             return Some(Err(Error::Cancelled("statement cancelled".into())));
+        }
+        if !self.timed {
+            let r = self.inner.next();
+            if !matches!(r, Some(Ok(_))) {
+                self.done = true;
+            }
+            return r;
         }
         let t = Instant::now();
         let r = self.inner.next();
@@ -616,6 +626,7 @@ impl<'p, 'c, 'a> Executor<'p, 'c, 'a> {
             cache: RefCell::new(HashMap::new()),
             tree: Cell::new(0),
             opts: ctx.exec.clone(),
+            analyze: false,
         }
     }
 
@@ -628,7 +639,9 @@ impl<'p, 'c, 'a> Executor<'p, 'c, 'a> {
     }
 
     fn bump(&self, key: (usize, usize), f: impl FnOnce(&mut Stat)) {
-        f(self.stats.borrow_mut().entry(key).or_default());
+        if self.analyze {
+            f(self.stats.borrow_mut().entry(key).or_default());
+        }
     }
 
     fn check_cancel(&self) -> Result<()> {
@@ -657,6 +670,7 @@ impl<'p, 'c, 'a> Executor<'p, 'c, 'a> {
         self.bump(key, |s| s.nanos += t.elapsed().as_nanos());
         Ok(Box::new(Counted {
             inner: inner?,
+            timed: self.analyze,
             stats: &self.stats,
             key,
             cancel: self.opts.cancel.clone(),
@@ -2296,7 +2310,8 @@ pub fn run_analyze<'p, 'c, 'a>(
     ctx: &'c Ctx<'a>,
     plan: &'p Plan,
 ) -> Result<(Vec<Row>, Executor<'p, 'c, 'a>, u128)> {
-    let ex = Executor::new(ctx, &plan.subs);
+    let mut ex = Executor::new(ctx, &plan.subs);
+    ex.analyze = true;
     let t = Instant::now();
     let rows = ex.exec(&plan.root, &[])?;
     let nanos = t.elapsed().as_nanos();

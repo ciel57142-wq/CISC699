@@ -454,6 +454,15 @@ pub struct Ctx<'a> {
     pub(crate) reads: Option<RefCell<ReadSet>>,
     /// Execution settings (memory budget, cancel flag) for queries run in this context.
     pub(crate) exec: crate::query::exec::ExecOpts,
+    /// Per-statement undo journal inside an explicit transaction.
+    pub(crate) undo: Option<Undo>,
+}
+
+/// Buffered states of the keys a statement changed, before it changed them.
+#[derive(Default)]
+pub(crate) struct Undo {
+    seen: BTreeSet<Vec<u8>>,
+    entries: Vec<(Vec<u8>, Option<Option<Vec<u8>>>)>,
 }
 
 impl<'a> Ctx<'a> {
@@ -468,11 +477,45 @@ impl<'a> Ctx<'a> {
     }
 
     pub fn put(&mut self, key: Vec<u8>, value: Vec<u8>) {
+        self.record_undo(&key);
         self.writes.insert(key, Some(value));
     }
 
     pub fn delete(&mut self, key: Vec<u8>) {
+        self.record_undo(&key);
         self.writes.insert(key, None);
+    }
+
+    /// Remember a key's buffered state before this statement first changes it,
+    /// so a failing statement can be undone without copying the write set.
+    fn record_undo(&mut self, key: &[u8]) {
+        if let Some(j) = &mut self.undo {
+            if j.seen.insert(key.to_vec()) {
+                j.entries
+                    .push((key.to_vec(), self.writes.get(key).cloned()));
+            }
+        }
+    }
+
+    /// Start journaling this statement's changes to the write set.
+    pub(crate) fn begin_statement(&mut self) {
+        self.undo = Some(Undo::default());
+    }
+
+    /// Undo this statement's changes, restoring the write set as it was.
+    pub(crate) fn undo_statement(&mut self) {
+        if let Some(j) = self.undo.take() {
+            for (k, prev) in j.entries.into_iter().rev() {
+                match prev {
+                    Some(v) => {
+                        self.writes.insert(k, v);
+                    }
+                    None => {
+                        self.writes.remove(&k);
+                    }
+                }
+            }
+        }
     }
 
     /// All live entries whose key starts with `prefix`, in key order.
