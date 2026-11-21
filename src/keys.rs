@@ -6,6 +6,7 @@
 //! d \0 <coll>  \0 <id>       document         (JSON object)
 //! m \0 t \0 <table>          table schema
 //! m \0 c \0 <coll>           collection marker
+//! K \0 <ns> \0 <key>        key-value entry in a named namespace
 //! m \0 s \0 <name>           sequence counter (row ids, document ids)
 //! i \0 <owner> \0 <field> \0 <value><id>   secondary index entry (empty value)
 //! ```
@@ -37,6 +38,22 @@ fn key(parts: &[&[u8]]) -> Vec<u8> {
 pub const KV_PREFIX: &[u8] = b"k\0";
 pub const TABLE_META_PREFIX: &[u8] = b"m\0t\0";
 pub const COLL_META_PREFIX: &[u8] = b"m\0c\0";
+
+/// Prefix of a key-value namespace: the default keyspace ("") is the
+/// original `k\0` space; named namespaces live under `K\0<ns>\0`.
+pub fn kv_ns_prefix(ns: &str) -> Vec<u8> {
+    if ns.is_empty() {
+        KV_PREFIX.to_vec()
+    } else {
+        key(&[b"K", ns.as_bytes(), b""])
+    }
+}
+
+pub fn kv_ns(ns: &str, k: &str) -> Vec<u8> {
+    let mut out = kv_ns_prefix(ns);
+    out.extend_from_slice(k.as_bytes());
+    out
+}
 
 pub fn kv(k: &str) -> Vec<u8> {
     key(&[b"k", k.as_bytes()])

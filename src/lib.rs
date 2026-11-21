@@ -24,10 +24,13 @@
 
 pub mod doc;
 pub mod error;
-mod keys;
+pub mod keys;
 pub mod kv;
 pub mod mongo;
+pub mod pbsql;
 pub mod pgwire;
+pub mod query;
+pub mod rel;
 pub mod resp;
 pub mod server;
 mod sql;
@@ -132,7 +135,7 @@ impl Shared {
         match self.active.keys().next().copied() {
             None => self.log.clear(),
             Some(oldest) => {
-                while self.log.front().map_or(false, |(v, _)| *v <= oldest) {
+                while self.log.front().is_some_and(|(v, _)| *v <= oldest) {
                     self.log.pop_front();
                 }
             }
@@ -291,7 +294,12 @@ impl Database {
 
     /// Run one SQL statement.
     pub fn sql(&mut self, statement: &str) -> Result<Output> {
-        let read = first_word(statement) == "select";
+        self.pbsql(statement)
+    }
+
+    /// Run one PBSQL statement (SQL, document, key-value or cross-model).
+    pub fn pbsql(&mut self, statement: &str) -> Result<Output> {
+        let read = pbsql::exec::is_read_only(statement);
         self.run(!read, |ctx| sql::execute(ctx, statement))
     }
 
@@ -372,7 +380,8 @@ impl Database {
 
     /// Run one command in any of the three languages:
     ///
-    /// * SQL: `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `CREATE TABLE|INDEX`, `DROP TABLE|INDEX`
+    /// * SQL / PBSQL: `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `CREATE TABLE|INDEX`, `DROP TABLE|INDEX`,
+    ///   `ALTER TABLE`, `EXPLAIN [ANALYZE]`, model-qualified names (`DOCUMENT.c`, `KV.ns`)
     /// * documents: `db.<collection>.<method>(...)`
     /// * key-value: `SET`, `GET`, `DEL`, `EXISTS`, `KEYS`, `INCR`
     /// * control: `BEGIN`, `COMMIT`, `ROLLBACK`, `CHECKPOINT`, `SHOW TABLES`, `SHOW COLLECTIONS`
@@ -405,14 +414,30 @@ impl Database {
                     rows: names.into_iter().map(|n| vec![Value::Text(n)]).collect(),
                 })
             }
+            // PBSQL key-value forms: GET FROM KV 'k', SET KV 'k' = v, EXISTS KV 'k'
+            "get" if first_word(rest) == "from" => self.pbsql(s),
+            "set" | "exists" if is_pbsql_kv(rest) => self.pbsql(s),
             w @ ("get" | "exists" | "keys") => self.run(false, |ctx| kv_command(ctx, w, rest)),
             w @ ("set" | "del" | "incr") => self.run(true, |ctx| kv_command(ctx, w, rest)),
-            "select" | "insert" | "update" | "delete" | "create" | "drop" => self.sql(s),
+            "select" | "insert" | "update" | "delete" | "create" | "drop" | "alter" | "explain" | "increment" | "with" => {
+                self.pbsql(s)
+            }
+            _ if s.starts_with('(') => self.pbsql(s),
             other => Err(Error::Parse(format!(
                 "unknown command '{other}': expected SQL, a db.<collection>.<method>(...) call, or SET/GET/DEL/EXISTS/KEYS/INCR"
             ))),
         }
     }
+}
+
+/// `KV 'key' ...` / `KV.ns 'key' ...` after SET or EXISTS (legacy forms take a bare key).
+fn is_pbsql_kv(rest: &str) -> bool {
+    let r = rest.trim_start();
+    let Some(after) = r.get(..2).filter(|p| p.eq_ignore_ascii_case("kv")).map(|_| &r[2..]) else {
+        return false;
+    };
+    let after = after.trim_start();
+    after.starts_with('\'') || after.starts_with('.')
 }
 
 fn first_word(s: &str) -> String {

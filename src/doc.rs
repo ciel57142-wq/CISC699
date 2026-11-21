@@ -27,12 +27,12 @@ fn check_depth(doc: &Value) -> Result<()> {
     Ok(())
 }
 
-fn decode(raw: &[u8]) -> Result<Value> {
+pub fn decode(raw: &[u8]) -> Result<Value> {
     let s = std::str::from_utf8(raw).map_err(|_| Error::Corrupt("document is not UTF-8".into()))?;
     Value::parse(s).map_err(|e| Error::Corrupt(format!("stored document: {e}")))
 }
 
-fn doc_key(coll: &str, id: &Value) -> Result<Vec<u8>> {
+pub fn doc_key(coll: &str, id: &Value) -> Result<Vec<u8>> {
     let mut k = keys::doc_prefix(coll);
     k.extend(keys::encode_id(id)?);
     Ok(k)
@@ -224,7 +224,7 @@ pub fn find(ctx: &Ctx, coll: &str, filter: &Value, opts: &FindOptions) -> Result
             return Err(Error::Type("sort must be an object like {\"field\": 1}".into()));
         };
         let spec: Vec<(&String, bool)> =
-            spec.iter().map(|(k, v)| (k, v.as_f64().map_or(false, |n| n < 0.0))).collect();
+            spec.iter().map(|(k, v)| (k, v.as_f64().is_some_and(|n| n < 0.0))).collect();
         docs.sort_by(|a, b| {
             for (path, desc) in &spec {
                 let (x, y) = (get_path(a, path).unwrap_or(&Value::Null), get_path(b, path).unwrap_or(&Value::Null));
@@ -289,12 +289,31 @@ pub fn update(
     Ok((n, None))
 }
 
+/// Replace a stored document (found by key), keeping indexes in step.
+pub fn replace(ctx: &mut Ctx, coll: &str, key: Vec<u8>, old: &Value, new: Value) -> Result<()> {
+    check_depth(&new)?;
+    if new.get("_id") != old.get("_id") {
+        return Err(Error::Constraint("_id cannot be changed".into()));
+    }
+    let fields = indexes(ctx, coll)?;
+    del_doc(ctx, coll, &fields, key.clone(), old);
+    put_doc(ctx, coll, &fields, key, &new);
+    Ok(())
+}
+
+/// Delete a stored document (found by key) and its index entries.
+pub fn remove(ctx: &mut Ctx, coll: &str, key: Vec<u8>, old: &Value) -> Result<()> {
+    let fields = indexes(ctx, coll)?;
+    del_doc(ctx, coll, &fields, key, old);
+    Ok(())
+}
+
 /// Delete matching documents, at most `limit` of them when given.
 pub fn delete(ctx: &mut Ctx, coll: &str, filter: &Value, limit: Option<u64>) -> Result<u64> {
     let fields = indexes(ctx, coll)?;
     let mut n = 0;
     for (key, d) in candidates(ctx, coll, filter)? {
-        if limit.map_or(false, |l| n >= l) {
+        if limit.is_some_and(|l| n >= l) {
             break;
         }
         if matches(&d, filter)? {
@@ -338,8 +357,8 @@ pub fn project(doc: Value, projection: &Value) -> Value {
         return doc;
     }
     if p.iter().any(|(k, v)| k != "_id" && on(v)) {
-        let keep_id = p.get("_id").map_or(true, on);
-        d.retain(|k, _| (k == "_id" && keep_id) || (k != "_id" && p.get(k).map_or(false, on)));
+        let keep_id = p.get("_id").is_none_or(on);
+        d.retain(|k, _| (k == "_id" && keep_id) || (k != "_id" && p.get(k).is_some_and(on)));
     } else {
         d.retain(|k, _| !p.contains_key(k));
     }
@@ -455,7 +474,7 @@ fn op_matches(v: Option<&Value>, op: &str, arg: &Value) -> Result<bool> {
 
 // ---------------------------------------------------------------- updates
 
-fn set_path(doc: &mut Value, path: &str, v: Value) -> Result<()> {
+pub fn set_path(doc: &mut Value, path: &str, v: Value) -> Result<()> {
     let parts: Vec<&str> = path.split('.').collect();
     let (last, parents) = parts.split_last().expect("split always yields one part");
     let mut cur = doc;

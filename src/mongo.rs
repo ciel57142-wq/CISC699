@@ -313,7 +313,7 @@ fn cursor(ns: &str, batch: Vec<Value>) -> Value {
 fn truthy(v: Option<&Value>) -> bool {
     match v {
         Some(Value::Bool(b)) => *b,
-        Some(v) => v.as_f64().map_or(false, |n| n != 0.0),
+        Some(v) => v.as_f64().is_some_and(|n| n != 0.0),
         None => false,
     }
 }
@@ -371,7 +371,7 @@ fn aggregate(db: &mut Database, coll: &str, pipeline: &[Value]) -> Result<Vec<Va
                             (doc::get_path(a, path).unwrap_or(&Value::Null), doc::get_path(b, path).unwrap_or(&Value::Null));
                         let o = x.total_cmp(y);
                         if o != std::cmp::Ordering::Equal {
-                            return if dir.as_f64().map_or(false, |n| n < 0.0) { o.reverse() } else { o };
+                            return if dir.as_f64().is_some_and(|n| n < 0.0) { o.reverse() } else { o };
                         }
                     }
                     std::cmp::Ordering::Equal

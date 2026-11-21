@@ -139,7 +139,7 @@ fn run_statement(db: &mut Database, stmt: &str, out: &mut Vec<u8>) -> bool {
     let mut words = stmt.split_whitespace().map(str::to_ascii_lowercase);
     let first = words.next().unwrap_or_default();
     let second = words.next().unwrap_or_default();
-    let second = second.trim_end_matches(|c| c == '=' || c == ';');
+    let second = second.trim_end_matches(['=', ';']);
 
     // PostgreSQL session chatter that drivers send and that has no meaning here.
     let noop = match first.as_str() {
