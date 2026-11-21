@@ -20,7 +20,7 @@ use super::plan::*;
 use crate::error::{Error, Result};
 use crate::keys;
 use crate::pbsql::ast::{AggFn, Expr, JoinKind, Op, Ty};
-use crate::rel::{self, Enc, Schema};
+use crate::rel::{self, Schema};
 use crate::storage::Ctx;
 use crate::value::Value;
 use std::cell::{Cell, RefCell};
@@ -307,7 +307,7 @@ impl<'f> Sorter<'f> {
             let mut best: Option<usize> = None;
             for (i, h) in heads.iter().enumerate() {
                 if let Some((k, _)) = h {
-                    if best.map_or(true, |b| {
+                    if best.is_none_or(|b| {
                         cmp(k, &heads[b].as_ref().expect("head").0) == Ordering::Less
                     }) {
                         best = Some(i);
@@ -372,15 +372,13 @@ impl Acc {
                 *n += 1;
             }
             Acc::Min(m) => {
-                if m.as_ref()
-                    .map_or(true, |c| v.total_cmp(c) == Ordering::Less)
-                {
+                if m.as_ref().is_none_or(|c| v.total_cmp(c) == Ordering::Less) {
                     *m = Some(v.clone());
                 }
             }
             Acc::Max(m) => {
                 if m.as_ref()
-                    .map_or(true, |c| v.total_cmp(c) == Ordering::Greater)
+                    .is_none_or(|c| v.total_cmp(c) == Ordering::Greater)
                 {
                     *m = Some(v.clone());
                 }
@@ -405,15 +403,13 @@ impl Acc {
                 *n += m;
             }
             (Acc::Min(a), Acc::Min(Some(b))) => {
-                if a.as_ref()
-                    .map_or(true, |c| b.total_cmp(c) == Ordering::Less)
-                {
+                if a.as_ref().is_none_or(|c| b.total_cmp(c) == Ordering::Less) {
                     *a = Some(b);
                 }
             }
             (Acc::Max(a), Acc::Max(Some(b))) => {
                 if a.as_ref()
-                    .map_or(true, |c| b.total_cmp(c) == Ordering::Greater)
+                    .is_none_or(|c| b.total_cmp(c) == Ordering::Greater)
                 {
                     *a = Some(b);
                 }
@@ -532,6 +528,8 @@ pub struct Executor<'p, 'c, 'a> {
     /// Which tree a node id belongs to: 0 = main plan, 1 + i = subplan i.
     tree: Cell<usize>,
     pub opts: ExecOpts,
+    /// Collect per-operator rows / time (EXPLAIN ANALYZE); off for normal queries.
+    pub analyze: bool,
 }
 
 impl SubRunner for Executor<'_, '_, '_> {
@@ -574,6 +572,7 @@ impl SubRunner for Executor<'_, '_, '_> {
 /// Counts rows and time of one operator and checks for cancellation.
 struct Counted<'e> {
     inner: RowIter<'e>,
+    timed: bool,
     stats: &'e RefCell<HashMap<(usize, usize), Stat>>,
     key: (usize, usize),
     cancel: Option<Arc<AtomicBool>>,
@@ -593,6 +592,13 @@ impl Iterator for Counted<'_> {
         {
             self.done = true;
             return Some(Err(Error::Cancelled("statement cancelled".into())));
+        }
+        if !self.timed {
+            let r = self.inner.next();
+            if !matches!(r, Some(Ok(_))) {
+                self.done = true;
+            }
+            return r;
         }
         let t = Instant::now();
         let r = self.inner.next();
@@ -616,6 +622,7 @@ impl<'p, 'c, 'a> Executor<'p, 'c, 'a> {
             cache: RefCell::new(HashMap::new()),
             tree: Cell::new(0),
             opts: ctx.exec.clone(),
+            analyze: false,
         }
     }
 
@@ -628,7 +635,9 @@ impl<'p, 'c, 'a> Executor<'p, 'c, 'a> {
     }
 
     fn bump(&self, key: (usize, usize), f: impl FnOnce(&mut Stat)) {
-        f(self.stats.borrow_mut().entry(key).or_default());
+        if self.analyze {
+            f(self.stats.borrow_mut().entry(key).or_default());
+        }
     }
 
     fn check_cancel(&self) -> Result<()> {
@@ -657,6 +666,7 @@ impl<'p, 'c, 'a> Executor<'p, 'c, 'a> {
         self.bump(key, |s| s.nanos += t.elapsed().as_nanos());
         Ok(Box::new(Counted {
             inner: inner?,
+            timed: self.analyze,
             stats: &self.stats,
             key,
             cancel: self.opts.cancel.clone(),
@@ -721,7 +731,8 @@ impl<'p, 'c, 'a> Executor<'p, 'c, 'a> {
                 let rnode: &'e Node = right;
                 let mut right_it: Option<RowIter<'e>> = None;
                 let mut left_it = Some(l);
-                let chained = std::iter::from_fn(move || loop {
+                // the right input is opened only once the left one is exhausted
+                let chained = std::iter::from_fn(move || {
                     if let Some(l) = &mut left_it {
                         match l.next() {
                             Some(r) => return Some(r),
@@ -734,7 +745,7 @@ impl<'p, 'c, 'a> Executor<'p, 'c, 'a> {
                             Err(e) => return Some(Err(e)),
                         }
                     }
-                    return right_it.as_mut()?.next();
+                    right_it.as_mut()?.next()
                 });
                 if *all {
                     Box::new(chained)
@@ -2296,7 +2307,8 @@ pub fn run_analyze<'p, 'c, 'a>(
     ctx: &'c Ctx<'a>,
     plan: &'p Plan,
 ) -> Result<(Vec<Row>, Executor<'p, 'c, 'a>, u128)> {
-    let ex = Executor::new(ctx, &plan.subs);
+    let mut ex = Executor::new(ctx, &plan.subs);
+    ex.analyze = true;
     let t = Instant::now();
     let rows = ex.exec(&plan.root, &[])?;
     let nanos = t.elapsed().as_nanos();

@@ -536,6 +536,8 @@ const COMMANDS: &[&str] = &[
     "listcollections",
     "listdatabases",
     "createindexes",
+    "listindexes",
+    "dropindexes",
 ];
 
 // --------------------------------------------- key order from raw BSON

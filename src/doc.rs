@@ -111,37 +111,47 @@ pub fn drop_index(ctx: &mut Ctx, coll: &str, name: &str) -> Result<bool> {
 
 /// Insert a document; returns its `_id` (generated when absent).
 pub fn insert(ctx: &mut Ctx, coll: &str, doc: Value) -> Result<Value> {
+    Ok(insert_many(ctx, coll, vec![doc])?.remove(0))
+}
+
+/// Insert several documents, reading the collection's metadata once.
+/// Returns their `_id`s; on error nothing is kept (the statement is atomic).
+pub fn insert_many(ctx: &mut Ctx, coll: &str, docs: Vec<Value>) -> Result<Vec<Value>> {
     check_name(coll)?;
-    check_depth(&doc)?;
-    let Value::Object(mut obj) = doc else {
-        return Err(Error::Type("a document must be a JSON object".into()));
-    };
     if ctx.get(&keys::coll_meta(coll)).is_none() {
         docindex::save(ctx, coll, &[]);
     }
-    let id = match obj.get("_id") {
-        Some(id) => id.clone(),
-        None => {
-            let n = keys::next_seq(ctx, &owner(coll))?;
-            let ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_millis())
-                .unwrap_or(0);
-            let id = Value::Text(format!("{ms:012x}{n:08x}"));
-            obj.insert("_id".into(), id.clone());
-            id
-        }
-    };
-    let key = doc_key(coll, &id)?;
-    if ctx.get(&key).is_some() {
-        return Err(Error::Constraint(format!(
-            "duplicate _id {} in collection '{coll}'",
-            id.to_json()
-        )));
-    }
     let mut ixs = indexes(ctx, coll)?;
-    put_doc(ctx, coll, &mut ixs, key, &Value::Object(obj))?;
-    Ok(id)
+    let mut ids = Vec::with_capacity(docs.len());
+    for doc in docs {
+        check_depth(&doc)?;
+        let Value::Object(mut obj) = doc else {
+            return Err(Error::Type("a document must be a JSON object".into()));
+        };
+        let id = match obj.get("_id") {
+            Some(id) => id.clone(),
+            None => {
+                let n = keys::next_seq(ctx, &owner(coll))?;
+                let ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0);
+                let id = Value::Text(format!("{ms:012x}{n:08x}"));
+                obj.insert("_id".into(), id.clone());
+                id
+            }
+        };
+        let key = doc_key(coll, &id)?;
+        if ctx.get(&key).is_some() {
+            return Err(Error::Constraint(format!(
+                "duplicate _id {} in collection '{coll}'",
+                id.to_json()
+            )));
+        }
+        put_doc(ctx, coll, &mut ixs, key, &Value::Object(obj))?;
+        ids.push(id);
+    }
+    Ok(ids)
 }
 
 /// Equality operand of a filter condition on a field (`{f: v}` or `{f: {$eq: v}}`).

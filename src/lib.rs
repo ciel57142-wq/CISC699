@@ -219,6 +219,7 @@ impl Database {
                 writes: WriteSet::new(),
                 reads: None,
                 exec: Default::default(),
+                undo: None,
             };
             kv::index_untracked_expiries(&mut ctx);
             let _ = rel::upgrade_indexes(&mut ctx);
@@ -247,6 +248,7 @@ impl Database {
                         writes: WriteSet::new(),
                         reads: None,
                         exec: Default::default(),
+                        undo: None,
                     };
                     kv::next_expiry(&ctx).is_some_and(|at| at <= kv::now_ms())
                 };
@@ -257,6 +259,7 @@ impl Database {
                         writes: WriteSet::new(),
                         reads: None,
                         exec: Default::default(),
+                        undo: None,
                     };
                     kv::purge_expired(&mut ctx, kv::now_ms(), 1000);
                     let ws = ctx.writes;
@@ -346,20 +349,24 @@ impl Database {
     fn run<T>(&mut self, writes: bool, f: impl FnOnce(&mut Ctx) -> Result<T>) -> Result<T> {
         if let Some(mut t) = self.txn.take() {
             let guard = self.shared.read().unwrap_or_else(|e| e.into_inner());
-            let savepoint = t.writes.clone();
             let mut ctx = Ctx {
                 store: &guard.store,
                 writes: t.writes,
                 reads: Some(RefCell::new(t.reads)),
                 exec: self.exec_opts(),
+                undo: None,
             };
+            ctx.begin_statement();
             let res = f(&mut ctx);
+            if res.is_err() {
+                ctx.undo_statement(); // a failing statement leaves the transaction as it was
+            }
             t.reads = ctx
                 .reads
                 .take()
                 .map(RefCell::into_inner)
                 .unwrap_or_default();
-            t.writes = if res.is_ok() { ctx.writes } else { savepoint };
+            t.writes = ctx.writes;
             drop(guard);
             self.txn = Some(t);
             return res;
@@ -372,6 +379,7 @@ impl Database {
                 writes: WriteSet::new(),
                 reads: None,
                 exec: self.exec_opts(),
+                undo: None,
             };
             let out = f(&mut ctx)?;
             let ws = ctx.writes;
@@ -384,6 +392,7 @@ impl Database {
                 writes: WriteSet::new(),
                 reads: None,
                 exec: self.exec_opts(),
+                undo: None,
             };
             f(&mut ctx)
         }
@@ -673,7 +682,13 @@ impl Database {
                 .to_ascii_lowercase();
             let read = matches!(
                 method.trim(),
-                "find" | "findone" | "count" | "countdocuments" | "aggregate"
+                "find"
+                    | "findone"
+                    | "count"
+                    | "countdocuments"
+                    | "aggregate"
+                    | "getindexes"
+                    | "validate"
             );
             return self.run(!read, |ctx| doc_command(ctx, s));
         }
@@ -984,10 +999,7 @@ fn doc_command(ctx: &mut Ctx, s: &str) -> Result<Output> {
     match method.as_str() {
         "insert" | "insertone" | "insertmany" => match need(0, "a document")? {
             Value::Array(docs) => {
-                let mut ids = Vec::new();
-                for d in docs {
-                    ids.push(doc::insert(ctx, coll, d.clone())?);
-                }
+                let ids = doc::insert_many(ctx, coll, docs.clone())?;
                 Ok(Output::Scalar(Value::Array(ids)))
             }
             d => Ok(Output::Scalar(doc::insert(ctx, coll, d.clone())?)),

@@ -520,7 +520,7 @@ pub fn choose<T: Clone>(
         } else {
             continue;
         };
-        if best.as_ref().map_or(true, |b| b.0 < score) {
+        if best.as_ref().is_none_or(|b| b.0 < score) {
             best = Some((
                 score,
                 Choice {

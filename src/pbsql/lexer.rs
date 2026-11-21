@@ -60,6 +60,18 @@ pub fn lex(src: &str) -> Result<Vec<Tok>> {
         {
             let start = i;
             let mut float = false;
+            if in_path(&out) {
+                // `items.0.qty`: an array index inside a dotted path is digits only
+                while i < cs.len() && cs[i].1.is_ascii_digit() {
+                    i += 1;
+                }
+                let text: String = cs[start..i].iter().map(|x| x.1).collect();
+                out.push(Tok::Int(
+                    text.parse()
+                        .map_err(|_| Error::Parse(format!("bad path index '{text}'")))?,
+                ));
+                continue;
+            }
             while i < cs.len() && (cs[i].1.is_ascii_digit() || cs[i].1 == '.') {
                 float |= cs[i].1 == '.';
                 i += 1;
@@ -176,6 +188,18 @@ pub fn lex(src: &str) -> Result<Vec<Tok>> {
         }
     }
     Ok(out)
+}
+
+/// Right after `name.` (or `name.0.`): the next number is a path step.
+fn in_path(out: &[Tok]) -> bool {
+    matches!(
+        out,
+        [
+            ..,
+            Tok::Word { .. } | Tok::Ident(_) | Tok::Int(_),
+            Tok::Sym(".")
+        ]
+    ) && !matches!(out, [.., Tok::Int(_), Tok::Sym(".")] if !matches!(out, [.., Tok::Word { .. } | Tok::Ident(_), Tok::Sym("."), Tok::Int(_), Tok::Sym(".")]))
 }
 
 /// `a.1` is a path step, not the number `.1`.
