@@ -11,10 +11,10 @@ use crate::error::Result;
 use crate::value::Value;
 
 const RESERVED: &[&str] = &[
-    "where", "join", "inner", "left", "outer", "cross", "on", "group", "order", "by", "limit",
-    "offset", "having", "as", "set", "values", "from", "and", "or", "not", "asc", "desc", "union",
-    "select", "when", "then", "else", "end", "case", "in", "is", "like", "between", "exists",
-    "all", "distinct",
+    "where", "join", "inner", "left", "right", "full", "outer", "cross", "on", "group", "order",
+    "by", "limit", "offset", "having", "as", "set", "values", "from", "and", "or", "not", "asc",
+    "desc", "union", "select", "when", "then", "else", "end", "case", "in", "is", "like",
+    "between", "exists", "all", "distinct",
 ];
 
 /// Limits on one expression. The parser, binder and evaluator are recursive,
@@ -346,11 +346,11 @@ impl Parser {
         }
         if self.kw("drop") {
             if self.kw("index") {
-                let name = self.ident()?;
+                let name = self.ident_orig()?;
                 self.expect_kw("on")?;
                 return Ok(Stmt::DropIndex {
                     name,
-                    table: self.ident()?,
+                    target: self.object_name(Model::Relational)?,
                 });
             }
             self.expect_kw("table")?;
@@ -800,6 +800,12 @@ impl Parser {
                 let kind = if self.kw("left") {
                     self.kw("outer");
                     JoinKind::Left
+                } else if self.kw("right") {
+                    self.kw("outer");
+                    JoinKind::Right
+                } else if self.kw("full") {
+                    self.kw("outer");
+                    JoinKind::Full
                 } else if self.kw("cross") {
                     JoinKind::Cross
                 } else {

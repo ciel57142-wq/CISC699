@@ -56,7 +56,7 @@ pub fn run_stmt(ctx: &mut Ctx, st: Stmt) -> Result<Output> {
             unique,
             if_not_exists,
         } => create_index(ctx, name, target, cols, unique, if_not_exists),
-        Stmt::DropIndex { name, table } => drop_index(ctx, &name, &table),
+        Stmt::DropIndex { name, target } => drop_index(ctx, &name, &target),
         Stmt::AlterTable { table, op } => alter(ctx, &table, op),
         Stmt::Insert {
             target,
@@ -208,6 +208,7 @@ fn explain_stmt(ctx: &mut Ctx, st: Stmt, analyze: bool) -> Result<Output> {
                     alias: alias.clone(),
                     filter: plan_and(filters),
                     limit: None,
+                    reverse: false,
                 },
             };
             let mut lines = vec![format!("{kind} on {}", target_name(target))];
@@ -571,19 +572,24 @@ fn create_index(
     if_not_exists: bool,
 ) -> Result<Output> {
     if target.model == Model::Document {
-        if cols.len() != 1 || unique {
-            return Err(Error::Schema(
-                "document indexes are single-field and non-unique".into(),
-            ));
-        }
-        let created = doc::create_index(ctx, &target.name, &cols[0])?;
+        let fields: Vec<(String, i64)> = cols.iter().map(|c| (c.clone(), 1)).collect();
+        let created =
+            doc::create_index_with(ctx, &target.name, fields, unique, Some(name.clone()))?;
         return Ok(Output::Done(if created {
             format!(
-                "index '{name}' created on DOCUMENT.{}({})",
-                target.name, cols[0]
+                "{}index '{name}' created on DOCUMENT.{}({})",
+                if unique { "unique " } else { "" },
+                target.name,
+                cols.join(", ")
             )
+        } else if if_not_exists {
+            format!("index '{name}' already exists")
         } else {
-            format!("DOCUMENT.{}.{} is already indexed", target.name, cols[0])
+            format!(
+                "DOCUMENT.{}({}) is already indexed",
+                target.name,
+                cols.join(", ")
+            )
         }));
     }
     if target.model == Model::Kv {
@@ -613,22 +619,14 @@ fn create_index(
     }
     // A plain single-column index keeps the original entry layout, so it can
     // share entries with an existing index on the same column.
-    let ix = if cols.len() == 1 && !unique {
-        Index {
-            name: name.clone(),
-            cols: cols.clone(),
-            unique: false,
-            field: cols[0].clone(),
-            enc: Enc::Legacy,
-        }
-    } else {
-        Index {
-            field: format!("{name}\u{1}"),
-            name: name.clone(),
-            cols: cols.clone(),
-            unique,
-            enc: Enc::Exact,
-        }
+    // Exact encoding keeps every value distinct and ordered, so the index
+    // can also serve ORDER BY. (Indexes from 0.2 keep their legacy layout.)
+    let ix = Index {
+        field: format!("{name}\u{1}"),
+        name: name.clone(),
+        cols: cols.clone(),
+        unique,
+        enc: Enc::Exact,
     };
     let shared = schema.indexes.iter().any(|i| i.field == ix.field);
     if !shared {
@@ -643,9 +641,21 @@ fn create_index(
     )))
 }
 
-fn drop_index(ctx: &mut Ctx, name: &str, table: &str) -> Result<Output> {
+fn drop_index(ctx: &mut Ctx, name: &str, target: &ObjectName) -> Result<Output> {
+    if target.model == Model::Document {
+        return if doc::drop_index(ctx, &target.name, name)? {
+            Ok(Output::Done(format!("index '{name}' dropped")))
+        } else {
+            Err(Error::Schema(format!(
+                "no index '{name}' on DOCUMENT.{}",
+                target.name
+            )))
+        };
+    }
+    let table = target.name.as_str();
+    let name = &name.to_lowercase();
     let mut schema = Schema::load(ctx, table)?;
-    let Some(pos) = schema.indexes.iter().position(|i| i.name == name) else {
+    let Some(pos) = schema.indexes.iter().position(|i| i.name == *name) else {
         return Err(Error::Schema(format!(
             "no index '{name}' on table '{table}'"
         )));
@@ -881,8 +891,13 @@ struct Subs<'p, 'c, 'a> {
 }
 
 impl SubRunner for Subs<'_, '_, '_> {
-    fn run_sub(&self, id: usize, outer: &[&[Value]]) -> Result<Vec<Vec<Value>>> {
-        self.ex.run_sub(id, outer)
+    fn run_sub(
+        &self,
+        id: usize,
+        outer: &[Vec<Value>],
+        limit: Option<usize>,
+    ) -> Result<Vec<Vec<Value>>> {
+        self.ex.run_sub(id, outer, limit)
     }
 }
 

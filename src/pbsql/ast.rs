@@ -199,6 +199,8 @@ pub struct TableRef {
 pub enum JoinKind {
     Inner,
     Left,
+    Right,
+    Full,
     Cross,
 }
 
@@ -324,7 +326,7 @@ pub enum Stmt {
     },
     DropIndex {
         name: String,
-        table: String,
+        target: ObjectName,
     },
     AlterTable {
         table: String,

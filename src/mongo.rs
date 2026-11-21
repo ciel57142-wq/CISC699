@@ -538,6 +538,127 @@ const COMMANDS: &[&str] = &[
     "createindexes",
 ];
 
+// --------------------------------------------- key order from raw BSON
+
+/// Size of one BSON element value starting at `pos`.
+fn bson_value_len(b: &[u8], ty: u8, pos: usize) -> Option<usize> {
+    let i32_at = |p: usize| {
+        b.get(p..p + 4)
+            .map(|s| i32::from_le_bytes([s[0], s[1], s[2], s[3]]) as usize)
+    };
+    Some(match ty {
+        0x01 | 0x09 | 0x11 | 0x12 => 8,
+        0x02 | 0x0D | 0x0E => 4 + i32_at(pos)?,
+        0x03 | 0x04 => i32_at(pos)?,
+        0x05 => 5 + i32_at(pos)?,
+        0x06 | 0x0A | 0xFF | 0x7F => 0,
+        0x07 => 12,
+        0x08 => 1,
+        0x10 => 4,
+        0x13 => 16,
+        0x0B => {
+            let a = b.get(pos..)?.iter().position(|c| *c == 0)? + 1;
+            let c = b.get(pos + a..)?.iter().position(|c| *c == 0)? + 1;
+            a + c
+        }
+        _ => return None,
+    })
+}
+
+/// (name, type, value bytes) of each element of the document at the start of `b`, in order.
+fn bson_elems(b: &[u8]) -> Vec<(String, u8, &[u8])> {
+    let mut out = Vec::new();
+    let Some(total) = b
+        .get(0..4)
+        .map(|s| i32::from_le_bytes([s[0], s[1], s[2], s[3]]) as usize)
+    else {
+        return out;
+    };
+    let mut pos = 4;
+    while pos + 1 < total.min(b.len()) {
+        let ty = b[pos];
+        let Some(nlen) = b
+            .get(pos + 1..)
+            .and_then(|r| r.iter().position(|c| *c == 0))
+        else {
+            break;
+        };
+        let name = String::from_utf8_lossy(&b[pos + 1..pos + 1 + nlen]).into_owned();
+        let vpos = pos + 2 + nlen;
+        let Some(len) = bson_value_len(b, ty, vpos) else {
+            break;
+        };
+        let Some(v) = b.get(vpos..vpos + len) else {
+            break;
+        };
+        out.push((name, ty, v));
+        pos = vpos + len;
+    }
+    out
+}
+
+/// A sub-document's keys in written order as `[[key, value], ...]`.
+fn ordered_pairs(doc_bytes: &[u8]) -> Option<Value> {
+    let (v, _, _) = decode_doc(doc_bytes).ok()?;
+    let pairs = bson_elems(doc_bytes)
+        .into_iter()
+        .map(|(k, _, _)| {
+            Value::Array(vec![
+                Value::Text(k.clone()),
+                v.get(&k).cloned().unwrap_or(Value::Null),
+            ])
+        })
+        .collect();
+    Some(Value::Array(pairs))
+}
+
+/// Replace order-sensitive specs in a decoded command (index keys, find
+/// sort, `$sort` stages) with order-preserving pair lists read from the raw BSON.
+fn restore_key_order(cmd: &mut BTreeMap<String, Value>, raw: &[u8]) {
+    for (name, ty, bytes) in bson_elems(raw) {
+        match (name.as_str(), ty) {
+            ("sort", 0x03) => {
+                if let Some(p) = ordered_pairs(bytes) {
+                    cmd.insert(name, p);
+                }
+            }
+            ("indexes", 0x04) => {
+                if let Some(Value::Array(list)) = cmd.get_mut("indexes") {
+                    for ((_, ty, ixb), ix) in bson_elems(bytes).into_iter().zip(list.iter_mut()) {
+                        if ty != 0x03 {
+                            continue;
+                        }
+                        for (k, kty, kb) in bson_elems(ixb) {
+                            if k == "key" && kty == 0x03 {
+                                if let (Some(p), Value::Object(o)) = (ordered_pairs(kb), &mut *ix) {
+                                    o.insert("key".into(), p);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            ("pipeline", 0x04) => {
+                if let Some(Value::Array(stages)) = cmd.get_mut("pipeline") {
+                    for ((_, ty, sb), st) in bson_elems(bytes).into_iter().zip(stages.iter_mut()) {
+                        if ty != 0x03 {
+                            continue;
+                        }
+                        for (k, kty, kb) in bson_elems(sb) {
+                            if k == "$sort" && kty == 0x03 {
+                                if let (Some(p), Value::Object(o)) = (ordered_pairs(kb), &mut *st) {
+                                    o.insert("$sort".into(), p);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Execute one database command and build its reply document.
 fn command(
     db: &mut Database,
@@ -680,7 +801,10 @@ fn command(
                 let opts = FindOptions {
                     sort: cmd
                         .get("sort")
-                        .filter(|s| matches!(s, Value::Object(o) if !o.is_empty()))
+                        .filter(|s| {
+                            matches!(s, Value::Object(o) if !o.is_empty())
+                                || matches!(s, Value::Array(a) if !a.is_empty())
+                        })
                         .cloned(),
                     skip: count_of(cmd.get("skip")).unwrap_or(0),
                     limit: count_of(cmd.get("limit")),
@@ -847,26 +971,75 @@ fn command(
                 ])
             }
             "createindexes" => {
+                let before = db.doc_indexes(coll)?.len() as i64 + 1;
                 let mut created = 0;
                 for ix in list(cmd, "indexes") {
-                    match ix.get("key") {
-                        Some(Value::Object(k)) if k.len() == 1 => {
-                            created += db.doc_create_index(
-                                coll,
-                                k.keys().next().map(String::as_str).unwrap_or(""),
-                            )? as i64;
-                        }
-                        _ => {
-                            return Err(Error::Parse(
-                                "only single-field indexes are supported".into(),
-                            ))
-                        }
-                    }
+                    let fields: Vec<(String, i64)> = match ix.get("key") {
+                        Some(k @ (Value::Object(_) | Value::Array(_))) => doc::sort_spec(k)?
+                            .into_iter()
+                            .map(|(f, desc)| (f, if desc { -1 } else { 1 }))
+                            .collect(),
+                        _ => return Err(Error::Parse("each index needs a key document".into())),
+                    };
+                    let unique = truthy(ix.get("unique"));
+                    let iname = ix.get("name").and_then(Value::as_str).map(String::from);
+                    created += db.doc_create_index_with(coll, fields, unique, iname)? as i64;
                 }
                 ok(vec![
-                    ("numIndexesBefore", Value::Int(1)),
-                    ("numIndexesAfter", Value::Int(1 + created)),
+                    ("createdCollectionAutomatically", false.into()),
+                    ("numIndexesBefore", Value::Int(before)),
+                    ("numIndexesAfter", Value::Int(before + created)),
                 ])
+            }
+            "listindexes" => {
+                let ixs = db.doc_indexes(coll)?;
+                let batch = crate::index_docs(&ixs);
+                first_batch(
+                    cursors,
+                    &format!("{dbname}.$cmd.listIndexes.{short}"),
+                    batch,
+                    cmd,
+                )
+            }
+            "dropindexes" => {
+                let ixs = db.doc_indexes(coll)?;
+                let before = ixs.len() as i64 + 1;
+                match cmd.get("index") {
+                    Some(Value::Text(n)) if n == "*" => {
+                        for ix in ixs {
+                            db.doc_drop_index(coll, &ix.name)?;
+                        }
+                    }
+                    Some(Value::Text(n)) => {
+                        if !db.doc_drop_index(coll, n)? {
+                            return Ok(fail(
+                                27,
+                                "IndexNotFound",
+                                &format!("index not found with name [{n}]"),
+                            ));
+                        }
+                    }
+                    Some(k @ (Value::Object(_) | Value::Array(_))) => {
+                        let want: Vec<(String, i64)> = doc::sort_spec(k)?
+                            .into_iter()
+                            .map(|(f, d)| (f, if d { -1 } else { 1 }))
+                            .collect();
+                        match ixs.iter().find(|i| i.fields == want) {
+                            Some(ix) => {
+                                db.doc_drop_index(coll, &ix.name)?;
+                            }
+                            None => {
+                                return Ok(fail(27, "IndexNotFound", "can't find index with key"))
+                            }
+                        }
+                    }
+                    _ => {
+                        return Err(Error::Parse(
+                            "dropIndexes needs an index name, key or \"*\"".into(),
+                        ))
+                    }
+                }
+                ok(vec![("nIndexesWas", Value::Int(before))])
             }
             _ => fail(59, "CommandNotFound", &format!("no such command: '{name}'")),
         })
@@ -926,10 +1099,11 @@ fn session(s: &mut TcpStream, db: &mut Database, limits: &Limits) -> io::Result<
                     match kind {
                         0 => {
                             let (doc, first, used) = decode_doc(&body[pos..end])?;
-                            pos += used;
-                            if let Value::Object(o) = doc {
+                            if let Value::Object(mut o) = doc {
+                                restore_key_order(&mut o, &body[pos..pos + used]);
                                 cmd = Some((o, first.unwrap_or_default()));
                             }
+                            pos += used;
                         }
                         1 => {
                             let size = rd_i32(&body, pos)? as usize;

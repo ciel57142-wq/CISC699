@@ -57,88 +57,54 @@ fn is_literal_object(o: &BTreeMap<String, Value>) -> bool {
 
 // ---------------------------------------------------------------- indexes
 
-/// Indexed field paths of a collection.
-pub fn indexes(ctx: &Ctx, coll: &str) -> Result<Vec<String>> {
-    Ok(match ctx.get(&keys::coll_meta(coll)) {
-        None => vec![],
-        Some(raw) => match decode(&raw)?.get("indexes") {
-            Some(Value::Array(a)) => a
-                .iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect(),
-            _ => vec![],
-        },
-    })
+use crate::docindex;
+pub use crate::docindex::DocIndex;
+
+/// Indexes of a collection.
+pub fn indexes(ctx: &Ctx, coll: &str) -> Result<Vec<DocIndex>> {
+    docindex::load(ctx, coll)
 }
 
-fn write_meta(ctx: &mut Ctx, coll: &str, fields: &[String]) {
-    let mut o = BTreeMap::new();
-    o.insert(
-        "indexes".to_string(),
-        Value::Array(fields.iter().map(|f| Value::Text(f.clone())).collect()),
-    );
-    ctx.put(
-        keys::coll_meta(coll),
-        Value::Object(o).to_json().into_bytes(),
-    );
-}
-
-/// Index entries for one document. Array fields get one entry per scalar element.
-fn index_keys(coll: &str, fields: &[String], key: &[u8], doc: &Value) -> Vec<Vec<u8>> {
-    let id = &key[keys::doc_prefix(coll).len()..];
-    let mut out = Vec::new();
-    for f in fields {
-        let mut add = |v: &Value| {
-            if let Some(enc) = keys::encode_index_value(v) {
-                let mut k = keys::index_prefix(&owner(coll), f);
-                k.extend(enc);
-                k.extend_from_slice(id);
-                out.push(k);
-            }
-        };
-        match get_path(doc, f) {
-            None => {}
-            Some(Value::Array(a)) => a.iter().for_each(&mut add),
-            Some(v) => add(v),
-        }
-    }
-    out
-}
-
-fn put_doc(ctx: &mut Ctx, coll: &str, fields: &[String], key: Vec<u8>, doc: &Value) {
-    for k in index_keys(coll, fields, &key, doc) {
-        ctx.put(k, Vec::new());
+fn put_doc(
+    ctx: &mut Ctx,
+    coll: &str,
+    ixs: &mut [DocIndex],
+    key: Vec<u8>,
+    doc: &Value,
+) -> Result<()> {
+    if docindex::add(ctx, coll, ixs, &key, doc)? {
+        docindex::save(ctx, coll, ixs);
     }
     ctx.put(key, doc.to_json().into_bytes());
+    Ok(())
 }
 
-fn del_doc(ctx: &mut Ctx, coll: &str, fields: &[String], key: Vec<u8>, doc: &Value) {
-    for k in index_keys(coll, fields, &key, doc) {
-        ctx.delete(k);
-    }
+fn del_doc(ctx: &mut Ctx, coll: &str, ixs: &[DocIndex], key: Vec<u8>, doc: &Value) {
+    docindex::remove(ctx, coll, ixs, &key, doc);
     ctx.delete(key);
 }
 
-/// Index a field path so equality filters on it stop scanning the collection.
-/// Returns false if the index already existed.
+/// Index a field path so filters on it stop scanning the collection.
+/// Returns false if an index on that field already existed.
 pub fn create_index(ctx: &mut Ctx, coll: &str, field: &str) -> Result<bool> {
+    create_index_with(ctx, coll, vec![(field.to_string(), 1)], false, None)
+}
+
+/// Create a single-field or compound index, optionally unique.
+pub fn create_index_with(
+    ctx: &mut Ctx,
+    coll: &str,
+    fields: Vec<(String, i64)>,
+    unique: bool,
+    name: Option<String>,
+) -> Result<bool> {
     check_name(coll)?;
-    if field.is_empty() || field.contains('\0') || field == "_id" {
-        return Err(Error::Schema(format!("cannot index field '{field}'")));
-    }
-    let mut fields = indexes(ctx, coll)?;
-    if fields.iter().any(|f| f == field) {
-        return Ok(false);
-    }
-    let one = [field.to_string()];
-    for (key, raw) in ctx.scan(&keys::doc_prefix(coll)) {
-        for k in index_keys(coll, &one, &key, &decode(&raw)?) {
-            ctx.put(k, Vec::new());
-        }
-    }
-    fields.push(field.to_string());
-    write_meta(ctx, coll, &fields);
-    Ok(true)
+    docindex::create(ctx, coll, fields, unique, name)
+}
+
+pub fn drop_index(ctx: &mut Ctx, coll: &str, name: &str) -> Result<bool> {
+    check_name(coll)?;
+    docindex::drop(ctx, coll, name)
 }
 
 // ------------------------------------------------------------------- CRUD
@@ -151,7 +117,7 @@ pub fn insert(ctx: &mut Ctx, coll: &str, doc: Value) -> Result<Value> {
         return Err(Error::Type("a document must be a JSON object".into()));
     };
     if ctx.get(&keys::coll_meta(coll)).is_none() {
-        write_meta(ctx, coll, &[]);
+        docindex::save(ctx, coll, &[]);
     }
     let id = match obj.get("_id") {
         Some(id) => id.clone(),
@@ -173,16 +139,56 @@ pub fn insert(ctx: &mut Ctx, coll: &str, doc: Value) -> Result<Value> {
             id.to_json()
         )));
     }
-    let fields = indexes(ctx, coll)?;
-    put_doc(ctx, coll, &fields, key, &Value::Object(obj));
+    let mut ixs = indexes(ctx, coll)?;
+    put_doc(ctx, coll, &mut ixs, key, &Value::Object(obj))?;
     Ok(id)
 }
 
-/// Documents that could match `filter`: a direct lookup when it pins `_id`,
-/// an index lookup when it pins an indexed field, otherwise a full scan.
-/// The caller still applies the filter.
-fn candidates(ctx: &Ctx, coll: &str, filter: &Value) -> Result<Vec<(Vec<u8>, Value)>> {
-    check_name(coll)?;
+/// Equality operand of a filter condition on a field (`{f: v}` or `{f: {$eq: v}}`).
+fn eq_operand(cond: &Value) -> Option<Value> {
+    match cond {
+        Value::Object(o) if o.len() == 1 && o.contains_key("$eq") => Some(o["$eq"].clone()),
+        Value::Object(o)
+            if !o.is_empty() && !is_literal_object(o) && o.keys().any(|k| k.starts_with('$')) =>
+        {
+            None
+        }
+        Value::Array(_) => None, // array equality is not an element match
+        other => Some(other.clone()),
+    }
+}
+
+/// Range operands of a filter condition (`$gt $gte $lt $lte`).
+fn range_operands(cond: &Value) -> (Option<(Value, bool)>, Option<(Value, bool)>) {
+    let (mut lo, mut hi) = (None, None);
+    if let Value::Object(o) = cond {
+        if is_literal_object(o) {
+            return (None, None);
+        }
+        for (op, v) in o {
+            if matches!(v, Value::Null | Value::Array(_) | Value::Object(_)) {
+                continue;
+            }
+            match op.as_str() {
+                "$gt" => lo = Some((v.clone(), false)),
+                "$gte" => lo = Some((v.clone(), true)),
+                "$lt" => hi = Some((v.clone(), false)),
+                "$lte" => hi = Some((v.clone(), true)),
+                _ => {}
+            }
+        }
+    }
+    (lo, hi)
+}
+
+/// How `find` reaches its candidate documents.
+enum Access {
+    Id(Value),
+    Index(docindex::Choice<Value>),
+    Scan,
+}
+
+fn plan_access(ixs: &[DocIndex], filter: &Value) -> Access {
     if let Some(id) = filter.get("_id") {
         let literal = match id {
             Value::Int(_) | Value::Text(_) => true,
@@ -190,44 +196,121 @@ fn candidates(ctx: &Ctx, coll: &str, filter: &Value) -> Result<Vec<(Vec<u8>, Val
             _ => false,
         };
         if literal {
-            let key = doc_key(coll, id)?;
-            return Ok(match ctx.get(&key) {
+            return Access::Id(id.clone());
+        }
+    }
+    let Value::Object(f) = filter else {
+        return Access::Scan;
+    };
+    let eq = |p: &str| f.get(p).and_then(eq_operand);
+    let range = |p: &str| f.get(p).map_or((None, None), range_operands);
+    // a legacy index has no entries for NULL/missing, so it cannot answer `f: null`
+    let usable = |ix: &DocIndex, v: &Value| !(ix.legacy && v.is_null());
+    match docindex::choose(ixs, &eq, &range, &usable) {
+        Some(c) => Access::Index(c),
+        None => Access::Scan,
+    }
+}
+
+/// Documents that could match `filter`, in key order unless an index decides
+/// otherwise. The caller still applies the filter.
+fn candidates(ctx: &Ctx, coll: &str, filter: &Value) -> Result<Vec<(Vec<u8>, Value)>> {
+    check_name(coll)?;
+    let ixs = indexes(ctx, coll)?;
+    match plan_access(&ixs, filter) {
+        Access::Id(id) => {
+            let key = doc_key(coll, &id)?;
+            Ok(match ctx.get(&key) {
                 Some(raw) => vec![(key, decode(&raw)?)],
                 None => vec![],
-            });
+            })
+        }
+        Access::Index(c) => index_docs(ctx, coll, &c, false, true),
+        Access::Scan => ctx
+            .scan(&keys::doc_prefix(coll))
+            .into_iter()
+            .map(|(k, raw)| Ok((k, decode(&raw)?)))
+            .collect(),
+    }
+}
+
+/// Documents reached through an index range, deduplicated (multikey);
+/// `key_order` re-sorts them by document key.
+fn index_docs(
+    ctx: &Ctx,
+    coll: &str,
+    c: &docindex::Choice<Value>,
+    rev: bool,
+    key_order: bool,
+) -> Result<Vec<(Vec<u8>, Value)>> {
+    let Some((lo, hi)) = docindex::key_range(coll, c) else {
+        return ctx
+            .scan(&keys::doc_prefix(coll))
+            .into_iter()
+            .map(|(k, raw)| Ok((k, decode(&raw)?)))
+            .collect();
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for (e, _) in ctx.iter_range(lo, hi, rev) {
+        let dk = docindex::doc_key_of(coll, &c.index, &e);
+        if seen.insert(dk.clone()) {
+            if let Some(raw) = ctx.get(&dk) {
+                out.push((dk, decode(&raw)?));
+            }
         }
     }
-    if let Value::Object(f) = filter {
-        let fields = indexes(ctx, coll)?;
-        for (field, cond) in f {
-            if !fields.contains(field) {
-                continue;
-            }
-            let operand = match cond {
-                Value::Object(o) if o.len() == 1 && o.contains_key("$eq") => &o["$eq"],
-                other => other,
-            };
-            let Some(enc) = keys::encode_index_value(operand) else {
-                continue;
-            };
-            let mut prefix = keys::index_prefix(&owner(coll), field);
-            prefix.extend(enc);
-            let mut out = Vec::new();
-            for (k, _) in ctx.scan(&prefix) {
-                let mut dk = keys::doc_prefix(coll);
-                dk.extend_from_slice(&k[prefix.len()..]);
-                if let Some(raw) = ctx.get(&dk) {
-                    out.push((dk, decode(&raw)?));
-                }
-            }
-            out.sort_by(|a, b| a.0.cmp(&b.0));
-            return Ok(out);
-        }
+    if key_order {
+        out.sort_by(|a, b| a.0.cmp(&b.0));
     }
-    ctx.scan(&keys::doc_prefix(coll))
-        .into_iter()
-        .map(|(k, raw)| Ok((k, decode(&raw)?)))
-        .collect()
+    Ok(out)
+}
+
+/// An index that returns documents already in `sort` order: not multikey,
+/// covers NULL/missing (so no document is skipped), and its leading fields
+/// after the equality prefix match the sort fields with one consistent direction.
+fn sort_index(
+    ixs: &[DocIndex],
+    access: &Access,
+    sort: &[(String, bool)],
+) -> Option<(docindex::Choice<Value>, bool)> {
+    let fits = |ix: &DocIndex, skip: usize| -> Option<bool> {
+        if ix.legacy || ix.multikey || ix.fields.len() < skip + sort.len() {
+            return None;
+        }
+        let mut rev = None;
+        for ((p, d), (sp, desc)) in ix.fields[skip..].iter().zip(sort) {
+            if p != sp {
+                return None;
+            }
+            let r = (*d < 0) != *desc;
+            if rev.is_some_and(|x| x != r) {
+                return None;
+            }
+            rev = Some(r);
+        }
+        rev
+    };
+    match access {
+        Access::Index(c) if c.lo.is_none() && c.hi.is_none() => {
+            fits(&c.index, c.eq.len()).map(|r| (c.clone(), r))
+        }
+        Access::Index(c) if c.eq.is_empty() => fits(&c.index, 0).map(|r| (c.clone(), r)),
+        Access::Scan => ixs.iter().find_map(|ix| {
+            fits(ix, 0).map(|r| {
+                (
+                    docindex::Choice {
+                        index: ix.clone(),
+                        eq: vec![],
+                        lo: None,
+                        hi: None,
+                    },
+                    r,
+                )
+            })
+        }),
+        _ => None,
+    }
 }
 
 #[derive(Default)]
@@ -238,25 +321,88 @@ pub struct FindOptions {
     pub limit: Option<usize>,
 }
 
+/// A sort specification as (path, descending) in priority order. Accepts
+/// `{field: 1, ...}` (keys in name order, since objects are stored sorted) or
+/// the order-preserving `[[field, 1], [field2, -1]]`.
+pub fn sort_spec(v: &Value) -> Result<Vec<(String, bool)>> {
+    let desc = |d: &Value| d.as_f64().is_some_and(|n| n < 0.0);
+    match v {
+        Value::Object(spec) => Ok(spec.iter().map(|(k, d)| (k.clone(), desc(d))).collect()),
+        Value::Array(pairs) => pairs
+            .iter()
+            .map(|p| match p {
+                Value::Array(kv) if kv.len() == 2 => match &kv[0] {
+                    Value::Text(k) => Ok((k.clone(), desc(&kv[1]))),
+                    _ => Err(Error::Type("sort field names must be strings".into())),
+                },
+                _ => Err(Error::Type(
+                    "sort must be {field: 1} or [[field, 1], ...]".into(),
+                )),
+            })
+            .collect(),
+        _ => Err(Error::Type(
+            "sort must be an object like {\"field\": 1}".into(),
+        )),
+    }
+}
+
 pub fn find(ctx: &Ctx, coll: &str, filter: &Value, opts: &FindOptions) -> Result<Vec<Value>> {
+    let spec: Vec<(String, bool)> = match &opts.sort {
+        None => vec![],
+        Some(v) => sort_spec(v)?,
+    };
+    check_name(coll)?;
+    if !spec.is_empty() {
+        let ixs = indexes(ctx, coll)?;
+        let access = plan_access(&ixs, filter);
+        if let Some((choice, rev)) = sort_index(&ixs, &access, &spec) {
+            // the index yields documents in sort order: stop as soon as skip + limit match
+            let want = opts.limit.map(|l| l.saturating_add(opts.skip));
+            let mut out = Vec::new();
+            let Some((lo, hi)) = docindex::key_range(coll, &choice) else {
+                return find_sorted_in_memory(ctx, coll, filter, opts, &spec);
+            };
+            for (e, _) in ctx.iter_range(lo, hi, rev) {
+                if want.is_some_and(|w| out.len() >= w) {
+                    break;
+                }
+                let dk = docindex::doc_key_of(coll, &choice.index, &e);
+                if let Some(raw) = ctx.get(&dk) {
+                    let d = decode(&raw)?;
+                    if matches(&d, filter)? {
+                        out.push(d);
+                    }
+                }
+            }
+            return Ok(out.into_iter().skip(opts.skip).collect());
+        }
+    }
+    find_sorted_in_memory(ctx, coll, filter, opts, &spec)
+}
+
+fn find_sorted_in_memory(
+    ctx: &Ctx,
+    coll: &str,
+    filter: &Value,
+    opts: &FindOptions,
+    spec: &[(String, bool)],
+) -> Result<Vec<Value>> {
     let mut docs = Vec::new();
+    let want = opts
+        .limit
+        .map(|l| l.saturating_add(opts.skip))
+        .filter(|_| spec.is_empty());
     for (_, d) in candidates(ctx, coll, filter)? {
+        if want.is_some_and(|w| docs.len() >= w) {
+            break;
+        }
         if matches(&d, filter)? {
             docs.push(d);
         }
     }
-    if let Some(sort) = &opts.sort {
-        let Value::Object(spec) = sort else {
-            return Err(Error::Type(
-                "sort must be an object like {\"field\": 1}".into(),
-            ));
-        };
-        let spec: Vec<(&String, bool)> = spec
-            .iter()
-            .map(|(k, v)| (k, v.as_f64().is_some_and(|n| n < 0.0)))
-            .collect();
+    if !spec.is_empty() {
         docs.sort_by(|a, b| {
-            for (path, desc) in &spec {
+            for (path, desc) in spec {
                 let (x, y) = (
                     get_path(a, path).unwrap_or(&Value::Null),
                     get_path(b, path).unwrap_or(&Value::Null),
@@ -287,7 +433,7 @@ pub fn update(
     multi: bool,
     upsert: bool,
 ) -> Result<(u64, Option<Value>)> {
-    let fields = indexes(ctx, coll)?;
+    let mut ixs = indexes(ctx, coll)?;
     let mut n = 0;
     for (key, old) in candidates(ctx, coll, filter)? {
         if !matches(&old, filter)? {
@@ -299,8 +445,8 @@ pub fn update(
         if new.get("_id") != old.get("_id") {
             return Err(Error::Constraint("_id cannot be changed".into()));
         }
-        del_doc(ctx, coll, &fields, key.clone(), &old);
-        put_doc(ctx, coll, &fields, key, &new);
+        del_doc(ctx, coll, &ixs, key.clone(), &old);
+        put_doc(ctx, coll, &mut ixs, key, &new)?;
         n += 1;
         if !multi {
             break;
@@ -334,10 +480,9 @@ pub fn replace(ctx: &mut Ctx, coll: &str, key: Vec<u8>, old: &Value, new: Value)
     if new.get("_id") != old.get("_id") {
         return Err(Error::Constraint("_id cannot be changed".into()));
     }
-    let fields = indexes(ctx, coll)?;
-    del_doc(ctx, coll, &fields, key.clone(), old);
-    put_doc(ctx, coll, &fields, key, &new);
-    Ok(())
+    let mut ixs = indexes(ctx, coll)?;
+    del_doc(ctx, coll, &ixs, key.clone(), old);
+    put_doc(ctx, coll, &mut ixs, key, &new)
 }
 
 /// Delete a stored document (found by key) and its index entries.

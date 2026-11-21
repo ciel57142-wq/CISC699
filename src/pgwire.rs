@@ -34,6 +34,7 @@ fn sqlstate(e: &Error) -> &'static str {
         Error::Type(_) => "22023",
         Error::Txn(_) => "25000",
         Error::Conflict(_) => "40001",
+        Error::Cancelled(_) => "57014",
         Error::Io(_) | Error::Corrupt(_) => "XX000",
     }
 }

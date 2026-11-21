@@ -259,6 +259,41 @@ impl<'a> JsonParser<'a> {
         }
     }
 
+    /// Parse an object keeping its keys in written order, as `[[key, value], ...]`
+    /// pairs. Used where order is meaningful (index keys, sort specifications).
+    pub fn ordered_object(&mut self) -> Result<Vec<(String, Value)>> {
+        self.ws();
+        if self.s.get(self.pos) != Some(&b'{') {
+            return self.err("expected an object");
+        }
+        self.pos += 1;
+        let mut out: Vec<(String, Value)> = Vec::new();
+        loop {
+            self.ws();
+            match self.s.get(self.pos) {
+                Some(b'}') => {
+                    self.pos += 1;
+                    return Ok(out);
+                }
+                Some(b',') => {
+                    self.pos += 1;
+                    continue;
+                }
+                None => return self.err("unterminated object"),
+                _ => {}
+            }
+            let k = self.key()?;
+            self.ws();
+            if self.s.get(self.pos) != Some(&b':') {
+                return self.err("expected ':'");
+            }
+            self.pos += 1;
+            let v = self.value()?;
+            out.retain(|(x, _)| *x != k);
+            out.push((k, v));
+        }
+    }
+
     pub fn value(&mut self) -> Result<Value> {
         if self.depth >= MAX_DEPTH {
             return self.err("nesting is deeper than 128 levels");

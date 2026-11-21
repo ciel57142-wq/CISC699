@@ -82,15 +82,7 @@ fn count(v: &Value) -> Result<usize> {
 }
 
 fn sort_docs(docs: &mut [Value], spec: &Value) -> Result<()> {
-    let Value::Object(spec) = spec else {
-        return Err(Error::Type(
-            "$sort expects an object like {field: 1}".into(),
-        ));
-    };
-    let keys: Vec<(&String, bool)> = spec
-        .iter()
-        .map(|(k, v)| (k, v.as_f64().is_some_and(|n| n < 0.0)))
-        .collect();
+    let keys = doc::sort_spec(spec)?;
     docs.sort_by(|a, b| {
         for (path, desc) in &keys {
             let (x, y) = (

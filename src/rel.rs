@@ -478,9 +478,10 @@ fn id_suffix<'a>(mut rest: &'a [u8], ix: &Index) -> &'a [u8] {
 /// Length of one self-delimiting encoded value.
 pub fn encoded_len(b: &[u8]) -> usize {
     match b.first() {
+        Some(0) => 1,
         Some(1) => 2,
         Some(2) | Some(3) => 9,
-        Some(4) => {
+        Some(4) | Some(5) => {
             let mut i = 1;
             while i < b.len() {
                 if b[i] == 0 {

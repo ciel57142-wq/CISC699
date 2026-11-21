@@ -191,6 +191,7 @@ pub(crate) fn error_kind(e: &Error) -> &'static str {
         Error::Corrupt(_) => "corrupt",
         Error::Txn(_) => "transaction",
         Error::Conflict(_) => "conflict",
+        Error::Cancelled(_) => "cancelled",
     }
 }
 

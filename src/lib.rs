@@ -24,6 +24,7 @@
 
 pub mod aggregate;
 pub mod doc;
+pub mod docindex;
 pub mod error;
 pub mod keys;
 pub mod kv;
@@ -182,6 +183,10 @@ struct Txn {
 pub struct Database {
     shared: Arc<RwLock<Shared>>,
     txn: Option<Txn>,
+    /// Memory budget of each blocking query operator (sort, aggregation, hash join).
+    mem_limit: usize,
+    /// Set from any thread to cancel this session's running statement.
+    cancel: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Drop for Database {
@@ -203,6 +208,8 @@ impl Database {
         Database {
             shared: Arc::new(RwLock::new(shared)),
             txn: None,
+            mem_limit: query::exec::DEFAULT_MEM_LIMIT,
+            cancel: Default::default(),
         }
     }
 
@@ -227,6 +234,27 @@ impl Database {
         Database {
             shared: self.shared.clone(),
             txn: None,
+            mem_limit: self.mem_limit,
+            cancel: Default::default(),
+        }
+    }
+
+    /// Memory budget (bytes) of each blocking query operator; beyond it,
+    /// sorts, aggregations and hash joins spill to temporary files.
+    pub fn set_memory_limit(&mut self, bytes: usize) {
+        self.mem_limit = bytes.max(1);
+    }
+
+    /// A flag that cancels this session's running statement when set (from
+    /// any thread). It is cleared when the next statement starts.
+    pub fn cancel_handle(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.cancel.clone()
+    }
+
+    fn exec_opts(&self) -> query::exec::ExecOpts {
+        query::exec::ExecOpts {
+            mem_limit: self.mem_limit,
+            cancel: Some(self.cancel.clone()),
         }
     }
 
@@ -255,6 +283,7 @@ impl Database {
                 store: &guard.store,
                 writes: t.writes,
                 reads: Some(RefCell::new(t.reads)),
+                exec: self.exec_opts(),
             };
             let res = f(&mut ctx);
             t.reads = ctx
@@ -274,6 +303,7 @@ impl Database {
                 store: &guard.store,
                 writes: WriteSet::new(),
                 reads: None,
+                exec: self.exec_opts(),
             };
             let out = f(&mut ctx)?;
             let ws = ctx.writes;
@@ -285,6 +315,7 @@ impl Database {
                 store: &guard.store,
                 writes: WriteSet::new(),
                 reads: None,
+                exec: self.exec_opts(),
             };
             f(&mut ctx)
         }
@@ -455,6 +486,38 @@ impl Database {
         self.run(true, |ctx| doc::delete(ctx, collection, filter, limit))
     }
 
+    /// Create a single-field or compound document index (`fields` as (path, 1 | -1)).
+    pub fn doc_create_index_with(
+        &mut self,
+        collection: &str,
+        fields: Vec<(String, i64)>,
+        unique: bool,
+        name: Option<String>,
+    ) -> Result<bool> {
+        self.run(true, |ctx| {
+            doc::create_index_with(ctx, collection, fields, unique, name)
+        })
+    }
+
+    /// Drop a document index by name; returns whether it existed.
+    pub fn doc_drop_index(&mut self, collection: &str, name: &str) -> Result<bool> {
+        self.run(true, |ctx| doc::drop_index(ctx, collection, name))
+    }
+
+    pub fn doc_indexes(&mut self, collection: &str) -> Result<Vec<docindex::DocIndex>> {
+        self.run(false, |ctx| doc::indexes(ctx, collection))
+    }
+
+    /// Check every index of a collection against its documents; returns problems found.
+    pub fn doc_validate_indexes(&mut self, collection: &str) -> Result<Vec<String>> {
+        self.run(false, |ctx| docindex::validate(ctx, collection))
+    }
+
+    /// Rebuild every index of a collection.
+    pub fn doc_reindex(&mut self, collection: &str) -> Result<usize> {
+        self.run(true, |ctx| docindex::reindex(ctx, collection))
+    }
+
     /// Run a MongoDB-style aggregation pipeline over a collection.
     pub fn doc_aggregate(&mut self, collection: &str, pipeline: &[Value]) -> Result<Vec<Value>> {
         self.run(false, |ctx| aggregate::aggregate(ctx, collection, pipeline))
@@ -483,6 +546,8 @@ impl Database {
     /// * key-value: `SET`, `GET`, `DEL`, `EXISTS`, `KEYS`, `INCR`
     /// * control: `BEGIN`, `COMMIT`, `ROLLBACK`, `CHECKPOINT`, `SHOW TABLES`, `SHOW COLLECTIONS`
     pub fn execute(&mut self, command: &str) -> Result<Output> {
+        self.cancel
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         let s = command.trim().trim_end_matches(';').trim_end();
         if let Some(rest) = s.strip_prefix("db.") {
             let method = rest
@@ -698,6 +763,20 @@ fn parse_calls(s: &str) -> Result<Vec<(String, Vec<Value>)>> {
                     break;
                 }
                 Some(b',') => pos += 1,
+                Some(b'{')
+                    if args.is_empty() && matches!(name.as_str(), "sort" | "createindex") =>
+                {
+                    // key order matters for sorts and compound indexes: keep it
+                    let mut jp = JsonParser::at(s, pos);
+                    let pairs = jp.ordered_object()?;
+                    args.push(Value::Array(
+                        pairs
+                            .into_iter()
+                            .map(|(k, v)| Value::Array(vec![Value::Text(k), v]))
+                            .collect(),
+                    ));
+                    pos = jp.pos;
+                }
                 Some(_) => {
                     let mut jp = JsonParser::at(s, pos);
                     args.push(jp.value()?);
@@ -718,6 +797,30 @@ fn parse_calls(s: &str) -> Result<Vec<(String, Vec<Value>)>> {
             }
         }
     }
+}
+
+/// Index descriptions in MongoDB's listIndexes shape (the `_id` index first).
+pub fn index_docs(ixs: &[docindex::DocIndex]) -> Vec<Value> {
+    let mut out = vec![Value::Object(BTreeMap::from([
+        ("v".to_string(), Value::Int(2)),
+        (
+            "key".to_string(),
+            Value::Object(BTreeMap::from([("_id".to_string(), Value::Int(1))])),
+        ),
+        ("name".to_string(), Value::Text("_id_".into())),
+    ]))];
+    for ix in ixs {
+        let mut o = BTreeMap::from([
+            ("v".to_string(), Value::Int(2)),
+            ("key".to_string(), ix.key_doc()),
+            ("name".to_string(), Value::Text(ix.name.clone())),
+        ]);
+        if ix.unique {
+            o.insert("unique".to_string(), Value::Bool(true));
+        }
+        out.push(Value::Object(o));
+    }
+    out
 }
 
 fn doc_command(ctx: &mut Ctx, s: &str) -> Result<Output> {
@@ -806,17 +909,44 @@ fn doc_command(ctx: &mut Ctx, s: &str) -> Result<Output> {
             Ok(Output::Done(format!("{n} document(s) deleted")))
         }
         "createindex" => {
-            let field = match need(0, "a field, e.g. createIndex({email: 1})")? {
-                Value::Text(f) => f.clone(),
-                Value::Object(o) if o.len() == 1 => o.keys().next().cloned().unwrap_or_default(),
-                _ => return Err(Error::Parse("createIndex takes one field: createIndex({email: 1})".into())),
+            let fields: Vec<(String, i64)> = match need(0, "a key, e.g. createIndex({email: 1})")? {
+                Value::Text(f) => vec![(f.clone(), 1)],
+                v @ (Value::Object(_) | Value::Array(_)) => doc::sort_spec(v)?
+                    .into_iter()
+                    .map(|(k, desc)| (k, if desc { -1 } else { 1 }))
+                    .collect(),
+                _ => return Err(Error::Parse("createIndex takes a key: createIndex({a: 1, b: -1})".into())),
             };
-            let created = doc::create_index(ctx, coll, &field)?;
+            let opts = args.get(1);
+            let unique = opts.and_then(|o| o.get("unique")) == Some(&Value::Bool(true));
+            let name = opts.and_then(|o| o.get("name")).and_then(Value::as_str).map(String::from);
+            let shown = fields.iter().map(|(f, _)| f.as_str()).collect::<Vec<_>>().join(", ");
+            let created = doc::create_index_with(ctx, coll, fields, unique, name)?;
             Ok(Output::Done(if created {
-                format!("index created on {coll}.{field}")
+                format!("{}index created on {coll}({shown})", if unique { "unique " } else { "" })
             } else {
-                format!("{coll}.{field} is already indexed")
+                format!("{coll}({shown}) is already indexed")
             }))
+        }
+        "dropindex" => {
+            let name = need(0, "an index name")?.as_str().ok_or_else(|| Error::Parse("dropIndex takes an index name".into()))?;
+            if doc::drop_index(ctx, coll, name)? {
+                Ok(Output::Done(format!("index '{name}' dropped")))
+            } else {
+                Err(Error::Schema(format!("no index '{name}' on collection '{coll}'")))
+            }
+        }
+        "getindexes" => Ok(Output::Docs(index_docs(&doc::indexes(ctx, coll)?))),
+        "reindex" => {
+            let n = docindex::reindex(ctx, coll)?;
+            Ok(Output::Done(format!("{n} index(es) rebuilt on '{coll}'")))
+        }
+        "validate" => {
+            let problems = docindex::validate(ctx, coll)?;
+            Ok(Output::Scalar(Value::Object(BTreeMap::from([
+                ("valid".to_string(), Value::Bool(problems.is_empty())),
+                ("errors".to_string(), Value::Array(problems.into_iter().map(Value::Text).collect())),
+            ]))))
         }
         "count" | "countdocuments" => {
             Ok(Output::Scalar(Value::Int(doc::find(ctx, coll, arg(0), &FindOptions::default())?.len() as i64)))
@@ -830,7 +960,7 @@ fn doc_command(ctx: &mut Ctx, s: &str) -> Result<Output> {
             }))
         }
         other => Err(Error::Parse(format!(
-            "unknown collection method '{other}': use insert, find, aggregate, update, delete, count, createIndex or drop"
+            "unknown collection method '{other}': use insert, find, aggregate, update, delete, count, createIndex, dropIndex, getIndexes, reIndex, validate or drop"
         ))),
     }
 }

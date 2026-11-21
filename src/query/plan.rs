@@ -161,12 +161,9 @@ pub enum TablePath {
 pub enum DocPath {
     FullScan,
     Ids(Vec<Expr>),
-    Index {
-        field: String,
-        eq: Option<Expr>,
-        lo: Option<Bound>,
-        hi: Option<Bound>,
-    },
+    /// A (possibly compound) document index: equality on leading fields,
+    /// optional range on the next one.
+    Index(crate::docindex::Choice<Expr>),
 }
 
 #[derive(Debug, Clone)]
@@ -195,6 +192,8 @@ pub enum PhysOp {
         alias: String,
         filter: Option<Expr>,
         limit: Option<usize>,
+        /// Read the access path in descending key order (to satisfy ORDER BY ... DESC).
+        reverse: bool,
     },
     Derived {
         input: Box<Node>,
@@ -208,7 +207,7 @@ pub enum PhysOp {
         left: Box<Node>,
         right: Box<Node>,
         on: Option<Expr>,
-        outer: bool,
+        kind: JoinKind,
         right_width: usize,
     },
     HashJoin {
@@ -217,7 +216,7 @@ pub enum PhysOp {
         lkeys: Vec<Expr>,
         rkeys: Vec<Expr>,
         on: Option<Expr>,
-        outer: bool,
+        kind: JoinKind,
         right_width: usize,
     },
     /// For each left row, look matching rows up in the right source through
@@ -226,7 +225,7 @@ pub enum PhysOp {
         left: Box<Node>,
         right: Box<Node>,
         on: Option<Expr>,
-        outer: bool,
+        kind: JoinKind,
         right_width: usize,
     },
     HashAggregate {
@@ -997,8 +996,16 @@ impl<'c, 'a> Planner<'c, 'a> {
         where_c: Vec<Expr>,
     ) -> Result<Logical> {
         let n = parts.len();
-        // a source is null-supplying if it is the right side of a LEFT JOIN
-        let nullable: Vec<bool> = parts.iter().map(|p| p.3 == JoinKind::Left).collect();
+        // a source is null-supplying if it is the right side of a LEFT/FULL JOIN,
+        // or sits left of a later RIGHT/FULL JOIN
+        let nullable: Vec<bool> = (0..parts.len())
+            .map(|k| {
+                matches!(parts[k].3, JoinKind::Left | JoinKind::Full)
+                    || parts[k + 1..]
+                        .iter()
+                        .any(|p| matches!(p.3, JoinKind::Right | JoinKind::Full))
+            })
+            .collect();
         let ranges: Vec<(usize, usize)> = parts.iter().map(|p| (p.1, p.1 + p.2)).collect();
         let owner_of = |set: &BTreeSet<usize>| -> Option<usize> {
             let mut owner = None;
@@ -1033,12 +1040,16 @@ impl<'c, 'a> Planner<'c, 'a> {
             let mut cs = Vec::new();
             conjuncts(on, &mut cs);
             for c in cs {
+                if matches!(parts[j].3, JoinKind::Right | JoinKind::Full) {
+                    join_on[j].push(c); // the preserved side cannot be filtered early
+                    continue;
+                }
                 match refs(&c, &self.subs) {
                     Some(set) if !set.is_empty() && owner_of(&set) == Some(j) => {
                         scan_filters[j].push(c)
                     }
                     Some(set)
-                        if parts[j].3 != JoinKind::Left
+                        if matches!(parts[j].3, JoinKind::Inner | JoinKind::Cross)
                             && !set.is_empty()
                             && last_source(&set) < j =>
                     {
@@ -1061,7 +1072,7 @@ impl<'c, 'a> Planner<'c, 'a> {
                         let j = last_source(&set);
                         // an inner join's condition can absorb it (enables hash/lookup joins)
                         if j > 0
-                            && parts[j].3 != JoinKind::Left
+                            && matches!(parts[j].3, JoinKind::Inner | JoinKind::Cross)
                             && !(0..=j).any(|k| {
                                 nullable[k]
                                     && set.iter().any(|s| *s >= ranges[k].0 && *s < ranges[k].1)
@@ -1462,39 +1473,29 @@ fn doc_path(ctx: &Ctx, coll: &str, filters: &[Expr]) -> Result<DocPath> {
     if let Some(l) = in_of(&preds, 0, &id).filter(|l| l.iter().all(id_ok)) {
         return Ok(DocPath::Ids(l.clone()));
     }
-    let scalar = |e: &Expr| {
+    // SQL comparisons with NULL never hold, and arrays/objects compare as a whole
+    let scalar = |_: &crate::docindex::DocIndex, e: &Expr| {
         !matches!(
             e,
             Expr::Lit(Value::Null | Value::Array(_) | Value::Object(_))
         )
     };
-    let indexed = crate::doc::indexes(ctx, coll)?;
-    let mut best: Option<DocPath> = None;
-    for field in indexed {
-        let path: Vec<String> = field.split('.').map(String::from).collect();
-        if let Some(e) = eq_of(&preds, 0, &path).filter(|e| scalar(e)) {
-            return Ok(DocPath::Index {
-                field,
-                eq: Some(e.clone()),
-                lo: None,
-                hi: None,
-            });
-        }
-        let (lo, hi) = range_of(&preds, 0, &path);
-        let (lo, hi) = (
-            lo.filter(|b| scalar(&b.expr)),
-            hi.filter(|b| scalar(&b.expr)),
-        );
-        if (lo.is_some() || hi.is_some()) && best.is_none() {
-            best = Some(DocPath::Index {
-                field,
-                eq: None,
-                lo,
-                hi,
-            });
-        }
-    }
-    Ok(best.unwrap_or(DocPath::FullScan))
+    let indexes = crate::doc::indexes(ctx, coll)?;
+    let split = |p: &str| -> Vec<String> { p.split('.').map(String::from).collect() };
+    let eq = |p: &str| eq_of(&preds, 0, &split(p)).cloned();
+    let range = |p: &str| {
+        let (lo, hi) = range_of(&preds, 0, &split(p));
+        (
+            lo.map(|b| (b.expr, b.inclusive)),
+            hi.map(|b| (b.expr, b.inclusive)),
+        )
+    };
+    Ok(
+        match crate::docindex::choose(&indexes, &eq, &range, &scalar) {
+            Some(c) => DocPath::Index(c),
+            None => DocPath::FullScan,
+        },
+    )
 }
 
 fn kv_path(filters: &[Expr]) -> KvPath {
@@ -1614,6 +1615,7 @@ impl<'c, 'a> PhysPlanner<'c, 'a> {
                     alias,
                     filter,
                     limit,
+                    reverse: false,
                 })
             }
             Logical::Derived { input, alias } => {
@@ -1631,13 +1633,17 @@ impl<'c, 'a> PhysPlanner<'c, 'a> {
                 on,
                 right_width,
             } => {
-                let outer = kind == JoinKind::Left;
                 let left_width = width_of(&left);
                 let left = Box::new(self.plan(*left)?);
                 // index lookup join: the right side is a base scan reachable by key from the left row
-                if let Logical::Scan { src, alias, filter } = &*right {
+                let lookup_ok = matches!(kind, JoinKind::Inner | JoinKind::Left | JoinKind::Cross);
+                if let (true, Logical::Scan { src, alias, filter }) = (lookup_ok, &*right) {
                     let (lk, rk) = equi_keys(&on, left_width);
-                    let mut lookup: Vec<Expr> = filter.clone();
+                    let mut lookup: Vec<Expr> = filter
+                        .iter()
+                        .cloned()
+                        .map(|e| shift_levels(e, 1, 1))
+                        .collect();
                     for (l, r) in lk.iter().zip(&rk) {
                         // move the left expression one row-context deeper: it is read from the outer stack
                         let probe = shift_levels(l.clone(), 0, 1);
@@ -1663,12 +1669,13 @@ impl<'c, 'a> PhysPlanner<'c, 'a> {
                                 alias: alias.clone(),
                                 filter: rfilter,
                                 limit: None,
+                                reverse: false,
                             }));
                             return Ok(self.node(PhysOp::LookupJoin {
                                 left,
                                 right,
                                 on: and_all(on),
-                                outer,
+                                kind,
                                 right_width,
                             }));
                         }
@@ -1683,7 +1690,7 @@ impl<'c, 'a> PhysPlanner<'c, 'a> {
                         lkeys: lk,
                         rkeys: rk,
                         on: and_all(on),
-                        outer,
+                        kind,
                         right_width,
                     })
                 } else {
@@ -1691,7 +1698,7 @@ impl<'c, 'a> PhysPlanner<'c, 'a> {
                         left,
                         right,
                         on: and_all(on),
-                        outer,
+                        kind,
                         right_width,
                     })
                 }
@@ -1720,7 +1727,22 @@ impl<'c, 'a> PhysPlanner<'c, 'a> {
                 self.node(PhysOp::Distinct { input })
             }
             Logical::Sort { input, keys } => {
-                let input = Box::new(self.plan(*input)?);
+                let mut input = self.plan(*input)?;
+                // the access path may already produce this order: no sort needed
+                if let PhysOp::Scan {
+                    access,
+                    reverse,
+                    limit: scan_limit,
+                    ..
+                } = &mut input.op
+                {
+                    if let Some(rev) = natural_order(access, &keys) {
+                        *reverse = rev;
+                        *scan_limit = limit;
+                        return Ok(input);
+                    }
+                }
+                let input = Box::new(input);
                 self.node(PhysOp::Sort { input, keys })
             }
             Logical::Limit {
@@ -1745,6 +1767,81 @@ impl<'c, 'a> PhysPlanner<'c, 'a> {
     }
 }
 
+/// If reading `access` forwards (Some(false)) or backwards (Some(true))
+/// yields rows ordered by `keys`, say which; None if a sort is needed.
+fn natural_order(access: &Access, keys: &[(Expr, bool)]) -> Option<bool> {
+    let mut cols: Vec<(usize, Vec<String>)> = Vec::new();
+    for (k, _) in keys {
+        match k {
+            Expr::Slot {
+                level: 0,
+                idx,
+                path,
+                ..
+            } => cols.push((*idx, path.clone())),
+            _ => return None,
+        }
+    }
+    // the order an access path produces: (column, path, stored descending), and whether it can run backwards
+    let (order, reversible): (Vec<(usize, Vec<String>, bool)>, bool) = match access {
+        Access::Table { schema, path } => {
+            let pk = schema.pk_positions();
+            let by = |cs: &[usize]| cs.iter().map(|c| (*c, vec![], false)).collect::<Vec<_>>();
+            match path {
+                TablePath::FullScan => (by(&pk), true),
+                TablePath::PkRange { eq, .. } => (by(&pk[eq.len()..]), true),
+                TablePath::PkPoints(_) => (by(&pk), false),
+                TablePath::Index { ix, eq, .. } => {
+                    if ix.enc != crate::rel::Enc::Exact {
+                        return None; // the original encoding merges large integers
+                    }
+                    let cs: Vec<usize> =
+                        ix.cols.iter().filter_map(|c| schema.find_col(c)).collect();
+                    if cs.len() != ix.cols.len() {
+                        return None;
+                    }
+                    (by(&cs[eq.len()..]), true)
+                }
+                TablePath::IndexIn { .. } => return None,
+            }
+        }
+        Access::Doc { path, .. } => match path {
+            DocPath::FullScan => (vec![(0, vec!["_id".to_string()], false)], true),
+            DocPath::Ids(_) => (vec![(0, vec!["_id".to_string()], false)], false),
+            DocPath::Index(c) => {
+                if c.index.legacy || c.index.multikey {
+                    return None;
+                }
+                let o = c.index.fields[c.eq.len()..]
+                    .iter()
+                    .map(|(p, d)| (0, p.split('.').map(String::from).collect(), *d < 0))
+                    .collect();
+                (o, true)
+            }
+        },
+        Access::Kv { path, .. } => match path {
+            KvPath::Keys(_) => (vec![(0, vec![], false)], false),
+            _ => (vec![(0, vec![], false)], true),
+        },
+    };
+    if cols.len() > order.len() || cols.is_empty() {
+        return None;
+    }
+    let mut rev = None;
+    for ((c, p), ((oc, op, stored_desc), (_, desc))) in cols.iter().zip(order.iter().zip(keys)) {
+        if c != oc || p != op {
+            return None;
+        }
+        let r = stored_desc != desc;
+        if rev.is_some_and(|x| x != r) {
+            return None;
+        }
+        rev = Some(r);
+    }
+    let rev = rev?;
+    (!rev || reversible).then_some(rev)
+}
+
 fn uses_outer(a: &Access) -> bool {
     let has = |e: &Expr| -> bool {
         fn walk(e: &Expr) -> bool {
@@ -1766,7 +1863,11 @@ fn uses_outer(a: &Access) -> bool {
         Access::Doc { path, .. } => match path {
             DocPath::FullScan => false,
             DocPath::Ids(v) => v.iter().any(has),
-            DocPath::Index { eq, lo, hi, .. } => eq.as_ref().is_some_and(has) || b(lo) || b(hi),
+            DocPath::Index(c) => {
+                c.eq.iter().any(has)
+                    || c.lo.as_ref().is_some_and(|x| has(&x.0))
+                    || c.hi.as_ref().is_some_and(|x| has(&x.0))
+            }
         },
         Access::Kv { path, .. } => match path {
             KvPath::Keys(v) => v.iter().any(has),

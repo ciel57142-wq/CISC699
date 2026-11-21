@@ -20,6 +20,8 @@ pub enum Error {
     /// The transaction read data that another session changed before it
     /// could commit. Nothing was written; retry the transaction.
     Conflict(String),
+    /// The statement was cancelled (by a cancel request or a resource limit).
+    Cancelled(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -35,6 +37,7 @@ impl fmt::Display for Error {
             Error::Corrupt(m) => write!(f, "corrupt data: {m}"),
             Error::Txn(m) => write!(f, "transaction error: {m}"),
             Error::Conflict(m) => write!(f, "serialization conflict: {m}"),
+            Error::Cancelled(m) => write!(f, "cancelled: {m}"),
         }
     }
 }

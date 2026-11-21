@@ -11,25 +11,31 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Runs a bound subquery for the evaluator. `outer` is the stack of
 /// enclosing rows (innermost first) that correlated references read.
 pub trait SubRunner {
-    fn run_sub(&self, id: usize, outer: &[&[Value]]) -> Result<Vec<Vec<Value>>>;
+    /// Rows of subquery `id`; `limit` caps how many are needed (EXISTS needs 1).
+    fn run_sub(
+        &self,
+        id: usize,
+        outer: &[Vec<Value>],
+        limit: Option<usize>,
+    ) -> Result<Vec<Vec<Value>>>;
 }
 
 /// No subqueries available (DDL defaults, constant folding).
 pub struct NoSubs;
 impl SubRunner for NoSubs {
-    fn run_sub(&self, _: usize, _: &[&[Value]]) -> Result<Vec<Vec<Value>>> {
+    fn run_sub(&self, _: usize, _: &[Vec<Value>], _: Option<usize>) -> Result<Vec<Vec<Value>>> {
         Err(Error::Parse("subqueries are not allowed here".into()))
     }
 }
 
 pub struct Env<'a> {
     pub row: &'a [Value],
-    pub outer: &'a [&'a [Value]],
+    pub outer: &'a [Vec<Value>],
     pub subs: &'a dyn SubRunner,
 }
 
 impl<'a> Env<'a> {
-    pub fn new(row: &'a [Value], outer: &'a [&'a [Value]], subs: &'a dyn SubRunner) -> Env<'a> {
+    pub fn new(row: &'a [Value], outer: &'a [Vec<Value>], subs: &'a dyn SubRunner) -> Env<'a> {
         Env { row, outer, subs }
     }
 }
@@ -573,7 +579,7 @@ pub fn eval(e: &Expr, env: &Env) -> Result<Value> {
             let row = if *level == 0 {
                 env.row
             } else {
-                env.outer.get(level - 1).copied().unwrap_or(&[])
+                env.outer.get(level - 1).map_or(&[][..], |r| r.as_slice())
             };
             match row.get(*idx) {
                 Some(v) => walk_path(v, path),
@@ -627,13 +633,19 @@ pub fn eval(e: &Expr, env: &Env) -> Result<Value> {
                 *neg,
             )
         }
-        Expr::Exists(sub, neg) => Value::Bool(run(env, sub_id(sub)?)?.is_empty() == *neg),
+        Expr::Exists(sub, neg) => {
+            Value::Bool(run_limited(env, sub_id(sub)?, Some(1))?.is_empty() == *neg)
+        }
         Expr::ScalarQuery(sub) => {
-            let rows = run(env, sub_id(sub)?)?;
+            let rows = run_limited(env, sub_id(sub)?, Some(2))?;
             match rows.len() {
                 0 => Value::Null,
                 1 => rows[0].first().cloned().unwrap_or(Value::Null),
-                n => return Err(Error::Type(format!("scalar subquery returned {n} rows"))),
+                _ => {
+                    return Err(Error::Type(
+                        "scalar subquery returned more than one row".into(),
+                    ))
+                }
             }
         }
         Expr::Bin(a, Op::And, b) => {
@@ -714,10 +726,14 @@ pub fn eval(e: &Expr, env: &Env) -> Result<Value> {
 }
 
 fn run(env: &Env, id: usize) -> Result<Vec<Vec<Value>>> {
-    let mut stack: Vec<&[Value]> = Vec::with_capacity(env.outer.len() + 1);
-    stack.push(env.row);
+    run_limited(env, id, None)
+}
+
+fn run_limited(env: &Env, id: usize, limit: Option<usize>) -> Result<Vec<Vec<Value>>> {
+    let mut stack: Vec<Vec<Value>> = Vec::with_capacity(env.outer.len() + 1);
+    stack.push(env.row.to_vec());
     stack.extend_from_slice(env.outer);
-    env.subs.run_sub(id, &stack)
+    env.subs.run_sub(id, &stack, limit)
 }
 
 fn in_list<'v>(v: &Value, items: impl Iterator<Item = &'v Value>, neg: bool) -> Value {

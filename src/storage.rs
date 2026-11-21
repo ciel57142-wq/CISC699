@@ -425,6 +425,8 @@ pub struct Ctx<'a> {
     pub(crate) writes: WriteSet,
     /// Present inside explicit transactions, where reads must be validated at commit.
     pub(crate) reads: Option<RefCell<ReadSet>>,
+    /// Execution settings (memory budget, cancel flag) for queries run in this context.
+    pub(crate) exec: crate::query::exec::ExecOpts,
 }
 
 impl<'a> Ctx<'a> {
@@ -503,5 +505,105 @@ impl<'a> Ctx<'a> {
             }
         }
         out.into_iter().collect()
+    }
+
+    /// Stream the live entries inside the bounds without materialising them,
+    /// in ascending key order (or descending with `rev`). Committed data is
+    /// merged with this transaction's uncommitted writes on the fly. Inside a
+    /// transaction the whole range is recorded for conflict detection.
+    pub fn iter_range<'c>(
+        &'c self,
+        lo: Bound<Vec<u8>>,
+        hi: Bound<Vec<u8>>,
+        rev: bool,
+    ) -> MergeIter<'c> {
+        if let Some(r) = &self.reads {
+            r.borrow_mut().ranges.push((lo.clone(), hi.clone()));
+        }
+        let r = (lo, hi);
+        let store: Box<dyn Iterator<Item = (&'c Vec<u8>, &'c Vec<u8>)> + 'c> = if rev {
+            Box::new(self.store.map.range::<Vec<u8>, _>(r.clone()).rev())
+        } else {
+            Box::new(self.store.map.range::<Vec<u8>, _>(r.clone()))
+        };
+        let writes: Box<dyn Iterator<Item = (&'c Vec<u8>, &'c Option<Vec<u8>>)> + 'c> = if rev {
+            Box::new(self.writes.range::<Vec<u8>, _>(r).rev())
+        } else {
+            Box::new(self.writes.range::<Vec<u8>, _>(r))
+        };
+        MergeIter {
+            store: store.peekable(),
+            writes: writes.peekable(),
+            rev,
+        }
+    }
+
+    /// Stream the live entries whose key starts with `prefix`.
+    pub fn iter_prefix<'c>(&'c self, prefix: &[u8], rev: bool) -> MergeIter<'c> {
+        let hi = prefix_successor(prefix).map_or(Bound::Unbounded, Bound::Excluded);
+        self.iter_range(Bound::Included(prefix.to_vec()), hi, rev)
+    }
+}
+
+/// The smallest key greater than every key starting with `p` (None if p is all 0xff).
+pub fn prefix_successor(p: &[u8]) -> Option<Vec<u8>> {
+    let mut k = p.to_vec();
+    while let Some(last) = k.pop() {
+        if last < 0xff {
+            k.push(last + 1);
+            return Some(k);
+        }
+    }
+    None
+}
+
+type StoreIter<'c> = std::iter::Peekable<Box<dyn Iterator<Item = (&'c Vec<u8>, &'c Vec<u8>)> + 'c>>;
+type WriteIter<'c> =
+    std::iter::Peekable<Box<dyn Iterator<Item = (&'c Vec<u8>, &'c Option<Vec<u8>>)> + 'c>>;
+
+/// Merge of committed entries and uncommitted writes (writes win; deletes hide).
+pub struct MergeIter<'c> {
+    store: StoreIter<'c>,
+    writes: WriteIter<'c>,
+    rev: bool,
+}
+
+impl Iterator for MergeIter<'_> {
+    type Item = (Vec<u8>, Vec<u8>);
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let order = match (self.store.peek(), self.writes.peek()) {
+                (None, None) => return None,
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (Some((a, _)), Some((b, _))) => {
+                    let o = a.as_slice().cmp(b.as_slice());
+                    if self.rev {
+                        o.reverse()
+                    } else {
+                        o
+                    }
+                }
+            };
+            match order {
+                std::cmp::Ordering::Less => {
+                    let (k, v) = self.store.next()?;
+                    return Some((k.clone(), v.clone()));
+                }
+                std::cmp::Ordering::Equal => {
+                    self.store.next();
+                    let (k, v) = self.writes.next()?;
+                    if let Some(v) = v {
+                        return Some((k.clone(), v.clone()));
+                    }
+                }
+                std::cmp::Ordering::Greater => {
+                    let (k, v) = self.writes.next()?;
+                    if let Some(v) = v {
+                        return Some((k.clone(), v.clone()));
+                    }
+                }
+            }
+        }
     }
 }
