@@ -280,6 +280,7 @@ pub struct ColumnDef {
     pub unique: bool,
     pub default: Option<Expr>,
     pub references: Option<FkDef>,
+    pub checks: Vec<Expr>,
 }
 
 #[derive(Debug, Clone)]
@@ -287,6 +288,7 @@ pub enum TableConstraint {
     PrimaryKey(Vec<String>),
     Unique(Vec<String>),
     ForeignKey(FkDef),
+    Check(Option<String>, Expr),
 }
 
 #[derive(Debug, Clone)]
@@ -295,6 +297,8 @@ pub enum AlterOp {
     DropColumn(String),
     RenameColumn(String, String),
     RenameTable(String),
+    AddCheck(Option<String>, Expr),
+    DropConstraint(String),
 }
 
 #[derive(Debug, Clone)]
@@ -375,4 +379,113 @@ pub enum Stmt {
         ns: String,
         key: Expr,
     },
+}
+
+/// Print an (unbound) expression back as PBSQL text that parses to the same
+/// expression. Used to store CHECK constraints in the schema.
+pub fn to_sql(e: &Expr) -> String {
+    let list = |v: &[Expr]| v.iter().map(to_sql).collect::<Vec<_>>().join(", ");
+    match e {
+        Expr::Lit(Value::Text(s)) => format!("'{}'", s.replace('\'', "''")),
+        Expr::Lit(Value::Null) => "NULL".into(),
+        Expr::Lit(Value::Float(f)) => {
+            let t = format!("{f:?}");
+            if f.is_finite() {
+                t
+            } else {
+                "NULL".into()
+            }
+        }
+        Expr::Lit(v) => v.to_json(),
+        Expr::Untyped(t) => format!("'{}'", t.replace('\'', "''")),
+        Expr::Col(p) => p
+            .iter()
+            .map(|x| format!("\"{}\"", x.replace('"', "")))
+            .collect::<Vec<_>>()
+            .join("."),
+        Expr::Slot { name, .. } => format!("\"{name}\""),
+        Expr::Bin(a, op, b) => format!("({} {} {})", to_sql(a), op.text(), to_sql(b)),
+        Expr::Not(a) => format!("(NOT {})", to_sql(a)),
+        Expr::Neg(a) => format!("(-{})", to_sql(a)),
+        Expr::IsNull(a, n) => format!("({} IS {}NULL)", to_sql(a), if *n { "NOT " } else { "" }),
+        Expr::Like(a, p, n) => format!(
+            "({} {}LIKE {})",
+            to_sql(a),
+            if *n { "NOT " } else { "" },
+            to_sql(p)
+        ),
+        Expr::In(a, l, n) => format!(
+            "({} {}IN ({}))",
+            to_sql(a),
+            if *n { "NOT " } else { "" },
+            list(l)
+        ),
+        Expr::Func(n, a) => format!("{n}({})", list(a)),
+        Expr::Agg(f, a, d) => format!(
+            "{}({}{})",
+            f.name(),
+            if *d { "DISTINCT " } else { "" },
+            a.as_ref().map_or("*".into(), |x| to_sql(x))
+        ),
+        Expr::Case {
+            operand,
+            whens,
+            otherwise,
+        } => {
+            let mut s = "(CASE".to_string();
+            if let Some(o) = operand {
+                s.push_str(&format!(" {}", to_sql(o)));
+            }
+            for (w, t) in whens {
+                s.push_str(&format!(" WHEN {} THEN {}", to_sql(w), to_sql(t)));
+            }
+            if let Some(o) = otherwise {
+                s.push_str(&format!(" ELSE {}", to_sql(o)));
+            }
+            s.push_str(" END)");
+            s
+        }
+        Expr::Cast(a, t) => format!("CAST({} AS {})", to_sql(a), t.name()),
+        Expr::Default => "DEFAULT".into(),
+        Expr::InQuery(..) | Expr::Exists(..) | Expr::ScalarQuery(_) => "(subquery)".into(),
+    }
+}
+
+/// Visit every unresolved column path in an expression.
+pub fn walk_cols(e: &mut Expr, f: &mut dyn FnMut(&mut Vec<String>)) {
+    match e {
+        Expr::Col(p) => f(p),
+        Expr::Bin(a, _, b) | Expr::Like(a, b, _) => {
+            walk_cols(a, f);
+            walk_cols(b, f);
+        }
+        Expr::Not(a)
+        | Expr::Neg(a)
+        | Expr::IsNull(a, _)
+        | Expr::Cast(a, _)
+        | Expr::InQuery(a, ..) => walk_cols(a, f),
+        Expr::In(a, l, _) => {
+            walk_cols(a, f);
+            l.iter_mut().for_each(|x| walk_cols(x, f));
+        }
+        Expr::Func(_, a) => a.iter_mut().for_each(|x| walk_cols(x, f)),
+        Expr::Agg(_, Some(a), _) => walk_cols(a, f),
+        Expr::Case {
+            operand,
+            whens,
+            otherwise,
+        } => {
+            if let Some(o) = operand {
+                walk_cols(o, f);
+            }
+            for (w, t) in whens {
+                walk_cols(w, f);
+                walk_cols(t, f);
+            }
+            if let Some(o) = otherwise {
+                walk_cols(o, f);
+            }
+        }
+        _ => {}
+    }
 }

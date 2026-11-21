@@ -2,6 +2,7 @@
 //! (including ALTER TABLE and constraints), and DML on relational tables,
 //! document collections and key-value namespaces.
 
+use super::ast::to_sql;
 use super::ast::*;
 use super::parser;
 use crate::doc;
@@ -473,7 +474,7 @@ fn create_table(
         .map(|c| vec![c.name.clone()])
         .collect();
     let mut fk_defs: Vec<FkDef> = defs.iter().filter_map(|c| c.references.clone()).collect();
-    for c in constraints {
+    for c in constraints.clone() {
         match c {
             TableConstraint::PrimaryKey(cols) => {
                 if !pk.is_empty() {
@@ -485,6 +486,7 @@ fn create_table(
             }
             TableConstraint::Unique(cols) => uniques.push(cols),
             TableConstraint::ForeignKey(f) => fk_defs.push(f),
+            TableConstraint::Check(..) => {} // handled once the columns exist
         }
     }
     let mut cols = Vec::new();
@@ -502,7 +504,40 @@ fn create_table(
         pk: Vec::new(),
         indexes: Vec::new(),
         fks: Vec::new(),
+        checks: Vec::new(),
+        compiled_checks: Vec::new(),
     };
+    // CHECK constraints (column-level ones are table checks named after the column)
+    let mut check_n = 0;
+    for d in &defs {
+        for e in &d.checks {
+            check_n += 1;
+            schema.checks.push((
+                format!(
+                    "{name}_{}_check{}",
+                    d.name,
+                    if check_n > 1 {
+                        check_n.to_string()
+                    } else {
+                        String::new()
+                    }
+                ),
+                to_sql(e),
+            ));
+        }
+    }
+    for c in &constraints {
+        if let TableConstraint::Check(cname, e) = c {
+            check_n += 1;
+            schema.checks.push((
+                cname
+                    .clone()
+                    .unwrap_or_else(|| format!("{name}_check{check_n}")),
+                to_sql(e),
+            ));
+        }
+    }
+    schema.compile_checks(ctx)?;
     let mut pk_seen = HashSet::new();
     for p in &pk {
         let ci = schema
@@ -702,6 +737,36 @@ fn drop_index(ctx: &mut Ctx, name: &str, target: &ObjectName) -> Result<Output> 
 fn alter(ctx: &mut Ctx, table: &str, op: AlterOp) -> Result<Output> {
     let mut s = Schema::load(ctx, table)?;
     match op {
+        AlterOp::AddCheck(name, e) => {
+            let name = name.unwrap_or_else(|| format!("{table}_check{}", s.checks.len() + 1));
+            if s.checks.iter().any(|(n, _)| *n == name) {
+                return Err(Error::Schema(format!(
+                    "constraint '{name}' already exists on '{table}'"
+                )));
+            }
+            s.checks.push((name.clone(), to_sql(&e)));
+            s.compile_checks(ctx)?;
+            for (_, row) in rel::scan_rows(ctx, &s)? {
+                s.check_row(&row)?; // existing rows must satisfy the new constraint
+            }
+            s.save(ctx);
+            Ok(Output::Done(format!(
+                "constraint '{name}' added to '{table}'"
+            )))
+        }
+        AlterOp::DropConstraint(name) => {
+            let before = s.checks.len();
+            s.checks.retain(|(n, _)| !n.eq_ignore_ascii_case(&name));
+            if s.checks.len() == before {
+                return Err(Error::Schema(format!(
+                    "no CHECK constraint '{name}' on '{table}'"
+                )));
+            }
+            s.save(ctx);
+            Ok(Output::Done(format!(
+                "constraint '{name}' dropped from '{table}'"
+            )))
+        }
         AlterOp::AddColumn(def) => {
             if s.find_col(&def.name).is_some() {
                 return Err(Error::Schema(format!(
@@ -791,6 +856,13 @@ fn alter(ctx: &mut Ctx, table: &str, op: AlterOp) -> Result<Output> {
                     "cannot drop the only column of a table".into(),
                 ));
             }
+            for (cname, sql) in &s.checks {
+                if check_mentions(sql, table, &name) {
+                    return Err(Error::Schema(format!(
+                        "cannot drop '{name}': CHECK constraint '{cname}' uses it"
+                    )));
+                }
+            }
             if s.fks.iter().any(|f| f.cols.contains(&name)) {
                 return Err(Error::Schema(format!(
                     "cannot drop '{name}': it is part of a foreign key"
@@ -845,6 +917,9 @@ fn alter(ctx: &mut Ctx, table: &str, op: AlterOp) -> Result<Output> {
                 )));
             }
             s.cols[ci].name = to.clone();
+            for (_, sql) in s.checks.iter_mut() {
+                *sql = rename_in_check(sql, table, &from, &to)?;
+            }
             let ren = |v: &mut Vec<String>| {
                 v.iter_mut()
                     .filter(|c| **c == from)
@@ -903,6 +978,15 @@ fn alter(ctx: &mut Ctx, table: &str, op: AlterOp) -> Result<Output> {
             ctx.delete(keys::table_meta(table));
             for fk in s.fks.iter_mut().filter(|f| f.table == table) {
                 fk.table = to.clone();
+            }
+            for (_, sql) in s.checks.iter_mut() {
+                let mut e = parser::parse_expr(sql)?;
+                walk_cols(&mut e, &mut |p| {
+                    if p.len() >= 2 && p[0].eq_ignore_ascii_case(table) {
+                        p[0] = to.clone();
+                    }
+                });
+                *sql = to_sql(&e);
             }
             s.name = to.clone();
             s.save(ctx);
@@ -1291,4 +1375,37 @@ fn delete(
 /// Evaluate a predicate with no subqueries against a row (used by callers outside the planner).
 pub fn matches_row(e: &Expr, row: &[Value]) -> Result<bool> {
     is_true(&eval(e, &Env::new(row, &[], &NoSubs))?)
+}
+
+/// Does a stored CHECK expression refer to column `col` of `table`?
+fn check_mentions(sql: &str, table: &str, col: &str) -> bool {
+    let Ok(mut e) = parser::parse_expr(sql) else {
+        return false;
+    };
+    let mut hit = false;
+    walk_cols(&mut e, &mut |p| {
+        let c = if p.len() >= 2 && p[0].eq_ignore_ascii_case(table) {
+            &p[1]
+        } else {
+            &p[0]
+        };
+        hit |= c.eq_ignore_ascii_case(col);
+    });
+    hit
+}
+
+/// Rename column `from` to `to` inside a stored CHECK expression.
+fn rename_in_check(sql: &str, table: &str, from: &str, to: &str) -> Result<String> {
+    let mut e = parser::parse_expr(sql)?;
+    walk_cols(&mut e, &mut |p| {
+        let i = if p.len() >= 2 && p[0].eq_ignore_ascii_case(table) {
+            1
+        } else {
+            0
+        };
+        if p[i].eq_ignore_ascii_case(from) {
+            p[i] = to.to_string();
+        }
+    });
+    Ok(to_sql(&e))
 }

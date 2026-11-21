@@ -65,6 +65,10 @@ pub struct Schema {
     pub pk: Vec<String>,
     pub indexes: Vec<Index>,
     pub fks: Vec<ForeignKey>,
+    /// CHECK constraints as (name, PBSQL expression text).
+    pub checks: Vec<(String, String)>,
+    /// The CHECK expressions bound to this table's columns (built on load).
+    pub compiled_checks: Vec<crate::pbsql::ast::Expr>,
 }
 
 /// Exact, order-preserving, self-delimiting encoding of one key component.
@@ -186,6 +190,17 @@ impl Schema {
         o.insert("pk".to_string(), list(&self.pk));
         o.insert("indexes".to_string(), Value::Array(indexes));
         o.insert("fks".to_string(), Value::Array(fks));
+        if !self.checks.is_empty() {
+            o.insert(
+                "checks".to_string(),
+                Value::Array(
+                    self.checks
+                        .iter()
+                        .map(|(n, e)| Value::Array(vec![s(n), s(e)]))
+                        .collect(),
+                ),
+            );
+        }
         Value::Object(o).to_json()
     }
 
@@ -302,13 +317,75 @@ impl Schema {
                 });
             }
         }
-        Ok(Some(Schema {
+        let mut checks = Vec::new();
+        if let Some(Value::Array(list)) = v.get("checks") {
+            for c in list {
+                if let Value::Array(p) = c {
+                    if let (Some(Value::Text(n)), Some(Value::Text(e))) = (p.first(), p.get(1)) {
+                        checks.push((n.clone(), e.clone()));
+                    }
+                }
+            }
+        }
+        let mut schema = Schema {
             name: name.to_string(),
             cols: out,
             pk,
             indexes,
             fks,
-        }))
+            checks,
+            compiled_checks: vec![],
+        };
+        schema.compile_checks(ctx)?;
+        Ok(Some(schema))
+    }
+
+    /// Parse and bind the CHECK expressions against this table's columns.
+    pub fn compile_checks(&mut self, ctx: &Ctx) -> Result<()> {
+        use crate::query::plan::{source_scope, Planner, SourceKind};
+        let scope = source_scope(
+            &SourceKind::Table(Schema {
+                compiled_checks: vec![],
+                ..self.clone()
+            }),
+            &self.name,
+        );
+        let mut out = Vec::with_capacity(self.checks.len());
+        for (name, sql) in &self.checks {
+            let e = crate::pbsql::parser::parse_expr(sql)?;
+            let (mut bound, subs, _) = Planner::bind_single(ctx, &scope, vec![e])?;
+            if !subs.is_empty() {
+                return Err(Error::Schema(format!(
+                    "CHECK constraint '{name}' cannot contain a subquery"
+                )));
+            }
+            out.push(bound.remove(0));
+        }
+        self.compiled_checks = out;
+        Ok(())
+    }
+
+    /// Enforce the CHECK constraints on a row (NULL results pass, as in SQL).
+    pub fn check_row(&self, row: &[Value]) -> Result<()> {
+        use crate::query::eval::{eval, Env, NoSubs};
+        for ((name, _), e) in self.checks.iter().zip(&self.compiled_checks) {
+            match eval(e, &Env::new(row, &[], &NoSubs))? {
+                Value::Bool(false) => {
+                    return Err(Error::Constraint(format!(
+                        "row violates CHECK constraint '{name}' of table '{}'",
+                        self.name
+                    )))
+                }
+                Value::Bool(true) | Value::Null => {}
+                other => {
+                    return Err(Error::Type(format!(
+                        "CHECK constraint '{name}' must be boolean, got {}",
+                        other.to_json()
+                    )))
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn save(&self, ctx: &mut Ctx) {
@@ -669,6 +746,7 @@ fn remove_entries(ctx: &mut Ctx, s: &Schema, key: &[u8], row: &[Value]) {
 
 /// Insert a fully coerced row, enforcing PK, UNIQUE and FOREIGN KEY constraints.
 pub fn insert_row(ctx: &mut Ctx, s: &Schema, row: Vec<Value>) -> Result<()> {
+    s.check_row(&row)?;
     let key = row_key(ctx, s, &row)?;
     if ctx.get(&key).is_some() {
         let pk: Vec<String> = s.pk_positions().iter().map(|i| row[*i].to_json()).collect();
@@ -712,6 +790,7 @@ pub fn update_row(
         key.clone()
     };
     remove_entries(ctx, s, &key, old);
+    s.check_row(&new)?;
     check_unique(ctx, s, &new_key, &new)?;
     check_parents(ctx, s, &new, Some(old))?;
     // children referencing values this update changes

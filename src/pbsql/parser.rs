@@ -94,6 +94,21 @@ pub fn parse_params(src: &str, params: &[Param]) -> Result<Stmt> {
     parse_tokens(toks)
 }
 
+/// Parse a single expression (e.g. a stored CHECK constraint).
+pub fn parse_expr(src: &str) -> Result<Expr> {
+    let mut p = Parser {
+        t: lex(src)?,
+        i: 0,
+        nest: 0,
+        ops: 0,
+    };
+    let e = p.expr()?;
+    if p.peek().is_some() {
+        return perr(format!("unexpected {} after the expression", p.found()));
+    }
+    Ok(e)
+}
+
 pub fn parse(src: &str) -> Result<Stmt> {
     parse_tokens(lex(src)?)
 }
@@ -435,11 +450,25 @@ impl Parser {
             self.expect_kw("table")?;
             let table = self.ident()?;
             let op = if self.kw("add") {
-                self.kw("column");
-                AlterOp::AddColumn(self.column_def()?)
+                if self.peek_kw("constraint") || self.peek_kw("check") {
+                    let name = if self.kw("constraint") {
+                        Some(self.ident()?)
+                    } else {
+                        None
+                    };
+                    self.expect_kw("check")?;
+                    AlterOp::AddCheck(name, self.paren_expr()?)
+                } else {
+                    self.kw("column");
+                    AlterOp::AddColumn(self.column_def()?)
+                }
             } else if self.kw("drop") {
-                self.kw("column");
-                AlterOp::DropColumn(self.ident()?)
+                if self.kw("constraint") {
+                    AlterOp::DropConstraint(self.ident()?)
+                } else {
+                    self.kw("column");
+                    AlterOp::DropColumn(self.ident()?)
+                }
             } else if self.kw("rename") {
                 if self.kw("to") {
                     AlterOp::RenameTable(self.ident()?)
@@ -585,10 +614,14 @@ impl Parser {
         let mut cols: Vec<ColumnDef> = Vec::new();
         let mut constraints = Vec::new();
         loop {
-            if self.kw("constraint") {
-                self.ident()?; // constraint names are accepted and not stored
-            }
-            if self.kw("primary") {
+            let cname = if self.kw("constraint") {
+                Some(self.ident()?)
+            } else {
+                None
+            };
+            if self.kw("check") {
+                constraints.push(TableConstraint::Check(cname, self.paren_expr()?));
+            } else if self.kw("primary") {
                 self.expect_kw("key")?;
                 constraints.push(TableConstraint::PrimaryKey(self.ident_list()?));
             } else if self.kw("unique") {
@@ -695,9 +728,15 @@ impl Parser {
             unique: false,
             default: None,
             references: None,
+            checks: Vec::new(),
         };
         loop {
-            if self.kw("primary") {
+            if self.kw("check") {
+                col.checks.push(self.paren_expr()?);
+            } else if self.kw("constraint") {
+                self.ident()?; // a named column constraint: the name is not kept
+                continue;
+            } else if self.kw("primary") {
                 self.expect_kw("key")?;
                 col.pk = true;
             } else if self.kw("not") {
@@ -714,6 +753,14 @@ impl Parser {
             }
         }
         Ok(col)
+    }
+
+    /// `( expr )`
+    fn paren_expr(&mut self) -> Result<Expr> {
+        self.expect_sym("(")?;
+        let e = self.expr()?;
+        self.expect_sym(")")?;
+        Ok(e)
     }
 
     fn unary_top(&mut self) -> Result<Expr> {
