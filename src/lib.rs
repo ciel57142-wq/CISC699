@@ -205,12 +205,79 @@ impl Database {
             log: VecDeque::new(),
             active: BTreeMap::new(),
         };
-        Database {
+        let db = Database {
             shared: Arc::new(RwLock::new(shared)),
             txn: None,
             mem_limit: query::exec::DEFAULT_MEM_LIMIT,
             cancel: Default::default(),
+        };
+        // expiry index for TTLs written by an earlier format, then drop what already expired
+        {
+            let mut g = db.write_lock();
+            let mut ctx = Ctx {
+                store: &g.store,
+                writes: WriteSet::new(),
+                reads: None,
+                exec: Default::default(),
+            };
+            kv::index_untracked_expiries(&mut ctx);
+            while kv::purge_expired(&mut ctx, kv::now_ms(), 10_000) > 0 {}
+            let ws = ctx.writes;
+            let _ = g.commit(ws);
         }
+        Database::start_reaper(Arc::downgrade(&db.shared));
+        db
+    }
+
+    /// Background expiry: every `REAP_INTERVAL`, if the earliest expiry is due,
+    /// delete due key-value entries in small committed batches. The thread
+    /// holds only a weak reference and ends when the database is dropped.
+    fn start_reaper(weak: std::sync::Weak<RwLock<Shared>>) {
+        const REAP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+        let _ = std::thread::Builder::new()
+            .name("polydb-expiry".into())
+            .spawn(move || loop {
+                std::thread::sleep(REAP_INTERVAL);
+                let Some(shared) = weak.upgrade() else { return };
+                let due = {
+                    let g = shared.read().unwrap_or_else(|e| e.into_inner());
+                    let ctx = Ctx {
+                        store: &g.store,
+                        writes: WriteSet::new(),
+                        reads: None,
+                        exec: Default::default(),
+                    };
+                    kv::next_expiry(&ctx).is_some_and(|at| at <= kv::now_ms())
+                };
+                if due {
+                    let mut g = shared.write().unwrap_or_else(|e| e.into_inner());
+                    let mut ctx = Ctx {
+                        store: &g.store,
+                        writes: WriteSet::new(),
+                        reads: None,
+                        exec: Default::default(),
+                    };
+                    kv::purge_expired(&mut ctx, kv::now_ms(), 1000);
+                    let ws = ctx.writes;
+                    let _ = g.commit(ws);
+                }
+                drop(shared);
+            });
+    }
+
+    /// Delete expired key-value entries now (the background reaper does this
+    /// periodically); returns how many were removed.
+    pub fn purge_expired(&mut self) -> Result<usize> {
+        self.run(true, |ctx| {
+            let mut n = 0;
+            loop {
+                let k = kv::purge_expired(ctx, kv::now_ms(), 10_000);
+                n += k;
+                if k == 0 {
+                    return Ok(n);
+                }
+            }
+        })
     }
 
     /// Open or create a durable database in directory `path`.
@@ -383,6 +450,55 @@ impl Database {
     }
 
     // ------------------------------------------------------------ typed API
+
+    /// Run a statement with `$1`, `$2`, ... bound to `params` (as values,
+    /// never spliced into the text). Statements without parameters run like
+    /// [`Database::execute`].
+    pub fn execute_params(
+        &mut self,
+        command: &str,
+        params: &[pbsql::parser::Param],
+    ) -> Result<Output> {
+        let wanted = pbsql::parser::param_count(command).unwrap_or(0);
+        if wanted == 0 && params.is_empty() {
+            return self.execute(command);
+        }
+        if params.len() < wanted {
+            return Err(Error::Parse(format!(
+                "statement uses {wanted} parameter(s) but {} were bound",
+                params.len()
+            )));
+        }
+        self.cancel
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let st = pbsql::parser::parse_params(command.trim().trim_end_matches(';'), params)?;
+        let read = pbsql::exec::is_read_only_stmt(&st);
+        self.run(!read, |ctx| pbsql::exec::run_stmt(ctx, st))
+    }
+
+    /// Describe a statement without running it: how many `$n` parameters it
+    /// takes and, for statements that return rows, its column names.
+    pub fn describe(
+        &mut self,
+        command: &str,
+    ) -> Result<(usize, Option<Vec<(String, Option<pbsql::ast::Ty>)>>)> {
+        let n = pbsql::parser::param_count(command).unwrap_or(0);
+        let s = command.trim().trim_end_matches(';');
+        let try_with = |p: pbsql::parser::Param| pbsql::parser::parse_params(s, &vec![p; n]);
+        let st = try_with(pbsql::parser::Param::Typed(Value::Null))
+            .or_else(|_| try_with(pbsql::parser::Param::Untyped("1".into())));
+        let cols = match st {
+            Ok(st) => self.run(false, |ctx| Ok(pbsql::exec::describe(ctx, st)))?,
+            Err(_) => match first_word(s).as_str() {
+                // other commands (document, key-value, SHOW) return rows of unknown shape
+                "show" | "get" | "keys" | "exists" | "incr" | "db" => {
+                    Some(vec![("value".into(), None)])
+                }
+                _ => None,
+            },
+        };
+        Ok((n, cols))
+    }
 
     /// Run one SQL statement.
     pub fn sql(&mut self, statement: &str) -> Result<Output> {

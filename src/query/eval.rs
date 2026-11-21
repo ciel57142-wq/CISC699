@@ -592,6 +592,7 @@ pub fn eval(e: &Expr, env: &Env) -> Result<Value> {
                 p.join(".")
             )))
         }
+        Expr::Untyped(t) => infer_untyped(t),
         Expr::Default => {
             return Err(Error::Parse(
                 "DEFAULT is only allowed in INSERT ... VALUES".into(),
@@ -752,6 +753,46 @@ fn in_list<'v>(v: &Value, items: impl Iterator<Item = &'v Value>, neg: bool) -> 
         Value::Null
     } else {
         Value::Bool(neg)
+    }
+}
+
+/// An untyped parameter with no context: an integer or a decimal when it is
+/// written as one, otherwise text.
+pub fn infer_untyped(t: &str) -> Value {
+    let canonical_int = |s: &str| {
+        let d = s.strip_prefix('-').unwrap_or(s);
+        !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()) && (d == "0" || !d.starts_with('0'))
+    };
+    if canonical_int(t) {
+        if let Ok(i) = t.parse::<i64>() {
+            return Value::Int(i);
+        }
+    }
+    let looks_decimal = t.contains('.')
+        && t.bytes()
+            .all(|b| b.is_ascii_digit() || b == b'.' || b == b'-');
+    if looks_decimal {
+        if let Ok(f) = t.parse::<f64>() {
+            return Value::Float(f);
+        }
+    }
+    Value::Text(t.to_string())
+}
+
+/// An untyped parameter used where a column of type `ty` is expected.
+/// Text that does not convert stays text (and then fails coercion or compares unequal).
+pub fn untyped_as(ty: Ty, t: &str) -> Value {
+    let text = Value::Text(t.to_string());
+    match ty {
+        Ty::Int => t.trim().parse::<i64>().map(Value::Int).unwrap_or(text),
+        Ty::Float => t.trim().parse::<f64>().map(Value::Float).unwrap_or(text),
+        Ty::Bool => match t.trim().to_ascii_lowercase().as_str() {
+            "t" | "true" | "1" | "yes" | "on" => Value::Bool(true),
+            "f" | "false" | "0" | "no" | "off" => Value::Bool(false),
+            _ => text,
+        },
+        Ty::Json => Value::parse(t).unwrap_or(text),
+        _ => coerce_type(ty, text.clone()).unwrap_or(text),
     }
 }
 

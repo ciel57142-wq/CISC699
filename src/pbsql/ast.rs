@@ -181,6 +181,9 @@ pub enum Expr {
     Cast(Box<Expr>, Ty),
     /// `DEFAULT` inside an INSERT's VALUES list.
     Default,
+    /// A bound parameter sent without a type (PostgreSQL OID 0): its type is
+    /// resolved from context, like an untyped literal in PostgreSQL.
+    Untyped(String),
 }
 
 #[derive(Debug, Clone)]

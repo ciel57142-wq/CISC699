@@ -236,7 +236,19 @@ impl Store {
             .create(true)
             .truncate(false)
             .open(dir.join(LOCK_FILE))?;
-        match lock.try_lock() {
+        // A handle being dropped in this or another thread releases the lock a
+        // moment later: wait briefly before reporting the directory as locked.
+        let mut tries = 0;
+        let locked = loop {
+            match lock.try_lock() {
+                Err(fs::TryLockError::WouldBlock) if tries < 25 => {
+                    tries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                other => break other,
+            }
+        };
+        match locked {
             Ok(()) => {}
             Err(fs::TryLockError::WouldBlock) => {
                 return Err(Error::Io(std::io::Error::new(

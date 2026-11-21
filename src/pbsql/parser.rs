@@ -7,7 +7,7 @@
 
 use super::ast::*;
 use super::lexer::{lex, perr, Tok};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::value::Value;
 
 const RESERVED: &[&str] = &[
@@ -34,9 +34,73 @@ fn bx(e: Expr) -> Box<Expr> {
 }
 
 /// Parse exactly one statement (a trailing `;` is allowed).
+/// A value bound to a `$n` parameter.
+#[derive(Debug, Clone)]
+pub enum Param {
+    Typed(Value),
+    /// Sent without a type: resolved from where it is used.
+    Untyped(String),
+}
+
+/// The highest `$n` parameter number used in a statement (0 if none).
+pub fn param_count(src: &str) -> Result<usize> {
+    Ok(lex(src)?
+        .iter()
+        .filter_map(|t| {
+            if let Tok::Param(n) = t {
+                Some(*n)
+            } else {
+                None
+            }
+        })
+        .max()
+        .unwrap_or(0))
+}
+
+/// Parse with `$n` parameters bound to values. Values become literal tokens,
+/// never text, so they cannot change the statement's structure.
+pub fn parse_params(src: &str, params: &[Param]) -> Result<Stmt> {
+    let mut toks = lex(src)?;
+    for t in toks.iter_mut() {
+        if let Tok::Param(n) = t {
+            let p = n
+                .checked_sub(1)
+                .and_then(|i| params.get(i))
+                .ok_or_else(|| {
+                    Error::Parse(format!(
+                        "there is no parameter ${n} ({} supplied)",
+                        params.len()
+                    ))
+                })?;
+            *t = match p {
+                Param::Untyped(s) => Tok::Untyped(s.clone()),
+                Param::Typed(v) => match v {
+                    Value::Null => Tok::Word {
+                        lower: "null".into(),
+                        orig: "NULL".into(),
+                    },
+                    Value::Bool(b) => Tok::Word {
+                        lower: b.to_string(),
+                        orig: b.to_string(),
+                    },
+                    Value::Int(i) => Tok::Int(*i),
+                    Value::Float(f) => Tok::Float(*f),
+                    Value::Text(s) => Tok::Str(s.clone()),
+                    other => Tok::Json(other.clone()),
+                },
+            };
+        }
+    }
+    parse_tokens(toks)
+}
+
 pub fn parse(src: &str) -> Result<Stmt> {
+    parse_tokens(lex(src)?)
+}
+
+fn parse_tokens(t: Vec<Tok>) -> Result<Stmt> {
     let mut p = Parser {
-        t: lex(src)?,
+        t,
         i: 0,
         nest: 0,
         ops: 0,
@@ -70,6 +134,8 @@ impl Parser {
             Some(Tok::Float(f)) => f.to_string(),
             Some(Tok::Str(s)) => format!("'{s}'"),
             Some(Tok::Json(v)) => v.to_json(),
+            Some(Tok::Param(n)) => format!("${n}"),
+            Some(Tok::Untyped(t)) => format!("'{t}'"),
             Some(Tok::Sym(s)) => format!("'{s}'"),
         }
     }
@@ -1046,6 +1112,8 @@ impl Parser {
             Tok::Float(f) => Ok(Expr::Lit(Value::Float(f))),
             Tok::Str(s) => Ok(Expr::Lit(Value::Text(s))),
             Tok::Json(v) => Ok(Expr::Lit(v)),
+            Tok::Untyped(t) => Ok(Expr::Untyped(t)),
+            Tok::Param(n) => perr(format!("no value bound for parameter ${n}")),
             Tok::Sym("(") => {
                 if self.peek_kw("select") {
                     let q = self.subquery()?;

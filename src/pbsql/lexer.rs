@@ -21,6 +21,10 @@ pub enum Tok {
     Float(f64),
     Str(String),
     Json(Value),
+    /// `$1`, `$2`, ...: a bound parameter (replaced before parsing).
+    Param(usize),
+    /// A substituted parameter that arrived without a type.
+    Untyped(String),
     Sym(&'static str),
 }
 
@@ -118,6 +122,17 @@ pub fn lex(src: &str) -> Result<Vec<Tok>> {
             }
             out.push(Tok::Ident(cs[start..i].iter().map(|x| x.1).collect()));
             i += 1;
+        } else if c == '$' && next.is_some_and(|n| n.is_ascii_digit()) {
+            i += 1;
+            let start = i;
+            while i < cs.len() && cs[i].1.is_ascii_digit() {
+                i += 1;
+            }
+            let text: String = cs[start..i].iter().map(|x| x.1).collect();
+            let n = text
+                .parse::<usize>()
+                .map_err(|_| Error::Parse(format!("bad parameter ${text}")))?;
+            out.push(Tok::Param(n));
         } else if c == '{' || c == '[' {
             let byte = cs[i].0;
             let mut jp = JsonParser::at(src, byte);

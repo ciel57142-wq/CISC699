@@ -25,6 +25,39 @@ pub fn execute(ctx: &mut Ctx, src: &str) -> Result<Output> {
     run_stmt(ctx, parser::parse(src)?)
 }
 
+/// Whether a statement only reads (so it can run under a shared lock).
+pub fn is_read_only_stmt(st: &Stmt) -> bool {
+    match st {
+        Stmt::Query(_) | Stmt::KvGet { .. } | Stmt::KvExists { .. } => true,
+        Stmt::Explain { analyze: false, .. } => true,
+        Stmt::Explain {
+            analyze: true,
+            stmt,
+        } => matches!(**stmt, Stmt::Query(_)),
+        _ => false,
+    }
+}
+
+/// Output columns (name, static type when certain) a statement would return,
+/// planned but not executed (`None` for statements that return no rows or
+/// cannot be planned yet).
+pub fn describe(ctx: &Ctx, st: Stmt) -> Option<Vec<(String, Option<Ty>)>> {
+    match st {
+        Stmt::Query(q) => Planner::plan_query(ctx, q, vec![]).ok().map(|p| {
+            if p.docs_output {
+                vec![("document".to_string(), Some(Ty::Text))]
+            } else {
+                p.columns.into_iter().zip(p.types).collect()
+            }
+        }),
+        Stmt::Explain { .. } => Some(vec![("QUERY PLAN".into(), Some(Ty::Text))]),
+        Stmt::KvGet { .. } => Some(vec![("value".into(), Some(Ty::Text))]),
+        Stmt::KvExists { .. } => Some(vec![("value".into(), Some(Ty::Bool))]),
+        Stmt::KvIncr { .. } | Stmt::KvDel { .. } => Some(vec![("value".into(), Some(Ty::Int))]),
+        _ => None,
+    }
+}
+
 /// Whether a parsed statement only reads (so it can run under a shared lock).
 pub fn is_read_only(src: &str) -> bool {
     match parser::parse(src) {
@@ -907,6 +940,26 @@ fn insert(
     cols: Option<Vec<String>>,
     source: InsertSource,
 ) -> Result<Output> {
+    // untyped parameters take the type of the column they are inserted into
+    let mut source = source;
+    if let (Model::Relational, InsertSource::Values(rows)) = (target.model, &mut source) {
+        if let Ok(schema) = Schema::load(ctx, &target.name) {
+            let tys: Vec<Option<Ty>> = match &cols {
+                Some(names) => names
+                    .iter()
+                    .map(|n| schema.find_col(n).map(|i| schema.cols[i].ty))
+                    .collect(),
+                None => schema.cols.iter().map(|c| Some(c.ty)).collect(),
+            };
+            for row in rows.iter_mut() {
+                for (e, ty) in row.iter_mut().zip(&tys) {
+                    if let (Expr::Untyped(t), Some(ty)) = (&*e, ty) {
+                        *e = Expr::Lit(crate::query::eval::untyped_as(*ty, t));
+                    }
+                }
+            }
+        }
+    }
     // 1. compute the rows to insert (reads only)
     // `None` marks a DEFAULT written in a VALUES list
     let rows: Vec<Vec<Option<Value>>> = match source {
@@ -1109,7 +1162,21 @@ fn update(
     filter: Option<Expr>,
 ) -> Result<Output> {
     let src = resolve_source(ctx, &target)?;
-    let exprs: Vec<Expr> = sets.iter().map(|(_, e)| e.clone()).collect();
+    let exprs: Vec<Expr> = sets
+        .iter()
+        .map(|(path, e)| match (e, &src) {
+            // SET col = <untyped parameter>: use the column's type
+            (Expr::Untyped(t), SourceKind::Table(schema)) => {
+                let col = path.last().and_then(|c| schema.find_col(c));
+                match col {
+                    Some(ci) => Expr::Lit(crate::query::eval::untyped_as(schema.cols[ci].ty, t)),
+                    None => e.clone(),
+                }
+            }
+            (Expr::Untyped(t), SourceKind::Kv(_)) => Expr::Lit(Value::Text(t.clone())),
+            _ => e.clone(),
+        })
+        .collect();
     let (hits, new_vals) = targets(ctx, &src, &alias, filter, exprs)?;
     let n = hits.len();
     match src {

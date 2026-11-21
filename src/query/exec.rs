@@ -1894,6 +1894,7 @@ pub fn fmt_expr(e: &Expr) -> String {
         Expr::Case { .. } => "CASE ...".into(),
         Expr::Cast(a, t) => format!("CAST({} AS {})", fmt_expr(a), t.name().to_uppercase()),
         Expr::Default => "DEFAULT".into(),
+        Expr::Untyped(t) => format!("'{}'", t.replace('\'', "''")),
     }
 }
 

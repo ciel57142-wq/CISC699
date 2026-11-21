@@ -32,6 +32,8 @@ pub struct ScopeCol {
     pub alias: String,
     pub name: String,
     pub kind: ColKind,
+    /// Declared type of a relational column (used to type untyped parameters).
+    pub ty: Option<Ty>,
 }
 
 pub type Scope = Vec<ScopeCol>;
@@ -51,12 +53,16 @@ impl SourceKind {
             alias: alias.to_string(),
             name: n.to_string(),
             kind,
+            ty: None,
         };
         match self {
             SourceKind::Table(s) => s
                 .cols
                 .iter()
-                .map(|c| col(&c.name, ColKind::Column))
+                .map(|c| ScopeCol {
+                    ty: Some(c.ty),
+                    ..col(&c.name, ColKind::Column)
+                })
                 .collect(),
             SourceKind::Collection(_) => vec![col(alias, ColKind::Doc)],
             SourceKind::Kv(_) => vec![col("key", ColKind::Column), col("value", ColKind::Column)],
@@ -269,6 +275,8 @@ pub struct Plan {
     pub root: Node,
     pub subs: Vec<SubPlan>,
     pub columns: Vec<String>,
+    /// Static column types, where certain (for describing results before execution).
+    pub types: Vec<Option<Ty>>,
     /// `SELECT *` from a single collection: return documents, not rows.
     pub docs_output: bool,
     pub node_count: usize,
@@ -294,6 +302,8 @@ pub struct Planner<'c, 'a> {
     depth: usize,
     /// The top-level query is `SELECT *` over one collection.
     docs_flag: bool,
+    /// Static result types of the top-level query's columns (None = unknown).
+    top_types: Option<Vec<Option<Ty>>>,
 }
 
 fn conjuncts(e: Expr, out: &mut Vec<Expr>) {
@@ -325,6 +335,7 @@ fn children(e: &Expr) -> Vec<&Expr> {
         | Expr::Col(_)
         | Expr::Slot { .. }
         | Expr::Default
+        | Expr::Untyped(_)
         | Expr::Exists(..)
         | Expr::ScalarQuery(_) => vec![],
         Expr::Not(a)
@@ -486,6 +497,7 @@ impl<'c, 'a> Planner<'c, 'a> {
             used: vec![0],
             depth: 0,
             docs_flag: false,
+            top_types: None,
         }
     }
 
@@ -605,8 +617,119 @@ impl<'c, 'a> Planner<'c, 'a> {
                     .collect::<Result<_>>()?;
                 Ok(Expr::Func(name, args))
             }
+            Expr::Bin(a, op, b)
+                if matches!(op, Op::Eq | Op::Ne | Op::Lt | Op::Le | Op::Gt | Op::Ge) =>
+            {
+                let (a, b) = (self.bind(*a, scope)?, self.bind(*b, scope)?);
+                // an untyped parameter takes the type of the column it is compared with
+                let (a, b) = match (&a, &b) {
+                    (Expr::Untyped(t), slot) => (self.typed_untyped(t, slot, scope), b),
+                    (slot, Expr::Untyped(t)) => {
+                        let nb = self.typed_untyped(t, slot, scope);
+                        (a, nb)
+                    }
+                    _ => (a, b),
+                };
+                Ok(Expr::Bin(Box::new(a), op, Box::new(b)))
+            }
+            Expr::In(a, list, n) => {
+                let a = self.bind(*a, scope)?;
+                let list = list
+                    .into_iter()
+                    .map(|e| match self.bind(e, scope)? {
+                        Expr::Untyped(t) => Ok(self.typed_untyped(&t, &a, scope)),
+                        other => Ok(other),
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Expr::In(Box::new(a), list, n))
+            }
             other => map_children(other, &mut |c| self.bind(c, scope)),
         }
+    }
+
+    /// The static type of a bound expression when it is certain (used to
+    /// describe result columns before execution).
+    fn infer_ty(&self, e: &Expr, scope: &Scope) -> Option<Ty> {
+        use crate::pbsql::ast::AggFn;
+        Some(match e {
+            Expr::Slot { .. } => return self.slot_ty(e, scope),
+            Expr::Lit(v) => match v {
+                Value::Int(_) => Ty::Int,
+                Value::Float(_) => Ty::Float,
+                Value::Bool(_) => Ty::Bool,
+                Value::Text(_) => Ty::Text,
+                Value::Object(_) | Value::Array(_) => Ty::Json,
+                Value::Null => return None,
+            },
+            Expr::Bin(
+                _,
+                Op::Eq | Op::Ne | Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::And | Op::Or,
+                _,
+            )
+            | Expr::Not(_)
+            | Expr::IsNull(..)
+            | Expr::Like(..)
+            | Expr::In(..)
+            | Expr::InQuery(..)
+            | Expr::Exists(..) => Ty::Bool,
+            Expr::Bin(_, Op::Concat, _) => Ty::Text,
+            Expr::Bin(a, _, b) => match (self.infer_ty(a, scope)?, self.infer_ty(b, scope)?) {
+                (Ty::Int, Ty::Int) => Ty::Int,
+                (Ty::Int | Ty::Float, Ty::Int | Ty::Float) => Ty::Float,
+                _ => return None,
+            },
+            Expr::Neg(a) => match self.infer_ty(a, scope)? {
+                t @ (Ty::Int | Ty::Float) => t,
+                _ => return None,
+            },
+            Expr::Agg(AggFn::Count, ..) => Ty::Int,
+            Expr::Agg(AggFn::Avg, ..) => Ty::Float,
+            Expr::Agg(_, Some(a), _) => match self.infer_ty(a, scope)? {
+                Ty::Int => Ty::Int,
+                Ty::Float => Ty::Float,
+                t => t,
+            },
+            Expr::Cast(_, t) => *t,
+            Expr::Func(n, _) => match n.as_str() {
+                "length" | "year" | "month" | "day" | "hour" | "minute" | "second" => Ty::Int,
+                "lower" | "upper" | "concat" | "trim" | "substr" | "substring" | "version"
+                | "typeof" | "json_type" => Ty::Text,
+                "now" | "current_timestamp" | "localtimestamp" | "timestamp" | "datetime" => {
+                    Ty::Timestamp
+                }
+                "current_date" | "date" => Ty::Date,
+                "current_time" | "time" => Ty::Time,
+                _ => return None,
+            },
+            _ => return None,
+        })
+    }
+
+    /// The declared type of a bound column reference, if known.
+    fn slot_ty(&self, e: &Expr, scope: &Scope) -> Option<Ty> {
+        match e {
+            Expr::Slot {
+                level, idx, path, ..
+            } if path.is_empty() => {
+                let sc = if *level == 0 {
+                    Some(scope)
+                } else {
+                    self.outer.get(level - 1)
+                };
+                sc.and_then(|s| s.get(*idx)).and_then(|c| c.ty)
+            }
+            _ => None,
+        }
+    }
+
+    /// An untyped parameter compared with `other`: a literal of the column's type
+    /// when known (and convertible), otherwise inferred from its text.
+    fn typed_untyped(&self, text: &str, other: &Expr, scope: &Scope) -> Expr {
+        let v = match self.slot_ty(other, scope) {
+            Some(ty) => crate::query::eval::untyped_as(ty, text),
+            None => crate::query::eval::infer_untyped(text),
+        };
+        Expr::Lit(v)
     }
 
     fn subquery(&mut self, q: Query, scope: &Scope, want_cols: Option<usize>) -> Result<usize> {
@@ -673,6 +796,7 @@ impl<'c, 'a> Planner<'c, 'a> {
                         alias: tr.alias.clone(),
                         name: n,
                         kind: ColKind::Column,
+                        ty: None,
                     })
                     .collect();
                 Ok((
@@ -704,6 +828,7 @@ impl<'c, 'a> Planner<'c, 'a> {
                 alias: String::new(),
                 name: c.clone(),
                 kind: ColKind::Column,
+                ty: None,
             })
             .collect();
         let mut plan = plan;
@@ -869,6 +994,14 @@ impl<'c, 'a> Planner<'c, 'a> {
             }
         }
         let docs_output = star_doc && scope.len() == 1 && items.len() == 1;
+        if self.depth == 0 && self.top_types.is_none() {
+            self.top_types = Some(
+                items
+                    .iter()
+                    .map(|(e, _, _)| self.infer_ty(e, &scope))
+                    .collect(),
+            );
+        }
 
         // ORDER BY may name a select alias or a 1-based output position
         let mut order = Vec::new();
@@ -1902,6 +2035,8 @@ impl<'c, 'a> Planner<'c, 'a> {
         b.outer = outer;
         let (logical, columns) = b.query(q)?;
         let docs_output = b.docs_flag;
+        let mut types = b.top_types.take().unwrap_or_default();
+        types.resize(columns.len(), None);
         let mut pp = PhysPlanner::new(ctx);
         let root = pp.plan(logical)?;
         let mut subs = Vec::new();
@@ -1915,6 +2050,7 @@ impl<'c, 'a> Planner<'c, 'a> {
             root,
             subs,
             columns,
+            types,
             docs_output,
             node_count: pp.next_id,
         })
