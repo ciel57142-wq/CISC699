@@ -297,6 +297,16 @@ impl<'a> Ctx<'a> {
         self.store.get(key).cloned()
     }
 
+    /// Like `get`, but not recorded in a transaction's read set. Only for
+    /// data that cannot change a statement's result (planner statistics),
+    /// so that refreshing it never makes a concurrent transaction conflict.
+    pub fn get_untracked(&self, key: &[u8]) -> Option<Vec<u8>> {
+        if let Some(v) = self.writes.get(key) {
+            return v.clone();
+        }
+        self.store.get(key).cloned()
+    }
+
     pub fn put(&mut self, key: Vec<u8>, value: Vec<u8>) {
         self.writes.insert(key, Some(value));
     }

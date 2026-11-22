@@ -41,11 +41,13 @@ bash scripts/smoke.sh              # 4. scripted session compared with stored ou
 
 ### Expected output
 
-Step 3 prints one `test result` line per test target. The three that matter are:
+Step 3 prints one `test result` line per test target. The ones that matter are:
 
 ```
+test result: ok. 24 passed; 0 failed; 0 ignored; ...     (tests/document.rs)
 test result: ok. 23 passed; 0 failed; 0 ignored; ...     (tests/hardening.rs)
 test result: ok. 22 passed; 0 failed; 0 ignored; ...     (tests/integration.rs)
+test result: ok. 13 passed; 0 failed; 0 ignored; ...     (tests/planner.rs)
 test result: ok. 37 passed; 0 failed; 0 ignored; ...     (tests/relational.rs)
 test result: ok. 1 passed; 0 failed; 0 ignored; ...      (Doc-tests polydb)
 ```
@@ -154,6 +156,7 @@ The build compiles polydb, runs the Rust tests and the smoke comparison, and fai
 | `cargo test --release --locked` | correct behaviour of all three models, transactions, recovery (`tests/integration.rs`) | 22 |
 | | failure paths: bad arguments, damaged files, port conflicts, garbage and deeply nested input on every port, killing the server (`tests/hardening.rs`) | 23 |
 | | SQL engine: constraints, foreign keys, joins, subqueries, indexes (`tests/relational.rs`) and parser unit tests | 37 + 6 |
+| | SQL indexes, planner and `EXPLAIN` (`tests/planner.rs`) | 13 |
 | | document model: types, paths, every query/update operator, bulk writes, indexes checked against unindexed results, aggregation, schemas, transactions, restarts and torn logs (`tests/document.rs`) | 24 |
 | | library example in `src/lib.rs` compiles | 1 |
 | `bash scripts/smoke.sh` | scripted session equals stored output | 64 lines |
@@ -194,7 +197,7 @@ polydb ships with **no dataset** and downloads none. Every test creates its own 
 - **Large-message allocation (open):** the Redis and PostgreSQL listeners accept a declared message length of up to 512 MB and 256 MB and allocate it before reading.
 - **Log damage:** recovery stops at the first log record that fails its checksum. A torn final record (the normal crash case) is handled correctly; damage in the middle of the log also drops the commits after it.
 - Commits wait for their own `fsync`, so write throughput is bounded by the disk.
-- Indexes serve equality only; range queries and joins scan.
+- Document-model indexes serve equality only. SQL indexes serve equality, ranges, IN lists and index joins, but no index-only scans, no ORDER BY by index order and no OR across columns; join reordering is greedy and only for inner joins; planner statistics are refreshed only by `ANALYZE` (see [docs/INDEXING.md](docs/INDEXING.md)).
 - SQL has no date/time types, views, CTEs (`WITH`), window functions, `RETURNING` or `ON ... SET DEFAULT`; foreign-key `NO ACTION` is checked immediately, like `RESTRICT`. Subqueries nest at most 6 deep.
 - No lock file: do not open the same directory from two processes at once.
 - Object keys in documents are stored sorted, not in insertion order.
@@ -203,7 +206,7 @@ polydb ships with **no dataset** and downloads none. Every test creates its own 
 
 ```
 Cargo.toml, Cargo.lock      package manifest and lock file (no dependencies)
-src/                        the engine (about 5,600 lines)
+src/                        the engine (about 11,400 lines)
   storage.rs keys.rs          ordered map, write-ahead log, snapshot, key layout
   sql/ doc/ kv.rs             the three data models
   lib.rs value.rs error.rs    sessions, transactions, value type, errors
@@ -214,6 +217,7 @@ tests/
   integration.rs              22 behaviour tests
   hardening.rs                23 failure-path tests
   relational.rs               37 SQL engine tests
+  planner.rs                  13 index, planner and EXPLAIN tests
   document.rs                 24 document-model tests
   drivers.py                  45 checks through third-party drivers
   requirements-drivers.txt    pinned driver versions
@@ -230,6 +234,7 @@ docs/
   AUDIT.md                    what the repository audit found and changed
   EVIDENCE.md                 file manifest with checksums
   REFERENCE.md                command syntax, library API, protocol subsets
+  INDEXING.md                 index audit, planner design, EXPLAIN, benchmarks
   WALKTHROUGH.md              script for the recorded walkthrough
   evidence/                   clean-run logs
 ```

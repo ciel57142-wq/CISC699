@@ -180,6 +180,24 @@ impl Database {
         Ok(Database::from_store(Store::open(path)?))
     }
 
+    /// Open a durable database and, after recovery, verify every relational
+    /// index entry against the rows, rebuilding the indexes of any table
+    /// where they disagree. Costs one pass over the data; returns what it
+    /// found. Rows and index entries are written in the same atomic commit,
+    /// so on an undamaged database this finds nothing; it is the repair path
+    /// for data written by other tools or damaged outside the engine.
+    pub fn open_verified(path: impl AsRef<Path>) -> Result<(Database, sql::RepairReport)> {
+        let mut db = Database::open(path)?;
+        let report = db.repair_indexes()?;
+        Ok((db, report))
+    }
+
+    /// Verify every relational index against its rows and rebuild the
+    /// indexes of tables where they disagree, as one atomic commit.
+    pub fn repair_indexes(&mut self) -> Result<sql::RepairReport> {
+        self.run(true, sql::repair_indexes)
+    }
+
     /// A database that lives only in memory.
     pub fn in_memory() -> Database {
         Database::from_store(Store::memory())
@@ -440,7 +458,7 @@ impl Database {
     /// Run one command in any of the three languages:
     ///
     /// * SQL: `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `CREATE TABLE|[UNIQUE] INDEX`, `DROP TABLE|INDEX`,
-    ///   `ALTER TABLE`, `TRUNCATE`, `EXPLAIN`, `DESCRIBE`, `CHECK TABLE`, `REINDEX`
+    ///   `ALTER TABLE`, `TRUNCATE`, `EXPLAIN [ANALYZE]`, `ANALYZE`, `DESCRIBE`, `CHECK TABLE`, `REINDEX`
     /// * documents: `db.<collection>.<method>(...)`
     /// * key-value: `SET`, `GET`, `DEL`, `EXISTS`, `KEYS`, `INCR`
     /// * control: `BEGIN`, `COMMIT`, `ROLLBACK`, `CHECKPOINT`, `SHOW TABLES`, `SHOW COLLECTIONS`
@@ -480,7 +498,7 @@ impl Database {
             w @ ("get" | "exists" | "keys") => self.run(false, |ctx| kv_command(ctx, w, rest)),
             w @ ("set" | "del" | "incr") => self.run(true, |ctx| kv_command(ctx, w, rest)),
             "select" | "insert" | "update" | "delete" | "create" | "drop" | "alter" | "truncate" | "explain"
-            | "describe" | "desc" | "check" | "reindex" => self.sql(s),
+            | "describe" | "desc" | "check" | "reindex" | "analyze" => self.sql(s),
             other => Err(Error::Parse(format!(
                 "unknown command '{other}': expected SQL, a db.<collection>.<method>(...) call, or SET/GET/DEL/EXISTS/KEYS/INCR"
             ))),
