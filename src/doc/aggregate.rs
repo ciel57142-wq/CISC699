@@ -68,6 +68,46 @@ fn ref_path(cur: &Value, parts: &[&str]) -> Option<Value> {
     }
 }
 
+/// Top-level fields an expression reads, or false if it cannot be analysed
+/// (variables, unsupported operators: evaluation will report those).
+fn expr_fields(e: &Value, out: &mut std::collections::BTreeSet<String>) -> bool {
+    match e {
+        Value::Text(s) if s.starts_with("$$") => false,
+        Value::Text(s) if s.starts_with('$') => {
+            out.insert(s[1..].split('.').next().unwrap_or("").to_string());
+            true
+        }
+        Value::Object(o) if o.keys().any(|k| k.starts_with('$')) => {
+            (o.len() == 1 && o.contains_key("$literal")) || super::path::is_literal_object(o)
+        }
+        Value::Object(o) => o.values().all(|v| expr_fields(v, out)),
+        Value::Array(a) => a.iter().all(|v| expr_fields(v, out)),
+        _ => true,
+    }
+}
+
+/// The top-level fields a `$group` stage reads, so documents can be decoded
+/// partially for it. None when the spec is not one this can analyse.
+pub(super) fn group_fields(spec: &Value) -> Option<std::collections::BTreeSet<String>> {
+    let Value::Object(g) = spec else { return None };
+    let mut out = std::collections::BTreeSet::new();
+    if !expr_fields(g.get("_id")?, &mut out) {
+        return None;
+    }
+    for (k, acc) in g.iter().filter(|(k, _)| *k != "_id") {
+        let _ = k;
+        match acc {
+            Value::Object(o) if o.len() == 1 => {
+                if !expr_fields(o.values().next()?, &mut out) {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
 // --------------------------------------------------------------- sorting
 
 /// A sort specification: `{"a": 1, "b": -1}` (keys apply in name order,
@@ -399,7 +439,7 @@ fn group(docs: Vec<Value>, spec: &Value) -> Result<Vec<Value>> {
 
 // --------------------------------------------------------------- pipeline
 
-fn count_arg(stage: &str, v: &Value, allow_zero: bool) -> Result<usize> {
+pub(super) fn count_arg(stage: &str, v: &Value, allow_zero: bool) -> Result<usize> {
     let n = match v {
         Value::Int(n) => *n as f64,
         Value::Float(f) if f.fract() == 0.0 => *f,

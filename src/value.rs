@@ -390,18 +390,34 @@ impl<'a> JsonParser<'a> {
     fn string(&mut self) -> Result<String> {
         let quote = self.s[self.pos];
         self.pos += 1;
+        // Fast path: no escapes. The bytes between two ASCII quotes of a
+        // `&str` are valid UTF-8 already, so copy them in one go.
+        let start = self.pos;
+        let run = self.s[start..].iter().position(|&c| c == quote || c == b'\\');
+        match run {
+            None => {
+                self.pos = self.s.len();
+                return self.err("unterminated string");
+            }
+            Some(n) if self.s[start + n] == quote => {
+                self.pos = start + n + 1;
+                return Ok(self.src[start..start + n].to_string());
+            }
+            Some(_) => {}
+        }
         let mut buf: Vec<u8> = Vec::new();
         loop {
+            // Copy the unescaped run up to the next quote or backslash.
+            let rest = &self.s[self.pos..];
+            let n = rest.iter().position(|&c| c == quote || c == b'\\').unwrap_or(rest.len());
+            buf.extend_from_slice(&rest[..n]);
+            self.pos += n;
             let Some(&c) = self.s.get(self.pos) else {
                 return self.err("unterminated string");
             };
             self.pos += 1;
             if c == quote {
                 break;
-            }
-            if c != b'\\' {
-                buf.push(c);
-                continue;
             }
             let Some(&e) = self.s.get(self.pos) else {
                 return self.err("unterminated escape");

@@ -195,18 +195,45 @@ pub fn validate_doc(doc: &Value) -> Result<()> {
     if doc.deeper_than(MAX_DOC_DEPTH) {
         return Err(Error::Type(format!("document nesting is deeper than {MAX_DOC_DEPTH} levels")));
     }
-    check_shape(doc, "")
+    // The location is kept as borrowed segments and only turned into a
+    // string when there is an error: building it for every field was a
+    // fifth of the cost of an insert.
+    let mut at: Vec<Seg> = Vec::new();
+    check_shape(doc, &mut at)
 }
 
-fn check_shape(v: &Value, at: &str) -> Result<()> {
-    let here = |k: &str| if at.is_empty() { k.to_string() } else { format!("{at}.{k}") };
+#[derive(Clone, Copy)]
+enum Seg<'v> {
+    Key(&'v str),
+    Index(usize),
+}
+
+fn join(at: &[Seg], last: Option<&str>) -> String {
+    let mut s = String::new();
+    for seg in at.iter().map(|g| match g {
+        Seg::Key(k) => (*k).to_string(),
+        Seg::Index(i) => i.to_string(),
+    }).chain(last.map(String::from)) {
+        if !s.is_empty() {
+            s.push('.');
+        }
+        s.push_str(&seg);
+    }
+    s
+}
+
+fn check_shape<'v>(v: &'v Value, at: &mut Vec<Seg<'v>>) -> Result<()> {
     match v {
         Value::Float(f) if !f.is_finite() => {
-            Err(Error::Type(format!("field '{at}' holds a non-finite number, which cannot be stored")))
+            Err(Error::Type(format!("field '{}' holds a non-finite number, which cannot be stored", join(at, None))))
         }
         Value::Array(a) => {
             for (i, e) in a.iter().enumerate() {
-                check_shape(e, &here(&i.to_string()))?;
+                if matches!(e, Value::Float(_) | Value::Array(_) | Value::Object(_)) {
+                    at.push(Seg::Index(i));
+                    check_shape(e, at)?;
+                    at.pop();
+                }
             }
             Ok(())
         }
@@ -214,15 +241,19 @@ fn check_shape(v: &Value, at: &str) -> Result<()> {
         Value::Object(o) => {
             for (k, e) in o {
                 if k.starts_with('$') {
-                    return Err(Error::Type(format!("field name '{}' may not start with '$'", here(k))));
+                    return Err(Error::Type(format!("field name '{}' may not start with '$'", join(at, Some(k)))));
                 }
                 if k.contains('.') {
-                    return Err(Error::Type(format!("field name '{}' may not contain '.'", here(k))));
+                    return Err(Error::Type(format!("field name '{}' may not contain '.'", join(at, Some(k)))));
                 }
                 if k.contains('\0') {
-                    return Err(Error::Type(format!("field name '{}' may not contain NUL", here(k))));
+                    return Err(Error::Type(format!("field name '{}' may not contain NUL", join(at, Some(k)))));
                 }
-                check_shape(e, &here(k))?;
+                if matches!(e, Value::Float(_) | Value::Array(_) | Value::Object(_)) {
+                    at.push(Seg::Key(k));
+                    check_shape(e, at)?;
+                    at.pop();
+                }
             }
             Ok(())
         }

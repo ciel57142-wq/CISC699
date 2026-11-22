@@ -13,6 +13,7 @@
 //!   (numbers with numbers, strings with strings, ...), against the value
 //!   itself or any element of an array value.
 
+use super::codec::Source;
 use super::path::{is_literal_object, path_values, type_name, validate_path};
 use crate::error::{Error, Result};
 use crate::value::Value;
@@ -172,6 +173,47 @@ impl Filter {
                 conds.iter().all(|c| c.eval(&vals))
             }
         }
+    }
+
+    /// [`Filter::eval`] on any field source, e.g. a stored document read
+    /// lazily: only the values the filter's paths reach are decoded.
+    pub fn eval_src(&self, doc: &dyn Source) -> Result<bool> {
+        Ok(match self {
+            Filter::And(fs) => {
+                for f in fs {
+                    if !f.eval_src(doc)? {
+                        return Ok(false);
+                    }
+                }
+                true
+            }
+            Filter::Or(fs) => {
+                for f in fs {
+                    if f.eval_src(doc)? {
+                        return Ok(true);
+                    }
+                }
+                false
+            }
+            Filter::Nor(fs) => {
+                for f in fs {
+                    if f.eval_src(doc)? {
+                        return Ok(false);
+                    }
+                }
+                true
+            }
+            Filter::Field(path, conds) => {
+                let vals = doc.values(path)?;
+                let refs: Vec<&Value> = vals.iter().map(|c| c.as_ref()).collect();
+                conds.iter().all(|c| c.eval(&refs))
+            }
+        })
+    }
+
+    /// Matches every document (`{}`).
+    pub fn is_empty(&self) -> bool {
+        matches!(self, Filter::And(fs) if fs.is_empty())
     }
 
     /// Top-level conjunctive field conditions (through nested `$and`),

@@ -13,6 +13,7 @@
 //! * [`aggregate`] — projection, sorting and the aggregation pipeline
 
 pub mod aggregate;
+pub mod codec;
 pub mod filter;
 pub mod index;
 pub mod path;
@@ -26,6 +27,7 @@ use crate::error::{Error, Result};
 use crate::keys;
 use crate::storage::Ctx;
 use crate::value::Value;
+use codec::Doc;
 use filter::Filter;
 use index::{IndexDef, Plan};
 use std::collections::{BTreeMap, BTreeSet};
@@ -39,9 +41,15 @@ fn check_name(coll: &str) -> Result<()> {
     }
 }
 
+/// Decode a stored document (the binary layout, or JSON written by older versions).
 fn decode(raw: &[u8]) -> Result<Value> {
-    let s = std::str::from_utf8(raw).map_err(|_| Error::Corrupt("document is not UTF-8".into()))?;
-    Value::parse(s).map_err(|e| Error::Corrupt(format!("stored document: {e}")))
+    Doc::from_stored(raw)?.to_value()
+}
+
+/// Collection metadata is small JSON.
+fn decode_json(raw: &[u8]) -> Result<Value> {
+    let s = std::str::from_utf8(raw).map_err(|_| Error::Corrupt("metadata is not UTF-8".into()))?;
+    Value::parse(s).map_err(|e| Error::Corrupt(format!("stored metadata: {e}")))
 }
 
 fn doc_key(coll: &str, id: &Value) -> Result<Vec<u8>> {
@@ -75,8 +83,8 @@ struct Meta {
 }
 
 fn load_meta(ctx: &Ctx, coll: &str) -> Result<Option<Meta>> {
-    let Some(raw) = ctx.get(&keys::coll_meta(coll)) else { return Ok(None) };
-    let v = decode(&raw)?;
+    let Some(raw) = ctx.get_ref(&keys::coll_meta(coll)) else { return Ok(None) };
+    let v = decode_json(raw)?;
     let indexes = match v.get("indexes") {
         Some(Value::Array(a)) => a.iter().map(IndexDef::from_meta).collect::<Result<_>>()?,
         _ => vec![],
@@ -208,7 +216,7 @@ fn write_doc(ctx: &mut Ctx, coll: &str, meta: &mut Meta, key: Vec<u8>, doc: &Val
     if meta_changed {
         save_meta(ctx, coll, meta);
     }
-    ctx.put(key, doc.to_json().into_bytes());
+    ctx.put(key, codec::encode(doc));
     Ok(())
 }
 
@@ -277,53 +285,92 @@ pub fn insert_many(ctx: &mut Ctx, coll: &str, docs: Vec<Value>) -> Result<Vec<Va
 
 // ------------------------------------------------------------------ reads
 
-/// Candidate documents for a filter through the planned access path, in
-/// key order. The caller still evaluates the filter.
-fn candidates(ctx: &Ctx, coll: &str, f: &Filter, meta: &Meta) -> Result<(Vec<(Vec<u8>, Value)>, Plan)> {
-    let plan = index::plan(coll, f, &meta.indexes);
-    let mut out = Vec::new();
-    match &plan {
+/// Visit the stored documents a plan reads, in key order, borrowed from
+/// the store. `f(doc key, stored bytes)` returns false to stop.
+fn for_each_candidate<'c>(
+    ctx: &'c Ctx,
+    coll: &str,
+    plan: &Plan,
+    mut f: impl FnMut(&[u8], &'c [u8]) -> Result<bool>,
+) -> Result<()> {
+    match plan {
         Plan::Ids(ids) => {
             let mut keys: Vec<Vec<u8>> = ids.iter().map(|id| doc_key(coll, id)).collect::<Result<_>>()?;
             keys.sort();
             for k in keys {
-                if let Some(raw) = ctx.get(&k) {
-                    out.push((k, decode(&raw)?));
+                if let Some(raw) = ctx.get_ref(&k) {
+                    if !f(&k, raw)? {
+                        break;
+                    }
                 }
             }
         }
         Plan::Index { index, ranges, .. } => {
             let prefix = index.prefix(coll);
+            let dp = keys::doc_prefix(coll);
             let mut found: BTreeSet<Vec<u8>> = BTreeSet::new();
             for (start, end) in ranges {
-                for (k, _) in ctx.scan_range(&prefix, start, Some(end)) {
+                for (k, _) in ctx.iter_range(&prefix, start, Some(end), false) {
                     let id = index
                         .id_of(&k[prefix.len()..])
                         .ok_or_else(|| Error::Corrupt(format!("malformed entry in index {}", index.name())))?;
-                    found.insert([keys::doc_prefix(coll).as_slice(), id].concat());
+                    found.insert([dp.as_slice(), id].concat());
                 }
             }
             for k in found {
-                if let Some(raw) = ctx.get(&k) {
-                    out.push((k, decode(&raw)?));
+                if let Some(raw) = ctx.get_ref(&k) {
+                    if !f(&k, raw)? {
+                        break;
+                    }
                 }
             }
         }
         Plan::Scan => {
-            for (k, raw) in ctx.scan(&keys::doc_prefix(coll)) {
-                out.push((k, decode(&raw)?));
+            for (k, raw) in ctx.iter_prefix(&keys::doc_prefix(coll)) {
+                if !f(k, raw)? {
+                    break;
+                }
             }
         }
     }
-    Ok((out, plan))
+    Ok(())
 }
 
-fn matching(ctx: &Ctx, coll: &str, filter: &Value) -> Result<(Vec<(Vec<u8>, Value)>, Meta)> {
+/// Stored documents matching `f`, in key order, at most `limit`. The
+/// filter reads fields straight from the stored bytes, so documents that
+/// do not match are never decoded. Keys are returned when `with_keys`.
+fn matching_raw<'c>(
+    ctx: &'c Ctx,
+    coll: &str,
+    f: &Filter,
+    plan: &Plan,
+    with_keys: bool,
+    limit: Option<usize>,
+) -> Result<Vec<(Vec<u8>, &'c [u8])>> {
+    let mut out = Vec::new();
+    if limit == Some(0) {
+        return Ok(out);
+    }
+    let all = f.is_empty();
+    for_each_candidate(ctx, coll, plan, |k, raw| {
+        if all || f.eval_src(&Doc::from_stored(raw)?)? {
+            out.push((if with_keys { k.to_vec() } else { Vec::new() }, raw));
+            if limit.map_or(false, |l| out.len() >= l) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    })?;
+    Ok(out)
+}
+
+/// Compile, plan and match in one step: (matching documents, metadata).
+fn prepare(ctx: &Ctx, coll: &str, filter: &Value) -> Result<(Filter, Meta, Plan)> {
     check_name(coll)?;
     let f = filter::compile(filter)?;
     let meta = meta_or_default(ctx, coll)?;
-    let (cands, _) = candidates(ctx, coll, &f, &meta)?;
-    Ok((cands.into_iter().filter(|(_, d)| f.eval(d)).collect(), meta))
+    let plan = index::plan(coll, &f, &meta.indexes);
+    Ok((f, meta, plan))
 }
 
 #[derive(Default, Clone, Debug)]
@@ -337,35 +384,98 @@ pub struct FindOptions {
     pub projection: Option<Value>,
 }
 
-pub fn find(ctx: &Ctx, coll: &str, filter: &Value, opts: &FindOptions) -> Result<Vec<Value>> {
-    let sort = opts.sort.as_ref().map(aggregate::parse_sort).transpose()?;
-    let (found, _) = matching(ctx, coll, filter)?;
-    let mut docs: Vec<Value> = found.into_iter().map(|(_, d)| d).collect();
-    if let Some(spec) = sort {
-        aggregate::sort_docs(&mut docs, &spec);
+/// Sorted documents' stored bytes, after skip and limit. Sort keys are read
+/// from the stored bytes; with a limit only the best `skip + limit` are
+/// kept (selection, not a full sort). Equal keys keep key order, as the
+/// stable sort over key-ordered candidates did.
+fn sort_raw<'c>(hits: Vec<&'c [u8]>, spec: &[(String, bool)], skip: usize, limit: Option<usize>) -> Result<Vec<&'c [u8]>> {
+    let mut keyed: Vec<(Vec<Value>, usize, &[u8])> = Vec::with_capacity(hits.len());
+    for (i, raw) in hits.into_iter().enumerate() {
+        let d = Doc::from_stored(raw)?;
+        let ks = spec.iter().map(|(p, _)| Ok(d.path(p)?.map(|c| c.into_owned()).unwrap_or(Value::Null))).collect::<Result<Vec<_>>>()?;
+        keyed.push((ks, i, raw));
     }
-    let docs = docs.into_iter().skip(opts.skip).take(opts.limit.unwrap_or(usize::MAX));
-    match &opts.projection {
-        Some(p) => docs.map(|d| project(d, p)).collect(),
-        None => Ok(docs.collect()),
+    let cmp = |a: &(Vec<Value>, usize, &[u8]), b: &(Vec<Value>, usize, &[u8])| {
+        for ((x, y), (_, desc)) in a.0.iter().zip(&b.0).zip(spec) {
+            let o = x.total_cmp(y);
+            if o != std::cmp::Ordering::Equal {
+                return if *desc { o.reverse() } else { o };
+            }
+        }
+        a.1.cmp(&b.1)
+    };
+    if let Some(l) = limit {
+        let want = l.saturating_add(skip);
+        if want == 0 {
+            return Ok(vec![]);
+        }
+        if want < keyed.len() {
+            keyed.select_nth_unstable_by(want - 1, cmp);
+            keyed.truncate(want);
+        }
     }
+    keyed.sort_unstable_by(cmp); // (keys, position) is a total order
+    Ok(keyed.into_iter().skip(skip).take(limit.unwrap_or(usize::MAX)).map(|k| k.2).collect())
 }
 
+pub fn find(ctx: &Ctx, coll: &str, filter: &Value, opts: &FindOptions) -> Result<Vec<Value>> {
+    find_fields(ctx, coll, filter, opts, None)
+}
+
+/// [`find`], decoding only the top-level fields in `only` when given.
+fn find_fields(
+    ctx: &Ctx,
+    coll: &str,
+    filter: &Value,
+    opts: &FindOptions,
+    only: Option<&BTreeSet<String>>,
+) -> Result<Vec<Value>> {
+    let sort = opts.sort.as_ref().map(aggregate::parse_sort).transpose()?;
+    let (f, _, plan) = prepare(ctx, coll, filter)?;
+    let raws: Vec<&[u8]> = match &sort {
+        Some(spec) if !spec.is_empty() => {
+            let hits = matching_raw(ctx, coll, &f, &plan, false, None)?.into_iter().map(|h| h.1).collect();
+            sort_raw(hits, spec, opts.skip, opts.limit)?
+        }
+        _ => {
+            // Natural (key) order: stop reading once skip + limit have matched.
+            let want = opts.limit.map(|l| l.saturating_add(opts.skip));
+            let hits = matching_raw(ctx, coll, &f, &plan, false, want)?;
+            hits.into_iter().skip(opts.skip).map(|h| h.1).collect()
+        }
+    };
+    raws.into_iter()
+        .map(|raw| {
+            let d = match only {
+                Some(keep) => Doc::from_stored(raw)?.to_value_where(|k| keep.contains(k))?,
+                None => decode(raw)?,
+            };
+            match &opts.projection {
+                Some(p) => project(d, p),
+                None => Ok(d),
+            }
+        })
+        .collect()
+}
+
+/// Number of matching documents. Only the fields the filter reads are decoded.
 pub fn count(ctx: &Ctx, coll: &str, filter: &Value) -> Result<u64> {
-    Ok(matching(ctx, coll, filter)?.0.len() as u64)
+    let (f, _, plan) = prepare(ctx, coll, filter)?;
+    Ok(matching_raw(ctx, coll, &f, &plan, false, None)?.len() as u64)
 }
 
 /// Distinct values of a field among matching documents (array fields
 /// contribute their elements), sorted.
 pub fn distinct(ctx: &Ctx, coll: &str, field: &str, filter: &Value) -> Result<Vec<Value>> {
     path::validate_path(field)?;
+    let (f, _, plan) = prepare(ctx, coll, filter)?;
     let mut seen: BTreeSet<SortKey> = BTreeSet::new();
-    for (_, d) in matching(ctx, coll, filter)?.0 {
-        for v in path::path_values(&d, field) {
-            match v {
-                Value::Array(a) => seen.extend(a.iter().cloned().map(SortKey)),
+    for (_, raw) in matching_raw(ctx, coll, &f, &plan, false, None)? {
+        for v in Doc::from_stored(raw)?.values(field)? {
+            match v.into_owned() {
+                Value::Array(a) => seen.extend(a.into_iter().map(SortKey)),
                 v => {
-                    seen.insert(SortKey(v.clone()));
+                    seen.insert(SortKey(v));
                 }
             }
         }
@@ -394,26 +504,64 @@ impl Ord for SortKey {
 /// How a filter would be answered: the access path, how many documents it
 /// read and how many matched.
 pub fn explain(ctx: &Ctx, coll: &str, filter: &Value) -> Result<Value> {
-    check_name(coll)?;
-    let f = filter::compile(filter)?;
-    let meta = meta_or_default(ctx, coll)?;
-    let (cands, plan) = candidates(ctx, coll, &f, &meta)?;
-    let matched = cands.iter().filter(|(_, d)| f.eval(d)).count();
+    let (f, _, plan) = prepare(ctx, coll, filter)?;
+    let (mut examined, mut matched) = (0i64, 0i64);
+    for_each_candidate(ctx, coll, &plan, |_, raw| {
+        examined += 1;
+        matched += f.eval_src(&Doc::from_stored(raw)?)? as i64;
+        Ok(true)
+    })?;
     let mut out = plan.describe();
     if let Value::Object(o) = &mut out {
-        o.insert("docsExamined".into(), Value::Int(cands.len() as i64));
-        o.insert("matched".into(), Value::Int(matched as i64));
+        o.insert("docsExamined".into(), Value::Int(examined));
+        o.insert("matched".into(), Value::Int(matched));
     }
     Ok(out)
 }
 
-/// Run an aggregation pipeline. A leading `$match` uses the planner.
+/// Run an aggregation pipeline. Leading `$match` stages, then a `$sort` and
+/// any `$skip`/`$limit`, run as one query: the planner picks an index, the
+/// filter reads stored bytes, and a sort with a limit keeps only the top
+/// documents. The remaining stages run in memory.
 pub fn aggregate(ctx: &Ctx, coll: &str, pipeline: &[Value]) -> Result<Vec<Value>> {
-    let (docs, rest) = match pipeline.first().map(aggregate::stage_parts).transpose()? {
-        Some(("$match", f)) => (find(ctx, coll, f, &FindOptions::default())?, &pipeline[1..]),
-        _ => (find(ctx, coll, &Value::Null, &FindOptions::default())?, pipeline),
+    let mut i = 0;
+    let mut filters = Vec::new();
+    while let Some(("$match", f)) = pipeline.get(i).map(aggregate::stage_parts).transpose()? {
+        filters.push(f.clone());
+        i += 1;
+    }
+    let filter = match filters.len() {
+        0 => Value::Null,
+        1 => filters.pop().expect("one"),
+        _ => obj(vec![("$and", Value::Array(filters))]),
     };
-    aggregate::run(docs, rest)
+    let mut opts = FindOptions::default();
+    if let Some(("$sort", spec)) = pipeline.get(i).map(aggregate::stage_parts).transpose()? {
+        if aggregate::parse_sort(spec)?.is_empty() {
+            return Err(Error::Parse("$sort needs at least one field".into()));
+        }
+        opts.sort = Some(spec.clone());
+        i += 1;
+    }
+    while let Some((name @ ("$skip" | "$limit"), arg)) = pipeline.get(i).map(aggregate::stage_parts).transpose()? {
+        if name == "$skip" {
+            let n = aggregate::count_arg("$skip", arg, true)?;
+            opts.skip = opts.skip.saturating_add(n);
+            opts.limit = opts.limit.map(|l| l.saturating_sub(n));
+        } else {
+            let n = aggregate::count_arg("$limit", arg, false)?;
+            opts.limit = Some(opts.limit.map_or(n, |l| l.min(n)));
+        }
+        i += 1;
+    }
+    // A $group or $count next only needs some fields (or none) of each document.
+    let only = match pipeline.get(i).map(aggregate::stage_parts).transpose()? {
+        Some(("$group", spec)) => aggregate::group_fields(spec),
+        Some(("$count", _)) => Some(BTreeSet::new()),
+        _ => None,
+    };
+    let docs = find_fields(ctx, coll, &filter, &opts, only.as_ref())?;
+    aggregate::run(docs, &pipeline[i..])
 }
 
 // ---------------------------------------------------------- update/delete
@@ -437,11 +585,11 @@ pub fn update(ctx: &mut Ctx, coll: &str, filter: &Value, upd: &Value, multi: boo
     update::validate(upd)?;
     let mut meta = meta_or_default(ctx, coll)?;
     let mut res = UpdateResult::default();
-    let (cands, _) = candidates(ctx, coll, &f, &meta)?;
-    for (key, old) in cands {
-        if !f.eval(&old) {
-            continue;
-        }
+    let plan = index::plan(coll, &f, &meta.indexes);
+    let targets: Vec<Vec<u8>> =
+        matching_raw(ctx, coll, &f, &plan, true, (!multi).then_some(1))?.into_iter().map(|h| h.0).collect();
+    for key in targets {
+        let old = decode(ctx.get_ref(&key).ok_or_else(|| Error::Corrupt("matched document vanished".into()))?)?;
         res.matched += 1;
         let mut new = old.clone();
         update::apply(&mut new, upd, false)?;
@@ -473,12 +621,12 @@ pub fn update(ctx: &mut Ctx, coll: &str, filter: &Value, upd: &Value, multi: boo
 
 /// Delete matching documents, at most `limit` of them when given.
 pub fn delete(ctx: &mut Ctx, coll: &str, filter: &Value, limit: Option<u64>) -> Result<u64> {
-    let (found, meta) = matching(ctx, coll, filter)?;
+    let (f, meta, plan) = prepare(ctx, coll, filter)?;
+    let targets: Vec<Vec<u8>> =
+        matching_raw(ctx, coll, &f, &plan, true, limit.map(|l| l as usize))?.into_iter().map(|h| h.0).collect();
     let mut n = 0;
-    for (key, d) in found {
-        if limit.map_or(false, |l| n >= l) {
-            break;
-        }
+    for key in targets {
+        let d = decode(ctx.get_ref(&key).ok_or_else(|| Error::Corrupt("matched document vanished".into()))?)?;
         remove_doc(ctx, coll, &meta, key, &d);
         n += 1;
     }
