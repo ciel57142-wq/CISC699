@@ -1,0 +1,72 @@
+# planner_bench, 100,000 rows, release build, in-memory, 2026-11-22
+# Model name: Intel(R) Xeon(R) Processor @ 2.30GHz, 4 CPUs, rustc 1.97.0 (2d8144b78 2026-07-07)
+# cargo run --release --example planner_bench 100000
+loaded 100000 rows in 1276 ms
+ANALYZE took 642 ms
+
+query                                     rows    planned   no index  speedup  plan                                                           est     act
+pk equality                                  1     0.01ms    69.27ms 10320.7x  Primary Key Lookup on t                                          1       1
+unique index equality                        1     0.01ms    68.18ms  5542.5x  Index Scan on t using t_uni                                      1       1
+index eq, 0.1% (grp)                        97     0.13ms    67.94ms   539.7x  Index Scan on t using t_grp                                    100      97
+index eq, 1% (flag)                       1022     1.61ms    64.67ms    40.1x  Index Scan on t using t_flag                                  1022    1022
+index eq, 5% (cat)                        5040    11.84ms    74.96ms     6.3x  Index Scan on t using t_cat_score                             5040    5040
+index eq, skewed rare (skew=8)             197     0.30ms    65.33ms   219.4x  Index Scan on t using t_skew                                   197     197
+index eq, skewed common (skew=0)         50088   100.13ms   121.79ms     1.2x  Index Scan on t using t_skew                                 50088   50088
+IN list on index                           413     0.64ms    70.62ms   110.4x  Index IN Scan on t using t_grp                                 399     413
+pk range, 1%                              1001     0.92ms    73.76ms    79.9x  Primary Key Range Scan on t                                   1000    1001
+index range, 0.5%                          481     0.71ms    62.62ms    88.1x  Index Range Scan on t using t_score                            480     481
+index range, 10%                         10120    22.86ms    79.20ms     3.5x  Index Range Scan on t using t_score                          10120   10120
+index range, 60%                         59669   132.30ms   139.17ms     1.1x  Seq Scan on t                                                59680   59669
+composite eq + range                       234     0.37ms    68.97ms   185.2x  Index Scan on t using t_cat_score                              254     234
+composite eq + eq                            0     0.01ms    80.70ms 10476.1x  Index Scan on t using t_cat_score                                1       0
+join, selective dimension                 4973    11.72ms    75.21ms     6.4x  Index Nested Loop (inner)                                     5000    4973
+join, point lookup on dimension            106     0.26ms    71.46ms   274.4x  Index Nested Loop (inner)                                      100     106
+join, filtered fact probes dimension pk     104     0.34ms    65.96ms   195.6x  Index Nested Loop (inner)                                       94     104
+join, large table written first              1     2.09ms    69.59ms    33.2x  Index Nested Loop (inner)                                     1100    1032
+join, both large (hash)                      1   302.13ms   316.82ms     1.0x  Hash Join (inner)                                           100000  100000
+
+# planner_compare (timing only), same data and queries
+# columns: previous engine (commit 367985b) | this engine, no ANALYZE | this engine after ANALYZE
+query                                       rows       time  |        time |        time
+pk equality                                    1     0.00ms  |      0.01ms |      0.01ms
+unique index equality                          1     0.01ms  |      0.01ms |      0.01ms
+index eq, 0.1% (grp)                          97     0.12ms  |      0.15ms |      0.16ms
+index eq, 1% (flag)                         1022     2.09ms  |      1.61ms |      1.52ms
+index eq, 5% (cat)                          5040    14.98ms  |     10.59ms |      8.87ms
+index eq, skewed rare (skew=8)               197     0.28ms  |      0.35ms |      0.26ms
+index eq, skewed common (skew=0)           50088    97.40ms  |     92.18ms |     68.30ms
+IN list on index                             413    86.09ms  |      0.70ms |      0.62ms
+pk range, 1%                                1001     1.07ms  |      0.98ms |      0.93ms
+index range, 0.5%                            481     1.09ms  |      0.87ms |      0.72ms
+index range, 10%                           10120    32.07ms  |     22.74ms |     18.99ms
+index range, 60%                           59669   249.16ms  |    171.84ms |     92.71ms
+composite eq + range                         234     0.59ms  |      0.39ms |      0.39ms
+composite eq + eq                              0     0.01ms  |      0.01ms |      0.01ms
+join, selective dimension                   4973   166.32ms  |      7.72ms |      7.34ms
+join, point lookup on dimension              106    71.53ms  |      0.18ms |      0.18ms
+join, filtered fact probes dimension pk      104     0.65ms  |      0.26ms |      0.24ms
+join, large table written first                1   145.32ms  |      1.75ms |      1.41ms
+join, both large (hash)                        1   244.86ms  |    233.26ms |    235.71ms
+
+# sql_bench 20000 (existing benchmark), previous engine then this engine
+insert users (batches of 500)                     38.5 ms       1.93 us/op  (20000 ops)
+insert orders (batches of 500)                    39.0 ms       1.95 us/op  (20000 ops)
+primary-key point lookup                           6.0 ms       2.98 us/op  (2000 ops)
+secondary-index equality lookup                   32.1 ms     160.66 us/op  (200 ops)
+primary-key range (100 rows)                       9.8 ms      48.88 us/op  (200 ops)
+full scan with filter                            117.6 ms    5881.12 us/op  (20 ops)
+equi-join users x orders (whole tables)           31.7 ms   31650.66 us/op  (1 ops)
+GROUP BY city with aggregates                     47.2 ms    9445.89 us/op  (5 ops)
+UPDATE through the index                          36.3 ms     362.53 us/op  (100 ops)
+DELETE by primary key                              3.4 ms       3.44 us/op  (1000 ops)
+--
+insert users (batches of 500)                     38.9 ms       1.95 us/op  (20000 ops)
+insert orders (batches of 500)                    39.7 ms       1.99 us/op  (20000 ops)
+primary-key point lookup                           6.5 ms       3.23 us/op  (2000 ops)
+secondary-index equality lookup                   30.1 ms     150.54 us/op  (200 ops)
+primary-key range (100 rows)                       9.3 ms      46.49 us/op  (200 ops)
+full scan with filter                            114.1 ms    5704.05 us/op  (20 ops)
+equi-join users x orders (whole tables)           32.3 ms   32300.76 us/op  (1 ops)
+GROUP BY city with aggregates                     46.1 ms    9223.83 us/op  (5 ops)
+UPDATE through the index                          39.7 ms     396.88 us/op  (100 ops)
+DELETE by primary key                              3.8 ms       3.82 us/op  (1000 ops)

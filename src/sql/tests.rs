@@ -117,7 +117,7 @@ fn schemas_and_indexes_in_the_original_format_still_work() {
     assert!(problems(&mut store, "legacy").is_empty());
     assert_eq!(rows(&mut store, "SELECT id FROM legacy WHERE city = 'Oslo' ORDER BY id").len(), 2);
     match sql(&mut store, "EXPLAIN SELECT id FROM legacy WHERE city = 'Oslo'") {
-        Output::Rows { rows, .. } => assert!(rows[0][0].display().contains("index legacy_city"), "{rows:?}"),
+        Output::Rows { rows, .. } => assert!(rows.iter().any(|r| r[0].display().contains("using legacy_city")), "{rows:?}"),
         other => panic!("{other:?}"),
     }
     // writing through the new engine keeps the old index layout readable and consistent
@@ -180,3 +180,4 @@ fn key_encoding_helpers() {
     assert_eq!(prefix_end(&[1, 2, 0xff]), Some(vec![1, 3]));
     assert_eq!(prefix_end(&[0xff, 0xff]), None);
 }
+

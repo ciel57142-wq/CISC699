@@ -326,8 +326,8 @@ fn composite_keys_and_composite_foreign_keys() {
     ok(&mut db, "INSERT INTO enroll VALUES (1, 'cs', 101), (1, 'ma', 101), (2, 'cs', 101), (2, 'cs', 201)");
     fails(&mut db, "INSERT INTO course VALUES ('cs', 101, 'dup')", constraint);
     fails(&mut db, "INSERT INTO enroll VALUES (3, 'cs', 999)", constraint);
-    assert!(plan(&mut db, "SELECT * FROM course WHERE dept = 'cs' AND num = 201").contains("primary key lookup"));
-    assert!(plan(&mut db, "SELECT * FROM course WHERE dept = 'cs'").contains("primary key prefix scan"));
+    assert!(plan(&mut db, "SELECT * FROM course WHERE dept = 'cs' AND num = 201").contains("Primary Key Lookup"));
+    assert!(plan(&mut db, "SELECT * FROM course WHERE dept = 'cs'").contains("Primary Key Prefix Scan"));
     assert_eq!(rows(&mut db, "SELECT title FROM course WHERE dept = 'cs' AND num = 201"), vec![vec![t("Data")]]);
     assert_eq!(ints(&mut db, "SELECT num FROM course WHERE dept = 'cs' ORDER BY num"), vec![101, 201]);
     assert_eq!(ints(&mut db, "SELECT num FROM course WHERE dept = 'cs' AND num > 150"), vec![201]);
@@ -492,8 +492,8 @@ fn inner_left_right_full_and_cross_joins() {
     assert_eq!(one(&mut db, "SELECT COUNT(*) FROM l CROSS JOIN r"), i(9));
     assert_eq!(one(&mut db, "SELECT COUNT(*) FROM l, r WHERE l.k < r.k"), i(3));
     // equi-joins use a hash join, other conditions a nested loop; both give the same answer
-    assert!(plan(&mut db, &q("LEFT")).contains("hash left join"));
-    assert!(plan(&mut db, "SELECT * FROM l JOIN r ON l.k < r.k").contains("nested loop inner join"));
+    assert!(plan(&mut db, &q("LEFT")).contains("Hash Join (left)"));
+    assert!(plan(&mut db, "SELECT * FROM l JOIN r ON l.k < r.k").contains("Nested Loop (inner)"));
     assert_eq!(
         rows(&mut db, "SELECT l.id, r.id FROM l JOIN r ON l.k = r.k AND r.id > 0"),
         rows(&mut db, "SELECT l.id, r.id FROM l JOIN r ON l.k + 0 = r.k + 0 AND r.id > 0")
@@ -617,14 +617,14 @@ fn index_creation_deletion_and_use() {
     let mut db = Database::in_memory();
     shop(&mut db);
     assert_eq!(done(&mut db, "CREATE INDEX cust_city_name ON customers (city, name)"), "index 'cust_city_name' created on customers(city, name)");
-    assert!(plan(&mut db, "SELECT * FROM customers WHERE city = 'London'").contains("index cust_city_name (city =)"));
-    assert!(plan(&mut db, "SELECT * FROM customers WHERE city = 'London' AND name = 'Ada'").contains("(city =, name =)"));
-    assert!(plan(&mut db, "SELECT * FROM customers WHERE city = 'London' AND name > 'B'").contains("(city =, name range)"));
-    assert!(plan(&mut db, "SELECT * FROM customers WHERE email = 'ada@x.org'").contains("index customers_email_key"));
-    assert!(plan(&mut db, "SELECT * FROM customers WHERE id IN (1, 3)").contains("primary key IN lookup (2 keys)"));
-    assert!(plan(&mut db, "SELECT * FROM customers WHERE id BETWEEN 2 AND 3").contains("primary key range scan"));
-    assert!(plan(&mut db, "SELECT * FROM customers WHERE id = -1").contains("primary key lookup"));
-    assert!(plan(&mut db, "SELECT * FROM customers WHERE name = 'Ada'").contains("full scan"));
+    assert!(plan(&mut db, "SELECT * FROM customers WHERE city = 'London'").contains("using cust_city_name"));
+    assert!(plan(&mut db, "SELECT * FROM customers WHERE city = 'London' AND name = 'Ada'").contains("Index Cond: city = 'London' AND name = 'Ada'"));
+    assert!(plan(&mut db, "SELECT * FROM customers WHERE city = 'London' AND name > 'B'").contains("Index Cond: city = 'London' AND name > 'B'"));
+    assert!(plan(&mut db, "SELECT * FROM customers WHERE email = 'ada@x.org'").contains("using customers_email_key"));
+    assert!(plan(&mut db, "SELECT * FROM customers WHERE id IN (1, 3)").contains("Primary Key IN Lookup on customers"));
+    assert!(plan(&mut db, "SELECT * FROM customers WHERE id BETWEEN 2 AND 3").contains("Primary Key Range Scan"));
+    assert!(plan(&mut db, "SELECT * FROM customers WHERE id = -1").contains("Primary Key Lookup"));
+    assert!(plan(&mut db, "SELECT * FROM customers WHERE name = 'Ada'").contains("Seq Scan"));
     assert_eq!(ints(&mut db, "SELECT id FROM customers WHERE city = 'London' AND name > 'Ab'"), vec![1, 4]);
     assert_eq!(ints(&mut db, "SELECT id FROM customers WHERE city = 'London' AND name > 'Ae'"), vec![4]);
     assert_eq!(ints(&mut db, "SELECT id FROM customers WHERE id BETWEEN 2 AND 3"), vec![2, 3]);
@@ -636,7 +636,7 @@ fn index_creation_deletion_and_use() {
     fails(&mut db, "CREATE INDEX i2 ON customers (city, city)", schema);
     fails(&mut db, "CREATE UNIQUE INDEX cu ON customers (city)", constraint);
     assert_eq!(done(&mut db, "DROP INDEX cust_city_name"), "index 'cust_city_name' dropped");
-    assert!(plan(&mut db, "SELECT * FROM customers WHERE city = 'London'").contains("full scan"));
+    assert!(plan(&mut db, "SELECT * FROM customers WHERE city = 'London'").contains("Seq Scan"));
     fails(&mut db, "DROP INDEX cust_city_name", schema);
     assert_eq!(done(&mut db, "DROP INDEX IF EXISTS cust_city_name"), "index 'cust_city_name' does not exist, nothing dropped");
     // a unique constraint that a foreign key relies on cannot be dropped
@@ -659,7 +659,7 @@ fn unique_index_enforces_and_tolerates_nulls() {
     assert_eq!(ints(&mut db, "SELECT id FROM t WHERE a IS NULL ORDER BY id"), vec![2, 3, 4]);
     ok(&mut db, "CREATE INDEX t_ba ON t (b, a)");
     assert_eq!(ints(&mut db, "SELECT id FROM t WHERE b = 'x' ORDER BY id"), vec![1, 2, 4]);
-    assert!(plan(&mut db, "SELECT id FROM t WHERE b = 'x'").contains("index t_ba"));
+    assert!(plan(&mut db, "SELECT id FROM t WHERE b = 'x'").contains("using t_ba"));
     consistent(&mut db);
 }
 
@@ -691,8 +691,8 @@ fn indexes_stay_consistent_through_updates_and_deletes() {
         let a = ints(&mut db, &format!("SELECT id FROM t WHERE {indexed} ORDER BY id"));
         let b = ints(&mut db, &format!("SELECT id FROM t WHERE {scan} ORDER BY id"));
         assert_eq!(a, b, "{indexed}");
-        assert!(plan(&mut db, &format!("SELECT id FROM t WHERE {scan}")).contains("full scan"));
-        assert!(!plan(&mut db, &format!("SELECT id FROM t WHERE {indexed}")).contains("full scan"), "{indexed}");
+        assert!(plan(&mut db, &format!("SELECT id FROM t WHERE {scan}")).contains("Seq Scan"));
+        assert!(!plan(&mut db, &format!("SELECT id FROM t WHERE {indexed}")).contains("Seq Scan"), "{indexed}");
     }
 }
 
@@ -773,7 +773,7 @@ fn alter_table_add_drop_and_rename_columns() {
     ok(&mut db, "ALTER TABLE customers RENAME COLUMN city TO town");
     ok(&mut db, "ALTER TABLE customers RENAME points TO pts");
     ok(&mut db, "ALTER TABLE customers RENAME COLUMN id TO cid");
-    assert!(plan(&mut db, "SELECT * FROM customers WHERE town = 'London'").contains("index cust_city (town =)"));
+    assert!(plan(&mut db, "SELECT * FROM customers WHERE town = 'London'").contains("Index Cond: town = 'London'"));
     assert_eq!(ints(&mut db, "SELECT cid FROM customers WHERE town = 'London' ORDER BY cid"), vec![1, 4]);
     fails(&mut db, "UPDATE customers SET pts = -1", constraint);
     fails(&mut db, "INSERT INTO orders (customer_id, total) VALUES (99, 1)", constraint);
@@ -799,7 +799,7 @@ fn alter_table_rename_table_keeps_data_indexes_and_references() {
     ok(&mut db, "ALTER TABLE customers RENAME TO clients");
     fails(&mut db, "SELECT * FROM customers", schema);
     assert_eq!(one(&mut db, "SELECT COUNT(*) FROM clients"), i(4));
-    assert!(plan(&mut db, "SELECT * FROM clients WHERE email = 'ada@x.org'").contains("index customers_email_key"));
+    assert!(plan(&mut db, "SELECT * FROM clients WHERE email = 'ada@x.org'").contains("using customers_email_key"));
     fails(&mut db, "INSERT INTO clients (id, name, email) VALUES (9, 'x', 'ada@x.org')", constraint);
     fails(&mut db, "INSERT INTO orders (customer_id) VALUES (42)", constraint);
     assert!(rows(&mut db, "DESCRIBE orders")[1][5].display().contains("references clients(id)"));
@@ -832,7 +832,7 @@ fn alter_column_defaults_nullability_and_types() {
     ok(&mut db, "CREATE INDEX t_n ON t (n)");
     ok(&mut db, "ALTER TABLE t ALTER COLUMN n TYPE INT");
     assert_eq!(ints(&mut db, "SELECT n FROM t WHERE n > 15 ORDER BY n"), vec![20, 30, 40]);
-    assert!(plan(&mut db, "SELECT * FROM t WHERE n = 20").contains("index t_n"));
+    assert!(plan(&mut db, "SELECT * FROM t WHERE n = 20").contains("using t_n"));
     fails(&mut db, "INSERT INTO t (id, n) VALUES (6, 'oops'::INT + 0)", type_err);
     consistent(&mut db);
 }

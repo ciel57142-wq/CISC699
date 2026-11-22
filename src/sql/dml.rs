@@ -523,5 +523,6 @@ pub(super) fn truncate(ctx: &mut Ctx, table: &str) -> Result<Output> {
             ctx.delete(k);
         }
     }
+    super::stats::forget(ctx, &s.name);
     Ok(Output::Done(format!("table '{table}' truncated")))
 }

@@ -284,6 +284,7 @@ pub(super) fn drop_table(ctx: &mut Ctx, name: &str, if_exists: bool, cascade: bo
         }
     }
     ctx.delete(keys::table_meta(name));
+    super::stats::forget(ctx, name);
     delete_sequences(ctx, name);
     Ok(Output::Done(format!("table '{name}' dropped")))
 }
@@ -442,6 +443,8 @@ fn rewrite_rows(ctx: &mut Ctx, s: &Schema, mut f: impl FnMut(&mut Ctx, Vec<Value
 pub(super) fn alter_table(ctx: &mut Ctx, table: &str, actions: Vec<Alter>) -> Result<Output> {
     let mut table = table.to_string();
     let original = table.clone();
+    // column names, types and keys may change: the statistics no longer apply
+    super::stats::forget(ctx, &table);
     for action in actions {
         let mut s = Schema::load(ctx, &table)?;
         match action {
@@ -878,4 +881,56 @@ pub(super) fn reindex(ctx: &mut Ctx, table: Option<&str>) -> Result<Output> {
         }
     }
     Ok(Output::Done(format!("{n} index(es) rebuilt on {} table(s)", names.len())))
+}
+
+/// Gather planner statistics for one or all tables.
+pub(super) fn analyze(ctx: &mut Ctx, table: Option<&str>) -> Result<Output> {
+    let names = match table {
+        Some(t) => vec![Schema::load(ctx, t)?.name],
+        None => tables(ctx),
+    };
+    let mut rows = Vec::new();
+    for t in &names {
+        let s = Schema::load(ctx, t)?;
+        let st = super::stats::analyze_table(ctx, &s)?;
+        rows.push(vec![Value::Text(t.clone()), Value::Int(st.rows as i64), Value::Int(s.cols.len() as i64)]);
+        super::stats::save(ctx, t, &st);
+    }
+    let columns = ["table", "rows", "columns"].iter().map(|s| s.to_string()).collect();
+    Ok(Output::Rows { columns, rows })
+}
+
+/// What `repair_indexes` found and did.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct RepairReport {
+    pub tables_checked: usize,
+    /// Tables whose index entries did not match their rows and were rebuilt.
+    pub rebuilt: Vec<String>,
+    /// The problems found, as `table: check: detail`.
+    pub problems: Vec<String>,
+}
+
+/// Verify every index entry of every table against the rows and rebuild the
+/// indexes of any table where they disagree (missing, orphaned or stray
+/// entries). Used after recovery; a no-op on a consistent database.
+pub fn repair_indexes(ctx: &mut Ctx) -> Result<RepairReport> {
+    let mut report = RepairReport::default();
+    for t in tables(ctx) {
+        let s = Schema::load(ctx, &t)?;
+        report.tables_checked += 1;
+        let mut bad = false;
+        for r in check_one(ctx, &s)? {
+            let check = r[1].display();
+            let detail = r[3].display();
+            if r[2] != Value::Text("ok".into()) && check.starts_with("index") && !detail.contains("duplicate") {
+                bad = true;
+                report.problems.push(format!("{t}: {check}: {detail}"));
+            }
+        }
+        if bad {
+            reindex(ctx, Some(&t))?;
+            report.rebuilt.push(t);
+        }
+    }
+    Ok(report)
 }

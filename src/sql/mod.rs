@@ -10,17 +10,23 @@
 //! | `parser.rs`  | lexer, parser, expression printer                           |
 //! | `catalog.rs` | schemas, row and index-entry layout                         |
 //! | `eval.rs`    | expression evaluation, functions, aggregates, subqueries    |
-//! | `query.rs`   | access-path selection, joins, grouping, set operations      |
+//! | `access.rs`  | predicates, access paths (key / index / range / scan), probes |
+//! | `stats.rs`   | ANALYZE statistics, selectivity and cardinality estimates   |
+//! | `query.rs`   | pushdown, join order and algorithms, grouping, set ops      |
+//! | `plan.rs`    | operator tree for EXPLAIN and EXPLAIN ANALYZE               |
 //! | `dml.rs`     | INSERT / UPDATE / DELETE and constraint enforcement         |
 //! | `ddl.rs`     | CREATE / DROP / ALTER, indexes, CHECK TABLE, REINDEX        |
 
+mod access;
 mod ast;
 mod catalog;
 mod ddl;
 mod dml;
 mod eval;
 mod parser;
+mod plan;
 mod query;
+mod stats;
 #[cfg(test)]
 mod tests;
 
@@ -32,6 +38,7 @@ use ast::Stmt;
 use eval::QCtx;
 
 pub use catalog::tables;
+pub use ddl::{repair_indexes, RepairReport};
 
 /// Does this statement only read? (Read-only statements take the shared lock.)
 pub fn is_read_only(statement: &str) -> bool {
@@ -57,13 +64,23 @@ pub fn execute(ctx: &mut Ctx, sql: &str) -> Result<Output> {
             let (columns, rows) = query::run_query(&q, &query, None, 0)?;
             Ok(Output::Rows { columns, rows })
         }
-        Stmt::Explain(query) => {
-            let mut q = QCtx::new(ctx);
-            q.explain = true;
-            query::run_query(&q, &query, None, 0)?;
-            let rows = q.plan.into_inner().into_iter().map(|l| vec![Value::Text(l)]).collect();
+        Stmt::Explain { query, analyze } => {
+            let mut q = QCtx::explaining(ctx, analyze);
+            let start = std::time::Instant::now();
+            let out = query::run_query_node(&q, &query, None, 0)?;
+            let elapsed = start.elapsed();
+            let mut prof = q.prof.take().expect("explaining").into_inner();
+            if analyze {
+                prof.note(format!(
+                    "Execution time: {:.3} ms ({} row(s) returned)",
+                    elapsed.as_secs_f64() * 1e3,
+                    out.rows.len()
+                ));
+            }
+            let rows = prof.render().into_iter().map(|l| vec![Value::Text(l)]).collect();
             Ok(Output::Rows { columns: vec!["plan".into()], rows })
         }
+        Stmt::Analyze(table) => ddl::analyze(ctx, table.as_deref()),
         Stmt::Describe(table) => ddl::describe(ctx, &table),
         Stmt::CheckTable(table) => ddl::check_tables(ctx, table.as_deref()),
         Stmt::Reindex(table) => ddl::reindex(ctx, table.as_deref()),
