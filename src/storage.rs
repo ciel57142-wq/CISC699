@@ -4,6 +4,19 @@
 //! Every commit is one WAL record holding the whole write set, so a commit is
 //! atomic on disk: after a crash it is either fully replayed or (if the record
 //! is torn) fully discarded.
+//!
+//! A database directory contains:
+//!
+//! ```text
+//! polydb.format   magic line, format version, whether a snapshot exists
+//! LOCK            exclusive OS lock held while a process has the database open
+//! data.wal        commit log: one checksummed record per commit, fsynced before ack
+//! data.snap       full snapshot (same record layout), after the first checkpoint
+//! ```
+//!
+//! The ordered map is an in-memory *cache* of the files: every change reaches
+//! `data.wal` (and is fsynced) before it is applied to the map, and the map is
+//! rebuilt from `data.snap` + `data.wal` whenever the database is opened.
 
 use crate::error::{Error, Result};
 use std::cell::RefCell;
@@ -181,6 +194,92 @@ pub struct OpenOptions {
 
 const LOCK_FILE: &str = "LOCK";
 
+/// Marks a directory as an initialised polydb database and records the
+/// on-disk format version. Written at creation (and rewritten when the first
+/// snapshot appears), always by atomic rename.
+const FORMAT_FILE: &str = "polydb.format";
+const FORMAT_MAGIC: &str = "polydb-storage";
+/// Version 1 is the log/snapshot record layout described at [`frame`]. It is
+/// the layout earlier releases already wrote, so directories without a format
+/// file are version 1 too.
+pub const FORMAT_VERSION: u32 = 1;
+
+#[derive(Clone, Copy)]
+struct Format {
+    version: u32,
+    /// A snapshot has been written, so `data.snap` must exist from now on.
+    snapshot: bool,
+}
+
+impl Format {
+    fn text(self) -> String {
+        format!(
+            "{FORMAT_MAGIC}\nversion={}\nsnapshot={}\n",
+            self.version, self.snapshot as u8
+        )
+    }
+
+    fn read(path: &Path) -> Result<Format> {
+        let text = fs::read_to_string(path)?;
+        let bad = || {
+            Error::Corrupt(format!(
+                "{} is not a valid polydb format file",
+                path.display()
+            ))
+        };
+        let mut lines = text.lines();
+        if lines.next() != Some(FORMAT_MAGIC) {
+            return Err(bad());
+        }
+        let (mut version, mut snapshot) = (None, false);
+        for line in lines.filter(|l| !l.trim().is_empty()) {
+            match line.split_once('=') {
+                Some(("version", v)) => version = Some(v.trim().parse::<u32>().map_err(|_| bad())?),
+                Some(("snapshot", v)) => snapshot = v.trim() == "1",
+                Some(_) => {} // keys added by later minor revisions are ignored
+                None => return Err(bad()),
+            }
+        }
+        match version {
+            Some(v) if v >= 1 => Ok(Format {
+                version: v,
+                snapshot,
+            }),
+            _ => Err(bad()),
+        }
+    }
+}
+
+/// Make directory entries (new files, renames) durable. Only Unix lets a
+/// directory be opened and fsynced; elsewhere the file system's own metadata
+/// journaling is relied on.
+fn sync_dir(dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    File::open(dir)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
+/// Replace `dir/name` with `contents` so that a crash leaves either the old
+/// or the new file, never a mix: temp file, fsync, rename, fsync directory.
+fn write_atomic(dir: &Path, name: &str, contents: &[u8]) -> Result<()> {
+    let tmp = dir.join(format!("{name}.tmp"));
+    let res = (|| -> Result<()> {
+        let mut f = File::create(&tmp)?;
+        f.write_all(contents)?;
+        f.sync_all()?;
+        Ok(())
+    })();
+    if let Err(e) = res {
+        // Best effort only: a leftover temp file is harmless and is removed at the next open.
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    fs::rename(&tmp, dir.join(name))?;
+    sync_dir(dir)
+}
+
 pub struct Store {
     map: BTreeMap<Vec<u8>, Vec<u8>>,
     /// Held for the lifetime of the store: an exclusive OS lock on `dir/LOCK`
@@ -189,6 +288,17 @@ pub struct Store {
     dir: Option<PathBuf>,
     wal: Option<File>,
     wal_len: u64,
+    /// The format file already records that a snapshot exists.
+    snapshot_recorded: bool,
+    /// Set when a write failed in a way that leaves the log's on-disk state
+    /// unknown (failed fsync, failed rollback). All further writes are refused
+    /// until the database is reopened.
+    failed: Option<String>,
+    /// After a failed automatic checkpoint, do not retry before the log reaches this size.
+    checkpoint_retry_at: u64,
+    last_checkpoint_error: Option<String>,
+    /// Bytes of an interrupted final log record that recovery removed at open.
+    discarded_tail: u64,
     /// fsync the WAL on every commit (default true). Turning this off trades
     /// durability of the last few commits on power loss for speed.
     pub sync: bool,
@@ -217,19 +327,47 @@ impl Store {
             dir: None,
             wal: None,
             wal_len: 0,
+            snapshot_recorded: false,
+            failed: None,
+            checkpoint_retry_at: 0,
+            last_checkpoint_error: None,
+            discarded_tail: 0,
             sync: true,
             checkpoint_bytes: 64 << 20,
         }
     }
 
-    /// Open (or create) a store in `dir`, recovering from the snapshot and WAL.
+    /// Open the database in `dir`, or create one if `dir` does not exist or
+    /// is an empty directory, recovering from the snapshot and WAL.
+    ///
+    /// Refuses (rather than starting empty) when the directory holds other
+    /// files, is locked, has a newer format version, is missing a file it is
+    /// known to have had, or has damage recovery cannot attribute to an
+    /// interrupted commit.
     pub fn open(dir: impl AsRef<Path>) -> Result<Store> {
         Store::open_with(dir, &OpenOptions::default())
     }
 
     pub fn open_with(dir: impl AsRef<Path>, opts: &OpenOptions) -> Result<Store> {
         let dir = dir.as_ref().to_path_buf();
-        fs::create_dir_all(&dir)?;
+        match fs::metadata(&dir) {
+            Ok(m) if !m.is_dir() => {
+                return Err(Error::Storage(format!(
+                    "'{}' exists and is not a directory",
+                    dir.display()
+                )))
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir_all(&dir)?;
+                let parent = match dir.parent() {
+                    Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+                    _ => PathBuf::from("."),
+                };
+                sync_dir(&parent)?;
+            }
+            Err(e) => return Err(e.into()),
+        }
         let lock = OpenOptions_::new()
             .read(true)
             .write(true)
@@ -261,10 +399,96 @@ impl Store {
             }
             Err(fs::TryLockError::Error(e)) => return Err(e.into()),
         }
-        let mut map = BTreeMap::new();
 
+        let wal_path = dir.join(WAL_FILE);
         let snap = dir.join(SNAPSHOT_FILE);
-        if snap.exists() {
+        let format_path = dir.join(FORMAT_FILE);
+        let has_wal = wal_path.try_exists()?;
+        let has_snap = snap.try_exists()?;
+        let format = if format_path.try_exists()? {
+            let f = Format::read(&format_path)?;
+            if f.version > FORMAT_VERSION {
+                return Err(Error::Storage(format!(
+                    "database '{}' uses storage format {}, but this polydb supports up to {FORMAT_VERSION}; use a newer polydb",
+                    dir.display(),
+                    f.version
+                )));
+            }
+            if !has_wal {
+                return Err(Error::Corrupt(format!(
+                    "{} is missing from an initialised database; refusing to open it as empty (restore the directory from a backup)",
+                    wal_path.display()
+                )));
+            }
+            if f.snapshot && !has_snap {
+                return Err(Error::Corrupt(format!(
+                    "{} is missing although a checkpoint was written; refusing to open a partial database (restore the directory from a backup)",
+                    snap.display()
+                )));
+            }
+            f
+        } else if has_wal {
+            // Written by a release without format files. The record layout is
+            // unchanged, so just record it as version 1.
+            let f = Format {
+                version: 1,
+                snapshot: has_snap,
+            };
+            write_atomic(&dir, FORMAT_FILE, f.text().as_bytes())?;
+            f
+        } else if has_snap {
+            return Err(Error::Corrupt(format!(
+                "{} exists but {} is missing; refusing to open a partial database",
+                snap.display(),
+                wal_path.display()
+            )));
+        } else {
+            // A new database. Only initialise into an empty directory (our own
+            // lock file, leftovers of an interrupted initialisation and a mount
+            // point's `lost+found` aside), so pointing polydb at the wrong
+            // directory cannot bury files there.
+            let tmp_format = format!("{FORMAT_FILE}.tmp");
+            for entry in fs::read_dir(&dir)? {
+                let name = entry?.file_name();
+                if name != LOCK_FILE && name != tmp_format.as_str() && name != "lost+found" {
+                    return Err(Error::Storage(format!(
+                        "'{}' is not empty and is not a polydb database (found '{}'); refusing to create a database there",
+                        dir.display(),
+                        name.to_string_lossy()
+                    )));
+                }
+            }
+            // The log first, then the format file: a crash in between leaves
+            // a log without a format file, which the branch above adopts.
+            OpenOptions_::new()
+                .write(true)
+                .create_new(true)
+                .open(&wal_path)?
+                .sync_all()?;
+            sync_dir(&dir)?;
+            let f = Format {
+                version: FORMAT_VERSION,
+                snapshot: false,
+            };
+            write_atomic(&dir, FORMAT_FILE, f.text().as_bytes())?;
+            f
+        };
+
+        // Temp files of an interrupted checkpoint or format rewrite carry nothing that is not elsewhere.
+        let mut removed = false;
+        for name in [format!("{SNAPSHOT_FILE}.tmp"), format!("{FORMAT_FILE}.tmp")] {
+            let p = dir.join(name);
+            if p.try_exists()? {
+                fs::remove_file(&p)?;
+                removed = true;
+            }
+        }
+        if removed {
+            sync_dir(&dir)?;
+        }
+
+        let mut map = BTreeMap::new();
+        if has_snap {
             let buf = fs::read(&snap)?;
             if replay(&buf, &mut map) != LogTail::Clean {
                 return Err(Error::Corrupt(format!(
@@ -274,19 +498,21 @@ impl Store {
             }
         }
 
-        let wal_path = dir.join(WAL_FILE);
         let mut wal = OpenOptions_::new()
             .read(true)
             .append(true)
-            .create(true)
             .open(&wal_path)?;
         let mut buf = Vec::new();
         wal.read_to_end(&mut buf)?;
+        let mut discarded = 0;
         let valid = match replay(&buf, &mut map) {
             LogTail::Clean => buf.len(),
             // A torn final record from a crash mid-commit: that commit never
             // completed (or was never acknowledged), so drop it.
-            LogTail::Torn { valid } => valid,
+            LogTail::Torn { valid } => {
+                discarded = (buf.len() - valid) as u64;
+                valid
+            }
             LogTail::Corrupt { valid, reason } => {
                 if !opts.salvage {
                     return Err(Error::Corrupt(format!(
@@ -302,15 +528,55 @@ impl Store {
             wal.set_len(valid)?;
             wal.sync_all()?;
         }
+        let mut snapshot_recorded = format.snapshot;
+        if has_snap && !format.snapshot {
+            // A checkpoint finished its rename but crashed before recording it.
+            let f = Format {
+                snapshot: true,
+                ..format
+            };
+            write_atomic(&dir, FORMAT_FILE, f.text().as_bytes())?;
+            snapshot_recorded = true;
+        }
         Ok(Store {
             map,
             _lock: Some(lock),
             dir: Some(dir),
             wal: Some(wal),
             wal_len: valid,
+            snapshot_recorded,
+            failed: None,
+            checkpoint_retry_at: 0,
+            last_checkpoint_error: None,
+            discarded_tail: discarded,
             sync: true,
             checkpoint_bytes: 64 << 20,
         })
+    }
+
+    /// Whether this store is backed by files.
+    pub fn is_durable(&self) -> bool {
+        self.dir.is_some()
+    }
+
+    /// Bytes of an interrupted final commit that recovery removed when opening.
+    pub fn discarded_tail_bytes(&self) -> u64 {
+        self.discarded_tail
+    }
+
+    /// Why the most recent automatic checkpoint failed, if it did. Commits
+    /// stay durable in the log meanwhile; the log just keeps growing.
+    pub fn last_checkpoint_error(&self) -> Option<&str> {
+        self.last_checkpoint_error.as_deref()
+    }
+
+    fn check_writable(&self) -> Result<()> {
+        match &self.failed {
+            None => Ok(()),
+            Some(why) => Err(Error::Storage(format!(
+                "writes are disabled after an earlier storage failure ({why}); reopen the database to recover"
+            ))),
+        }
     }
 
     pub fn get(&self, key: &[u8]) -> Option<&Vec<u8>> {
@@ -346,20 +612,38 @@ impl Store {
         self.map.is_empty()
     }
 
-    /// Atomically and durably apply a write set.
+    /// Atomically and durably apply a write set. When this returns `Ok` (and
+    /// `sync` is on, the default) the commit is on stable storage.
     pub fn commit(&mut self, ws: WriteSet) -> Result<()> {
         if ws.is_empty() {
             return Ok(());
         }
+        self.check_writable()?;
         if let Some(wal) = self.wal.as_mut() {
             let rec = frame(ws.iter().map(|(k, v)| (k.as_slice(), v.as_deref())));
-            let res =
-                wal.write_all(&rec)
-                    .and_then(|_| if self.sync { wal.sync_data() } else { Ok(()) });
-            if let Err(e) = res {
-                // Roll the log back so a half-written record cannot sit in front of later commits.
-                let _ = wal.set_len(self.wal_len);
+            if let Err(e) = wal.write_all(&rec) {
+                // Cut off whatever part of the record reached the file, so it
+                // cannot sit in front of later commits.
+                if let Err(e2) = wal.set_len(self.wal_len).and_then(|_| wal.sync_data()) {
+                    self.failed = Some(format!(
+                        "log write failed ({e}) and could not be rolled back ({e2})"
+                    ));
+                }
                 return Err(e.into());
+            }
+            if self.sync {
+                if let Err(e) = wal.sync_data() {
+                    // After a failed fsync the kernel may have dropped the
+                    // dirty pages, so the log's on-disk content is unknown.
+                    // The commit is reported as failed, the record is cut
+                    // off, and no later commit may build on this log.
+                    let rollback = match wal.set_len(self.wal_len) {
+                        Ok(()) => String::new(),
+                        Err(e2) => format!("; rollback also failed: {e2}"),
+                    };
+                    self.failed = Some(format!("fsync of {WAL_FILE} failed: {e}{rollback}"));
+                    return Err(e.into());
+                }
             }
             self.wal_len += rec.len() as u64;
         }
@@ -373,21 +657,32 @@ impl Store {
                 }
             }
         }
-        if self.wal.is_some() && self.wal_len > self.checkpoint_bytes {
-            self.checkpoint()?;
+        if self.wal.is_some() && self.wal_len > self.checkpoint_bytes.max(self.checkpoint_retry_at)
+        {
+            if let Err(e) = self.checkpoint() {
+                // The commit itself is already durable in the log, so it has
+                // succeeded. Report the checkpoint failure and retry later.
+                eprintln!(
+                    "polydb: warning: automatic checkpoint failed, will retry (commits remain durable in {WAL_FILE}): {e}"
+                );
+                self.last_checkpoint_error = Some(e.to_string());
+                self.checkpoint_retry_at = self.wal_len.saturating_add(self.checkpoint_bytes);
+            }
         }
         Ok(())
     }
 
     /// Write a full snapshot and empty the WAL. Safe at any crash point: the
     /// snapshot is swapped in by atomic rename, and replaying a stale WAL over
-    /// a newer snapshot is idempotent.
+    /// a newer snapshot is idempotent. Never needed for durability, only to
+    /// bound the log's size and the time recovery takes.
     pub fn checkpoint(&mut self) -> Result<()> {
         let Some(dir) = self.dir.clone() else {
             return Ok(());
         };
+        self.check_writable()?;
         let tmp = dir.join(format!("{SNAPSHOT_FILE}.tmp"));
-        {
+        let res = (|| -> Result<()> {
             let mut f = File::create(&tmp)?;
             let mut chunk: Vec<(&[u8], Option<&[u8]>)> = Vec::with_capacity(SNAPSHOT_CHUNK);
             for (k, v) in &self.map {
@@ -400,16 +695,34 @@ impl Store {
                 f.write_all(&frame(chunk.drain(..)))?;
             }
             f.sync_all()?;
+            Ok(())
+        })();
+        if let Err(e) = res {
+            // Best effort only: a leftover temp file is harmless and is removed at the next open.
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
         }
         fs::rename(&tmp, dir.join(SNAPSHOT_FILE))?;
-        if let Ok(d) = File::open(&dir) {
-            let _ = d.sync_all(); // persist the rename where the platform allows it
+        sync_dir(&dir)?;
+        if !self.snapshot_recorded {
+            let f = Format {
+                version: FORMAT_VERSION,
+                snapshot: true,
+            };
+            write_atomic(&dir, FORMAT_FILE, f.text().as_bytes())?;
+            self.snapshot_recorded = true;
         }
+        // Only now, with the snapshot durable, may the log be emptied.
         if let Some(wal) = self.wal.as_mut() {
             wal.set_len(0)?;
-            wal.sync_all()?;
+            self.wal_len = 0;
+            if let Err(e) = wal.sync_all() {
+                self.failed = Some(format!("fsync of {WAL_FILE} after truncation failed: {e}"));
+                return Err(e.into());
+            }
         }
-        self.wal_len = 0;
+        self.checkpoint_retry_at = 0;
+        self.last_checkpoint_error = None;
         Ok(())
     }
 }

@@ -28,9 +28,14 @@ A database directory (default `./polydb-data`) holds at most three files:
 
 | File | Content |
 |---|---|
+| `polydb.format` | text: format magic, format version, whether a snapshot exists |
+| `LOCK` | empty; locked while a process has the database open |
 | `data.wal` | write-ahead log: one checksummed record per commit |
 | `data.snap` | full snapshot, written by `CHECKPOINT` or when the log passes 64 MB |
-| `data.snap.tmp` | exists only while a checkpoint is being written |
+| `data.snap.tmp`, `polydb.format.tmp` | exist only while a checkpoint or format update is being written |
+| `data.wal.corrupt` | only after opening a damaged log with `salvage` |
+
+`--memory` creates none of them. Details are in [STORAGE.md](STORAGE.md).
 
 These are binary files in polydb's own format and contain whatever the user stored. They are listed in `.gitignore` and must not be committed. Tests that need files create them under the operating system's temporary directory in folders named `polydb-test-*` and `polydb-harden-*`, and delete them when the test passes. A failed test can leave its folder behind; it is safe to delete.
 

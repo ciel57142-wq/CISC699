@@ -189,6 +189,7 @@ pub(crate) fn error_kind(e: &Error) -> &'static str {
         Error::Constraint(_) => "constraint",
         Error::Type(_) => "type",
         Error::Corrupt(_) => "corrupt",
+        Error::Storage(_) => "storage",
         Error::Txn(_) => "transaction",
         Error::Conflict(_) => "conflict",
         Error::Cancelled(_) => "cancelled",

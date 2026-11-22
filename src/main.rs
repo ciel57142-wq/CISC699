@@ -12,6 +12,11 @@ USAGE
   polydb serve [DIRECTORY]      network server for many clients (see SERVER below)
   polydb client [HOST:PORT]     shell connected to a server (default 127.0.0.1:7878)
 
+Data in a DIRECTORY is durable: every acknowledged write is fsynced to its
+write-ahead log and survives the process exiting or being killed. CHECKPOINT
+is optional; it only compacts the log. A new database is created only in a
+missing or empty directory.
+
 One command per line; in the interactive shell SQL/PBSQL statements end
 with ';' and may span several lines. Commands can also be piped in on stdin
 (a line that is visibly unfinished, or ends with '\\', continues on the next).
@@ -77,7 +82,13 @@ fn open(path: Option<&str>, memory: bool) -> Database {
         return Database::in_memory();
     }
     let path = path.unwrap_or("polydb-data");
-    Database::open(path).unwrap_or_else(|e| die(&format!("cannot open database at '{path}': {e}")))
+    let db = Database::open(path)
+        .unwrap_or_else(|e| die(&format!("cannot open database at '{path}': {e}")));
+    let torn = db.recovered_torn_bytes();
+    if torn > 0 {
+        eprintln!("recovery: discarded {torn} byte(s) of an interrupted final commit in '{path}'");
+    }
+    db
 }
 
 /// Is the buffered text visibly unfinished (open quote/bracket, trailing
@@ -361,10 +372,25 @@ fn main() {
         return;
     }
 
-    let db = std::cell::RefCell::new(open(
-        first.filter(|a| *a != "--memory"),
-        first == Some("--memory"),
-    ));
+    let memory = args.iter().any(|a| a == "--memory");
+    if let Some(bad) = args
+        .iter()
+        .find(|a| a.starts_with("--") && *a != "--memory")
+    {
+        die(&format!("unknown option {bad}; see polydb --help"));
+    }
+    let dirs: Vec<&str> = args
+        .iter()
+        .map(String::as_str)
+        .filter(|a| !a.starts_with("--"))
+        .collect();
+    if dirs.len() > 1 {
+        die("give at most one DIRECTORY; see polydb --help");
+    }
+    if memory && !dirs.is_empty() {
+        die("--memory keeps nothing on disk and cannot be combined with a DIRECTORY");
+    }
+    let db = std::cell::RefCell::new(open(dirs.first().copied(), memory));
     repl(
         &mut || {
             if db.borrow().in_transaction() {

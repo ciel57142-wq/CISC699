@@ -284,7 +284,14 @@ impl Database {
         })
     }
 
-    /// Open or create a durable database in directory `path`.
+    /// Open the durable database in directory `path`, or create one there if
+    /// `path` does not exist or is an empty directory.
+    ///
+    /// Every successful commit is in the write-ahead log and fsynced before
+    /// it is acknowledged, so it survives the process being killed. Opening
+    /// recovers automatically; it fails (instead of starting empty) if the
+    /// directory is locked, holds non-polydb files, is missing files it is
+    /// known to have, or is damaged in a way a crash cannot explain.
     pub fn open(path: impl AsRef<Path>) -> Result<Database> {
         Ok(Database::from_store(Store::open(path)?))
     }
@@ -342,6 +349,24 @@ impl Database {
     /// most recent commits can be lost on power failure (never corrupted).
     pub fn set_sync(&mut self, sync: bool) {
         self.write_lock().store.sync = sync;
+    }
+
+    /// Fold the log into a snapshot automatically once it passes `bytes`
+    /// (default 64 MB). This bounds log size and recovery time; it has no
+    /// effect on durability, which comes from the log alone.
+    pub fn set_checkpoint_threshold(&mut self, bytes: u64) {
+        self.write_lock().store.checkpoint_bytes = bytes;
+    }
+
+    /// Whether this database is backed by files (false for [`Database::in_memory`]).
+    pub fn is_durable(&self) -> bool {
+        self.read_lock().store.is_durable()
+    }
+
+    /// Bytes of an interrupted, never-acknowledged final commit that recovery
+    /// discarded when the database was opened (0 after a clean shutdown).
+    pub fn recovered_torn_bytes(&self) -> u64 {
+        self.read_lock().store.discarded_tail_bytes()
     }
 
     /// Run `f` inside this session's open transaction, or as its own atomic
@@ -449,7 +474,8 @@ impl Database {
         self.txn.is_some()
     }
 
-    /// Fold the write-ahead log into a snapshot file.
+    /// Fold the write-ahead log into a snapshot file. Never required for
+    /// durability; it only shortens the log and the next start-up.
     pub fn checkpoint(&mut self) -> Result<()> {
         self.write_lock().store.checkpoint()
     }

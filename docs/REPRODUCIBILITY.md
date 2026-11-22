@@ -80,9 +80,9 @@ Problems met while preparing and running the pass, in the order they appeared.
 
 The Redis listener accepts a declared argument length of up to 512 MB and the PostgreSQL listener a message length of up to 256 MB, and each allocates that much before reading. A few connections could exhaust memory. Found by reading `src/resp.rs` and `src/pgwire.rs`; not exercised by a test because the test would itself need that memory. Suggested fix: lower the limits, or read in chunks.
 
-### Observation: damage in the middle of the log (open)
+### Observation: damage in the middle of the log (resolved)
 
-Recovery treats the first record that fails its checksum as the end of the log. That is correct for a crash (only the last record can be torn) but means damage in the middle of `data.wal` silently drops later commits. `damage_in_the_middle_of_the_log_keeps_everything_before_it` records the current behaviour. Suggested improvement: if valid records follow a bad one, refuse to open and report corruption instead of truncating.
+Resolved: damage followed by further log data is now refused with a `corrupt data` error (with an explicit `salvage` option), see [STORAGE.md](STORAGE.md), finding S-2.
 
 ## What was not verified
 

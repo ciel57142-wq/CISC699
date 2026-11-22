@@ -10,7 +10,7 @@ polydb is a multi-model database engine written in Rust. One engine and one tran
 
 It runs as an interactive shell, as a library inside a Rust program, or as a network server. The server speaks its own line protocol and, on separate ports, subsets of the Redis, PostgreSQL and MongoDB wire protocols, so `redis-cli`, `psql` and the standard Python drivers can connect unchanged.
 
-**Status:** version 0.2.0, a course capstone artifact. It is a working research prototype, not a production database: all data is held in memory, and there is no authentication. See [Known limits](#known-limits).
+**Status:** version 0.2.0, a course capstone artifact. It is a working research prototype, not a production database. Data written to a database directory (the default) is durable: every acknowledged commit is fsynced to a write-ahead log and survives the process exiting or being killed; `--memory` keeps nothing on disk. The working set is cached in memory and there is no authentication. See [Known limits](#known-limits) and [docs/STORAGE.md](docs/STORAGE.md).
 
 ## Prerequisites
 
@@ -100,7 +100,7 @@ polydb serve [DIRECTORY] [--memory] [--host ADDR] [--port N] [--redis-port N] [-
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `DIRECTORY` | `polydb-data` | where `data.wal` and `data.snap` are stored |
+| `DIRECTORY` | `polydb-data` | the database directory (`data.wal`, `data.snap`, `polydb.format`, `LOCK`); created if missing or empty, refused if it holds other files |
 | `--memory` | off | keep nothing on disk |
 | `--host` | `127.0.0.1` | address to bind |
 | `--port` | `7878` | native protocol |
@@ -152,6 +152,7 @@ The build compiles polydb, runs the Rust tests and the smoke comparison, and fai
 |---|---|---|
 | `cargo test --release --locked` | correct behaviour of all three models, transactions, recovery (`tests/integration.rs`) | 22 |
 | | failure paths: bad arguments, damaged files, port conflicts, garbage and deeply nested input on every port, killing the server (`tests/hardening.rs`) | 23 |
+| | durability across separate processes: all three models, schemas, indexes, kill -9, locking, safe initialisation, `--memory` writes nothing (`tests/persistence.rs`) | 19 |
 | | library example in `src/lib.rs` compiles | 1 |
 | `bash scripts/smoke.sh` | scripted session equals stored output | 64 lines |
 | `bash scripts/driver_checks.sh` | third-party drivers | 39 checks |
@@ -175,6 +176,9 @@ polydb ships with **no dataset** and downloads none. Every test creates its own 
 | `cannot connect to 127.0.0.1:7878: Connection refused` from `polydb client` | no server is running | start one with `polydb serve` in another terminal |
 | `cannot open database at 'x': ...` | the path is a file, or not writable | give a directory you can write to |
 | `corrupt data: snapshot ... failed its checksum` | `data.snap` is damaged | restore the directory from a backup; polydb refuses to load a damaged snapshot |
+| `storage error: '...' is not empty and is not a polydb database` | the directory holds other files | give an empty or new directory |
+| `corrupt data: ... is missing from an initialised database` | `data.wal` or `data.snap` was deleted | restore the directory from a backup |
+| `... is locked by another process` | another polydb process has that directory | stop it, or use another directory |
 | Data missing after restart | the server was started with `--memory`, or from a different working directory (the default `polydb-data` is relative) | pass an absolute directory path |
 | `psql` shows `ERROR: polydb supports the simple query protocol only` | the client used prepared statements | use `psql`, psycopg2, or a driver's simple-query mode |
 | `python3 -m venv` fails with `ensurepip is not available` | Debian/Ubuntu split package | `sudo apt install python3-venv` |
@@ -185,7 +189,7 @@ polydb ships with **no dataset** and downloads none. Every test creates its own 
 
 ## Known limits
 
-- **All data is held in memory**; the disk is used for durability only. Startup time grows with data size.
+- **The working set is cached in memory**; the disk (write-ahead log + snapshot) is the durable copy and is read back at start-up, so data must fit in RAM and start-up time grows with data size. Remaining durability limits are listed in [docs/STORAGE.md](docs/STORAGE.md#remaining-durability-limitations).
 - **No authentication, TLS or replication.** Bind to localhost or a trusted network.
 - **Nesting limits.** A SQL expression may nest 32 levels (parentheses, `NOT`, unary minus, function calls) and contain 100 chained operators and nested sub-expressions in total. JSON text may nest 128 levels and a stored document 100. Anything deeper is an error. These limits are what fixed DEFECT-01, where deeply nested input overflowed the stack and stopped the process; see [docs/REPRODUCIBILITY.md](docs/REPRODUCIBILITY.md).
 - **Request limits:** every listener refuses requests larger than `--max-request-bytes` (default 64 MiB) before allocating them, and `--max-connections` caps clients per listener.

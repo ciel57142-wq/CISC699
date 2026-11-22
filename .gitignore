@@ -7,6 +7,10 @@ mydata/
 data.wal
 data.snap
 data.snap.tmp
+data.wal.corrupt
+polydb.format
+polydb.format.tmp
+LOCK
 # Python environment for the driver checks
 .venv/
 __pycache__/
