@@ -7,25 +7,42 @@ Command syntax, the library API and the wire-protocol subsets. For setup and run
 ### Relational
 
 ```
-CREATE TABLE [IF NOT EXISTS] t (col TYPE [PRIMARY KEY] [NOT NULL], ..., [PRIMARY KEY (col)])
-DROP TABLE [IF EXISTS] t
-CREATE INDEX [IF NOT EXISTS] name ON t (col)
-DROP INDEX name ON t
-INSERT INTO t [(cols)] VALUES (...), (...)
-SELECT [DISTINCT] items FROM t [alias]
-       [[INNER | LEFT] JOIN t2 [alias] ON expr]...
+CREATE TABLE [IF NOT EXISTS] t (
+    col TYPE [PRIMARY KEY] [NOT NULL] [UNIQUE] [DEFAULT const] [CHECK (expr)]
+             [REFERENCES p [(col)] [ON DELETE action] [ON UPDATE action]] [AUTOINCREMENT],
+    ...,
+    [CONSTRAINT name] PRIMARY KEY (a, b) | UNIQUE (a, b) | CHECK (expr)
+                    | FOREIGN KEY (a, b) REFERENCES p (x, y) [ON DELETE action] [ON UPDATE action])
+DROP TABLE [IF EXISTS] t [CASCADE | RESTRICT]
+ALTER TABLE t action [, action ...]
+    ADD [COLUMN] coldef | DROP [COLUMN] [IF EXISTS] c | RENAME [COLUMN] a TO b | RENAME TO t2
+    ALTER [COLUMN] c SET DEFAULT const | DROP DEFAULT | SET NOT NULL | DROP NOT NULL | [SET DATA] TYPE type
+    ADD [CONSTRAINT name] UNIQUE (..) | CHECK (..) | FOREIGN KEY (..) REFERENCES ..
+    DROP CONSTRAINT [IF EXISTS] name
+TRUNCATE [TABLE] t
+CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON t (col [, col ...])
+DROP INDEX [IF EXISTS] name [ON t]
+INSERT INTO t [(cols)] VALUES (... | DEFAULT), ...  |  INSERT INTO t [(cols)] SELECT ...  |  INSERT INTO t DEFAULT VALUES
+SELECT [DISTINCT] items FROM t [alias] | (SELECT ...) alias
+       [[INNER | LEFT | RIGHT | FULL [OUTER] | CROSS] JOIN t2 [alias] [ON expr] | , t2]...
        [WHERE expr] [GROUP BY exprs] [HAVING expr]
-       [ORDER BY expr [ASC|DESC], ...] [LIMIT n] [OFFSET n]
-UPDATE t SET col = expr, ... [WHERE expr]
+       [UNION | INTERSECT | EXCEPT [ALL] SELECT ...]...
+       [ORDER BY expr [ASC|DESC] [NULLS FIRST|LAST], ...] [LIMIT n | ALL] [OFFSET n]
+UPDATE t SET col = expr | DEFAULT, ... [WHERE expr]
 DELETE FROM t [WHERE expr]
+EXPLAIN SELECT ...        DESCRIBE t        CHECK TABLE t | CHECK TABLES        REINDEX [TABLE t]
 ```
 
-- Types: `INT`, `REAL`, `TEXT`, `BOOL` (common aliases such as `INTEGER`, `VARCHAR(n)`, `DOUBLE`, `BOOLEAN` are accepted).
-- Expressions: `+ - * / %`, `||`, `= != <> < <= > >=`, `AND OR NOT`, `IS [NOT] NULL`, `[NOT] LIKE`, `[NOT] IN (...)`, `[NOT] BETWEEN`, with SQL three-valued NULL logic.
-- Aggregates: `COUNT(*)`, `COUNT(x)`, `SUM`, `AVG`, `MIN`, `MAX`. Functions: `LOWER`, `UPPER`, `LENGTH`, `ABS`, `COALESCE`.
-- Limits: an expression may nest 32 levels (parentheses, `NOT`, unary minus, function calls) and hold 100 chained operators and nested sub-expressions in total. Items of an `IN` list or of a function's arguments do not add up. Each row of `VALUES` and each `SELECT` item is its own expression.
-- Unquoted names are case-insensitive; `"Quoted"` names keep their case. Strings use single quotes.
-- `WHERE pk = literal` is a direct lookup and `WHERE indexed_col = literal` an index lookup; everything else scans the table.
+- Types: `INT`, `REAL`, `TEXT`, `BOOL` (aliases such as `INTEGER`, `DOUBLE`, `BOOLEAN` are accepted). `VARCHAR(n)` / `CHAR(n)` enforce a maximum length in characters. `SERIAL` is `INT NOT NULL AUTOINCREMENT`. Values are checked strictly: a whole `REAL` is accepted for `INT`, anything else of the wrong type is a type error; non-finite numbers are refused.
+- Constraints: primary keys (one or several `INT`/`TEXT` columns), `NOT NULL`, `UNIQUE` (NULLs never conflict), `CHECK` (NULL passes), constant `DEFAULT`s, foreign keys with `RESTRICT`/`NO ACTION` (both refuse immediately), `CASCADE` and `SET NULL`. A foreign key must reference the primary key or a unique column set of the same types. Constraints are checked against the statement's result, so `UPDATE t SET id = id + 1` and swapping unique values work.
+- Atomicity: a statement that fails (constraint, type, cascade, `ALTER`) leaves no change behind, inside or outside a transaction.
+- Expressions: `+ - * / %`, `||`, comparisons, `AND OR NOT`, `IS [NOT] NULL`, `[NOT] LIKE`, `[NOT] IN (list | SELECT)`, `[NOT] BETWEEN`, `EXISTS (SELECT)`, scalar `(SELECT)`, `CASE`, `CAST(x AS type)` and `x::type`, with SQL three-valued NULL logic. Subqueries may be correlated; uncorrelated ones run once per statement.
+- Aggregates: `COUNT(*)`, `COUNT/SUM/AVG/MIN/MAX([DISTINCT] x)`. Functions: `LOWER UPPER LENGTH TRIM LTRIM RTRIM SUBSTR REPLACE CONCAT ABS ROUND FLOOR CEIL COALESCE IFNULL NULLIF GREATEST LEAST TYPEOF`.
+- `GROUP BY` and `ORDER BY` accept select aliases and 1-based positions. Columns not in `GROUP BY` take the value of the group's first row. Set operations evaluate left to right; their `ORDER BY` names output columns. NULLs sort first unless `NULLS LAST` is given.
+- Limits: an expression may nest 32 levels (parentheses, `NOT`, unary minus, function calls, subqueries) and hold 100 chained operators and nested sub-expressions in total; each clause of a subquery starts from what its enclosing expression has used. Subqueries nest at most 6 deep. A foreign-key cascade stops with an error after 100,000 steps.
+- Unquoted names are case-insensitive; `"Quoted"` names keep their case (`""` inside is a quote). Strings use single quotes.
+- Access paths (shown by `EXPLAIN`): primary-key lookup, primary-key `IN` list, primary-key or composite-key prefix and range scans, index equality on a leftmost prefix of an index's columns plus a range on the next one, otherwise a full scan. Equality joins use a hash join, other joins a nested loop. Every candidate row is still checked against the full condition.
+- Indexes are kept up to date by every write and stored with the data, so they survive restarts. `CHECK TABLE` compares every index entry with the rows and also verifies types, primary-key placement, `CHECK` constraints and foreign keys; `REINDEX` rebuilds index entries from the rows.
 
 ### Document
 
@@ -140,7 +157,7 @@ Equality filters on an indexed column or field (`WHERE city = 'London'`, `{city:
   native :7878    Redis :6380    PostgreSQL :5433    MongoDB :27018      server.rs, resp.rs,
        \              |                |                 /               pgwire.rs, mongo.rs
         +---------- one session per connection ---------+               lib.rs
-        |      SQL       |    documents    |  key-value  |               sql.rs, doc.rs, kv.rs
+        |      SQL       |    documents    |  key-value  |               sql/, doc.rs, kv.rs  
         +------------------------------------------------+
         |  transaction overlay + read tracking (Ctx)     |               storage.rs
         |  ordered map  +  write-ahead log  +  snapshot  |

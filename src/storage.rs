@@ -184,6 +184,11 @@ impl Store {
             .take_while(move |(k, _)| k.starts_with(prefix))
     }
 
+    /// Entries from `start` (inclusive) onward, in key order.
+    pub fn range_from<'a>(&'a self, start: &'a [u8]) -> impl Iterator<Item = (&'a Vec<u8>, &'a Vec<u8>)> + 'a {
+        self.map.range::<[u8], _>((Bound::Included(start), Bound::Unbounded))
+    }
+
     pub fn len(&self) -> usize {
         self.map.len()
     }
@@ -312,6 +317,41 @@ impl<'a> Ctx<'a> {
             self.store.scan(prefix).map(|(k, v)| (k.clone(), v.clone())).collect();
         for (k, v) in self.writes.range::<[u8], _>((Bound::Included(prefix), Bound::Unbounded)) {
             if !k.starts_with(prefix) {
+                break;
+            }
+            match v {
+                Some(v) => {
+                    out.insert(k.clone(), v.clone());
+                }
+                None => {
+                    out.remove(k);
+                }
+            }
+        }
+        out.into_iter().collect()
+    }
+
+    /// Live entries whose key starts with `prefix`, is `>= start` and, when
+    /// `end` is given, `< end`, in key order. `start` must itself begin with
+    /// `prefix`. Inside a transaction the whole prefix is recorded as read,
+    /// which is conservative but keeps conflict detection simple and sound.
+    pub fn scan_range(&self, prefix: &[u8], start: &[u8], end: Option<&[u8]>) -> Vec<(Vec<u8>, Vec<u8>)> {
+        if let Some(r) = &self.reads {
+            let mut r = r.borrow_mut();
+            if !r.prefixes.iter().any(|p| prefix.starts_with(p)) {
+                r.prefixes.push(prefix.to_vec());
+            }
+        }
+        let start = if start < prefix { prefix } else { start };
+        let in_range = |k: &[u8]| k.starts_with(prefix) && end.map_or(true, |e| k < e);
+        let mut out: BTreeMap<Vec<u8>, Vec<u8>> = self
+            .store
+            .range_from(start)
+            .take_while(|(k, _)| in_range(k))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        for (k, v) in self.writes.range::<[u8], _>((Bound::Included(start), Bound::Unbounded)) {
+            if !in_range(k) {
                 break;
             }
             match v {

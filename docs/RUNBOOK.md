@@ -11,7 +11,7 @@ How to build, start, check, stop, back up and recover polydb. Commands are run f
   (one thread             \                    |              |               /
    per connection)         +-------------- one session per connection -------+
                                                    |
-  data models                    SQL (sql.rs) | documents (doc.rs) | key-value (kv.rs)
+  data models                    SQL (sql/) | documents (doc.rs) | key-value (kv.rs)
                                                    |
   transactions                 write overlay + read tracking, validated at commit
                                                    |
@@ -29,7 +29,7 @@ source (src/, tests/, Cargo.toml, Cargo.lock)
    |  cargo build --release --locked
    v
 target/release/polydb            one self-contained executable, about 1.5 MB
-   |  cargo test --release --locked      46 Rust tests
+   |  cargo test --release --locked      89 Rust tests
    |  scripts/smoke.sh                   golden-output comparison
    |  scripts/driver_checks.sh           39 third-party driver checks (optional)
    v

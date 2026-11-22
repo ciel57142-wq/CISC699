@@ -46,10 +46,11 @@ Step 3 prints one `test result` line per test target. The three that matter are:
 ```
 test result: ok. 23 passed; 0 failed; 0 ignored; ...     (tests/hardening.rs)
 test result: ok. 22 passed; 0 failed; 0 ignored; ...     (tests/integration.rs)
+test result: ok. 37 passed; 0 failed; 0 ignored; ...     (tests/relational.rs)
 test result: ok. 1 passed; 0 failed; 0 ignored; ...      (Doc-tests polydb)
 ```
 
-Two more lines say `0 passed` for the library and the binary; that is normal, because all tests live in `tests/`.
+The library line says `6 passed` (unit tests that damage index entries on purpose) and the binary line `0 passed`.
 
 Step 4 ends with:
 
@@ -187,12 +188,12 @@ polydb ships with **no dataset** and downloads none. Every test creates its own 
 
 - **All data is held in memory**; the disk is used for durability only. Startup time grows with data size.
 - **No authentication, TLS or replication.** Bind to localhost or a trusted network.
-- **Nesting limits.** A SQL expression may nest 32 levels (parentheses, `NOT`, unary minus, function calls) and contain 100 chained operators and nested sub-expressions in total. JSON text may nest 128 levels and a stored document 100. Anything deeper is an error. These limits are what fixed DEFECT-01, where deeply nested input overflowed the stack and stopped the process; see [docs/REPRODUCIBILITY.md](docs/REPRODUCIBILITY.md).
+- **Nesting limits.** A SQL expression may nest 32 levels (parentheses, `NOT`, unary minus, function calls, subqueries) and contain 100 chained operators and nested sub-expressions in total. JSON text may nest 128 levels and a stored document 100. Anything deeper is an error. These limits are what fixed DEFECT-01, where deeply nested input overflowed the stack and stopped the process; see [docs/REPRODUCIBILITY.md](docs/REPRODUCIBILITY.md).
 - **Large-message allocation (open):** the Redis and PostgreSQL listeners accept a declared message length of up to 512 MB and 256 MB and allocate it before reading.
 - **Log damage:** recovery stops at the first log record that fails its checksum. A torn final record (the normal crash case) is handled correctly; damage in the middle of the log also drops the commits after it.
 - Commits wait for their own `fsync`, so write throughput is bounded by the disk.
 - Indexes serve equality only; range queries and joins scan.
-- SQL omits subqueries, `UNION`, `ALTER TABLE`, foreign keys, `UNIQUE`, defaults, composite keys and date/time types.
+- SQL has no date/time types, views, CTEs (`WITH`), window functions, `RETURNING` or `ON ... SET DEFAULT`; foreign-key `NO ACTION` is checked immediately, like `RESTRICT`. Subqueries nest at most 6 deep.
 - No lock file: do not open the same directory from two processes at once.
 - Object keys in documents are stored sorted, not in insertion order.
 
@@ -202,7 +203,7 @@ polydb ships with **no dataset** and downloads none. Every test creates its own 
 Cargo.toml, Cargo.lock      package manifest and lock file (no dependencies)
 src/                        the engine (about 5,600 lines)
   storage.rs keys.rs          ordered map, write-ahead log, snapshot, key layout
-  sql.rs doc.rs kv.rs         the three data models
+  sql/ doc.rs kv.rs           the three data models
   lib.rs value.rs error.rs    sessions, transactions, value type, errors
   server.rs resp.rs           native and Redis listeners
   pgwire.rs mongo.rs          PostgreSQL and MongoDB listeners

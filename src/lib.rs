@@ -286,7 +286,7 @@ impl Database {
 
     /// Run one SQL statement.
     pub fn sql(&mut self, statement: &str) -> Result<Output> {
-        let read = first_word(statement) == "select";
+        let read = sql::is_read_only(statement);
         self.run(!read, |ctx| sql::execute(ctx, statement))
     }
 
@@ -367,7 +367,8 @@ impl Database {
 
     /// Run one command in any of the three languages:
     ///
-    /// * SQL: `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `CREATE TABLE|INDEX`, `DROP TABLE|INDEX`
+    /// * SQL: `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `CREATE TABLE|[UNIQUE] INDEX`, `DROP TABLE|INDEX`,
+    ///   `ALTER TABLE`, `TRUNCATE`, `EXPLAIN`, `DESCRIBE`, `CHECK TABLE`, `REINDEX`
     /// * documents: `db.<collection>.<method>(...)`
     /// * key-value: `SET`, `GET`, `DEL`, `EXISTS`, `KEYS`, `INCR`
     /// * control: `BEGIN`, `COMMIT`, `ROLLBACK`, `CHECKPOINT`, `SHOW TABLES`, `SHOW COLLECTIONS`
@@ -402,16 +403,13 @@ impl Database {
             }
             w @ ("get" | "exists" | "keys") => self.run(false, |ctx| kv_command(ctx, w, rest)),
             w @ ("set" | "del" | "incr") => self.run(true, |ctx| kv_command(ctx, w, rest)),
-            "select" | "insert" | "update" | "delete" | "create" | "drop" => self.sql(s),
+            "select" | "insert" | "update" | "delete" | "create" | "drop" | "alter" | "truncate" | "explain"
+            | "describe" | "desc" | "check" | "reindex" => self.sql(s),
             other => Err(Error::Parse(format!(
                 "unknown command '{other}': expected SQL, a db.<collection>.<method>(...) call, or SET/GET/DEL/EXISTS/KEYS/INCR"
             ))),
         }
     }
-}
-
-fn first_word(s: &str) -> String {
-    s.trim_start().split(|c: char| !c.is_alphanumeric()).next().unwrap_or("").to_ascii_lowercase()
 }
 
 // ------------------------------------------------------- key-value commands

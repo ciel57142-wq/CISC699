@@ -135,7 +135,7 @@ impl Value {
         s
     }
 
-    fn write_json(&self, out: &mut String) {
+    pub(crate) fn write_json(&self, out: &mut String) {
         match self {
             Value::Null => out.push_str("null"),
             Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
