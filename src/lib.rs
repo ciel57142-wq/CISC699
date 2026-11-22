@@ -318,17 +318,42 @@ impl Database {
         self.run(true, |ctx| doc::insert(ctx, collection, doc))
     }
 
+    /// Insert several documents atomically (all or none); returns their ids.
+    pub fn doc_insert_many(&mut self, collection: &str, docs: Vec<Value>) -> Result<Vec<Value>> {
+        self.run(true, |ctx| doc::insert_many(ctx, collection, docs))
+    }
+
     pub fn doc_find(&mut self, collection: &str, filter: &Value, opts: &FindOptions) -> Result<Vec<Value>> {
         self.run(false, |ctx| doc::find(ctx, collection, filter, opts))
     }
 
-    /// Update every matching document; returns how many.
+    /// Number of documents matching `filter`.
+    pub fn doc_count(&mut self, collection: &str, filter: &Value) -> Result<u64> {
+        self.run(false, |ctx| doc::count(ctx, collection, filter))
+    }
+
+    /// Distinct values of `field` among matching documents, sorted.
+    pub fn doc_distinct(&mut self, collection: &str, field: &str, filter: &Value) -> Result<Vec<Value>> {
+        self.run(false, |ctx| doc::distinct(ctx, collection, field, filter))
+    }
+
+    /// The access path a filter uses and how many documents it reads.
+    pub fn doc_explain(&mut self, collection: &str, filter: &Value) -> Result<Value> {
+        self.run(false, |ctx| doc::explain(ctx, collection, filter))
+    }
+
+    /// Run an aggregation pipeline (see [`doc::aggregate`](crate::doc::aggregate) for the stages).
+    pub fn doc_aggregate(&mut self, collection: &str, pipeline: &[Value]) -> Result<Vec<Value>> {
+        self.run(false, |ctx| doc::aggregate(ctx, collection, pipeline))
+    }
+
+    /// Update every matching document; returns how many matched.
     pub fn doc_update(&mut self, collection: &str, filter: &Value, update: &Value) -> Result<u64> {
         self.doc_update_with(collection, filter, update, true, false).map(|r| r.0)
     }
 
     /// Update with control over `multi` (all matches vs first) and `upsert`.
-    /// Returns (documents updated, id of an upserted document).
+    /// Returns (documents matched, id of an upserted document).
     pub fn doc_update_with(
         &mut self,
         collection: &str,
@@ -337,6 +362,18 @@ impl Database {
         multi: bool,
         upsert: bool,
     ) -> Result<(u64, Option<Value>)> {
+        self.doc_update_full(collection, filter, update, multi, upsert).map(|r| (r.matched, r.upserted_id))
+    }
+
+    /// Update returning matched and modified counts and any upserted id.
+    pub fn doc_update_full(
+        &mut self,
+        collection: &str,
+        filter: &Value,
+        update: &Value,
+        multi: bool,
+        upsert: bool,
+    ) -> Result<doc::UpdateResult> {
         self.run(true, |ctx| doc::update(ctx, collection, filter, update, multi, upsert))
     }
 
@@ -350,6 +387,11 @@ impl Database {
         self.run(true, |ctx| doc::delete(ctx, collection, filter, limit))
     }
 
+    /// Several write operations as one atomic unit (see [`doc::bulk_write`](crate::doc::bulk_write)).
+    pub fn doc_bulk_write(&mut self, collection: &str, ops: &[Value]) -> Result<Value> {
+        self.run(true, |ctx| doc::bulk_write(ctx, collection, ops))
+    }
+
     pub fn doc_drop(&mut self, collection: &str) -> Result<bool> {
         self.run(true, |ctx| doc::drop(ctx, collection))
     }
@@ -360,7 +402,37 @@ impl Database {
 
     /// Index a field of a collection; returns false if it was already indexed.
     pub fn doc_create_index(&mut self, collection: &str, field: &str) -> Result<bool> {
-        self.run(true, |ctx| doc::create_index(ctx, collection, field))
+        self.doc_create_index_on(collection, &[field], false)
+    }
+
+    /// Create a single-field or compound index, optionally unique.
+    pub fn doc_create_index_on(&mut self, collection: &str, fields: &[&str], unique: bool) -> Result<bool> {
+        let fields = fields.iter().map(|f| f.to_string()).collect();
+        self.run(true, |ctx| doc::create_index(ctx, collection, fields, unique))
+    }
+
+    /// Drop an index by name (`a_1_b_1`), field, or key spec.
+    pub fn doc_drop_index(&mut self, collection: &str, spec: &Value) -> Result<bool> {
+        self.run(true, |ctx| doc::drop_index(ctx, collection, spec))
+    }
+
+    pub fn doc_indexes(&mut self, collection: &str) -> Result<Vec<Value>> {
+        self.run(false, |ctx| doc::list_indexes(ctx, collection))
+    }
+
+    /// Set or clear (`null`) a collection's document schema.
+    pub fn doc_set_schema(&mut self, collection: &str, schema: &Value) -> Result<()> {
+        self.run(true, |ctx| doc::set_schema(ctx, collection, schema))
+    }
+
+    /// Consistency report for a collection's documents and index entries.
+    pub fn doc_validate(&mut self, collection: &str) -> Result<Value> {
+        self.run(false, |ctx| doc::validate(ctx, collection))
+    }
+
+    /// Rebuild a collection's index entries; returns how many were written.
+    pub fn doc_reindex(&mut self, collection: &str) -> Result<u64> {
+        self.run(true, |ctx| doc::reindex(ctx, collection))
     }
 
     // ---------------------------------------------------- unified commands
@@ -376,7 +448,11 @@ impl Database {
         let s = command.trim().trim_end_matches(';').trim_end();
         if let Some(rest) = s.strip_prefix("db.") {
             let method = rest.split_once('.').map_or("", |(_, m)| m.split('(').next().unwrap_or("")).to_ascii_lowercase();
-            let read = matches!(method.trim(), "find" | "findone" | "count" | "countdocuments");
+            let read = matches!(
+                method.trim(),
+                "find" | "findone" | "count" | "countdocuments" | "distinct" | "aggregate" | "getindexes" | "getschema"
+                    | "validate" | "explain"
+            );
             return self.run(!read, |ctx| doc_command(ctx, s));
         }
         let (word, rest) = match s.find(char::is_whitespace) {
@@ -572,6 +648,7 @@ fn doc_command(ctx: &mut Ctx, s: &str) -> Result<Output> {
             .map(|n| n as usize)
             .ok_or_else(|| Error::Parse("expected a non-negative integer".into()))
     };
+    let option = |i: usize, key: &str| args.get(i).and_then(|o| o.get(key)) == Some(&Value::Bool(true));
 
     let is_find = matches!(method.as_str(), "find" | "findone");
     if !is_find && calls.len() > 1 {
@@ -579,64 +656,111 @@ fn doc_command(ctx: &mut Ctx, s: &str) -> Result<Output> {
     }
     match method.as_str() {
         "insert" | "insertone" | "insertmany" => match need(0, "a document")? {
-            Value::Array(docs) => {
-                let mut ids = Vec::new();
-                for d in docs {
-                    ids.push(doc::insert(ctx, coll, d.clone())?);
-                }
-                Ok(Output::Scalar(Value::Array(ids)))
-            }
+            Value::Array(docs) => Ok(Output::Scalar(Value::Array(doc::insert_many(ctx, coll, docs.clone())?))),
             d => Ok(Output::Scalar(doc::insert(ctx, coll, d.clone())?)),
         },
         "find" | "findone" => {
-            let mut opts = FindOptions::default();
+            let mut opts = FindOptions { projection: args.get(1).cloned(), ..FindOptions::default() };
+            let mut finish: Option<&str> = None;
             for (name, a) in &calls[1..] {
+                if finish.is_some() {
+                    return Err(Error::Parse(format!(".{name}() cannot follow .count() or .explain()")));
+                }
+                if matches!(name.as_str(), "count" | "explain") {
+                    finish = Some(name);
+                    continue;
+                }
                 let first = a.first().ok_or_else(|| Error::Parse(format!("{name}() needs an argument")))?;
                 match name.as_str() {
                     "sort" => opts.sort = Some(first.clone()),
                     "limit" => opts.limit = Some(as_count(first)?),
                     "skip" => opts.skip = as_count(first)?,
-                    _ => return Err(Error::Parse(format!("unknown modifier .{name}(); use sort, limit or skip"))),
+                    "project" | "projection" => opts.projection = Some(first.clone()),
+                    _ => {
+                        return Err(Error::Parse(format!(
+                            "unknown modifier .{name}(); use sort, skip, limit, project, count or explain"
+                        )))
+                    }
                 }
             }
             if method == "findone" {
                 opts.limit = Some(1);
             }
-            Ok(Output::Docs(doc::find(ctx, coll, arg(0), &opts)?))
+            match finish {
+                Some("count") => Ok(Output::Scalar(Value::Int(doc::count(ctx, coll, arg(0))? as i64))),
+                Some(_) => Ok(Output::Scalar(doc::explain(ctx, coll, arg(0))?)),
+                None => Ok(Output::Docs(doc::find(ctx, coll, arg(0), &opts)?)),
+            }
         }
-        "update" | "updatemany" | "updateone" => {
-            let multi = method != "updateone";
-            let (n, _) = doc::update(
-                ctx,
-                coll,
-                need(0, "a filter and an update")?,
-                need(1, "a filter and an update")?,
-                multi,
-                false,
-            )?;
-            Ok(Output::Done(format!("{n} document(s) updated")))
+        "update" | "updatemany" | "updateone" | "replaceone" => {
+            let what = "a filter and an update";
+            let (filter, upd) = (need(0, what)?, need(1, what)?);
+            match method.as_str() {
+                "replaceone" if !doc::update::is_replacement(upd)? => {
+                    return Err(Error::Parse("replaceOne takes a document without operators".into()))
+                }
+                "updateone" | "updatemany" if doc::update::is_replacement(upd)? => {
+                    return Err(Error::Parse(format!("{method}() takes update operators such as $set; use replaceOne")))
+                }
+                _ => {}
+            }
+            // Plain update() changes every match unless given {multi: false}.
+            let multi = match method.as_str() {
+                "updatemany" => true,
+                "update" => args.get(2).and_then(|o| o.get("multi")).map_or(true, |m| *m == Value::Bool(true)),
+                _ => false,
+            };
+            let r = doc::update(ctx, coll, filter, upd, multi, option(2, "upsert"))?;
+            let mut msg = format!("{} document(s) matched, {} modified", r.matched, r.modified);
+            if let Some(id) = r.upserted_id {
+                msg.push_str(&format!(", upserted _id {}", id.to_json()));
+            }
+            Ok(Output::Done(msg))
         }
         "delete" | "deletemany" | "deleteone" | "remove" => {
             let limit = (method == "deleteone").then_some(1);
             let n = doc::delete(ctx, coll, need(0, "a filter ({} deletes everything)")?, limit)?;
             Ok(Output::Done(format!("{n} document(s) deleted")))
         }
+        "bulkwrite" => match need(0, "a list of operations")? {
+            Value::Array(ops) => Ok(Output::Scalar(doc::bulk_write(ctx, coll, ops)?)),
+            _ => Err(Error::Parse("bulkWrite() takes an array of operations".into())),
+        },
         "createindex" => {
-            let field = match need(0, "a field, e.g. createIndex({email: 1})")? {
-                Value::Text(f) => f.clone(),
-                Value::Object(o) if o.len() == 1 => o.keys().next().cloned().unwrap_or_default(),
-                _ => return Err(Error::Parse("createIndex takes one field: createIndex({email: 1})".into())),
-            };
-            let created = doc::create_index(ctx, coll, &field)?;
+            let fields = doc::index_fields(need(0, "a key spec, e.g. createIndex({email: 1})")?)?;
+            let unique = option(1, "unique");
+            let created = doc::create_index(ctx, coll, fields.clone(), unique)?;
+            let label = fields.join(", ");
             Ok(Output::Done(if created {
-                format!("index created on {coll}.{field}")
+                format!("{}index created on {coll}({label})", if unique { "unique " } else { "" })
             } else {
-                format!("{coll}.{field} is already indexed")
+                format!("{coll}({label}) is already indexed")
             }))
         }
-        "count" | "countdocuments" => {
-            Ok(Output::Scalar(Value::Int(doc::find(ctx, coll, arg(0), &FindOptions::default())?.len() as i64)))
+        "dropindex" => {
+            let dropped = doc::drop_index(ctx, coll, need(0, "an index name or key spec")?)?;
+            Ok(Output::Done(if dropped { "index dropped".into() } else { "no such index, nothing dropped".into() }))
         }
+        "getindexes" => Ok(Output::Docs(doc::list_indexes(ctx, coll)?)),
+        "count" | "countdocuments" => Ok(Output::Scalar(Value::Int(doc::count(ctx, coll, arg(0))? as i64))),
+        "distinct" => {
+            let field = need(0, "a field name")?
+                .as_str()
+                .ok_or_else(|| Error::Parse("distinct() takes a field name string".into()))?;
+            Ok(Output::Scalar(Value::Array(doc::distinct(ctx, coll, field, arg(1))?)))
+        }
+        "aggregate" => match need(0, "a pipeline array")? {
+            Value::Array(stages) => Ok(Output::Docs(doc::aggregate(ctx, coll, stages)?)),
+            _ => Err(Error::Parse("aggregate() takes an array of stages".into())),
+        },
+        "explain" => Ok(Output::Scalar(doc::explain(ctx, coll, arg(0))?)),
+        "setschema" => {
+            doc::set_schema(ctx, coll, need(0, "a schema (or null to remove it)")?)?;
+            Ok(Output::Done(format!("schema of '{coll}' updated")))
+        }
+        "getschema" => Ok(Output::Scalar(doc::get_schema(ctx, coll)?)),
+        "validate" => Ok(Output::Scalar(doc::validate(ctx, coll)?)),
+        "reindex" => Ok(Output::Done(format!("{} index entr(y/ies) rebuilt", doc::reindex(ctx, coll)?))),
         "drop" => {
             let existed = doc::drop(ctx, coll)?;
             Ok(Output::Done(if existed {
@@ -646,7 +770,7 @@ fn doc_command(ctx: &mut Ctx, s: &str) -> Result<Output> {
             }))
         }
         other => Err(Error::Parse(format!(
-            "unknown collection method '{other}': use insert, find, update, delete, count, createIndex or drop"
+            "unknown collection method '{other}': use insert, find, findOne, update, replaceOne, delete, bulkWrite, count, distinct, aggregate, explain, createIndex, dropIndex, getIndexes, setSchema, getSchema, validate, reindex or drop"
         ))),
     }
 }

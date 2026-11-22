@@ -47,22 +47,45 @@ EXPLAIN SELECT ...        DESCRIBE t        CHECK TABLE t | CHECK TABLES        
 ### Document
 
 ```
-db.<coll>.insert({...})  |  db.<coll>.insert([{...}, {...}])
-db.<coll>.find({filter}) [.sort({field: 1|-1})] [.skip(n)] [.limit(n)]
-db.<coll>.findOne({filter})
-db.<coll>.update({filter}, {update})       (updateOne changes only the first match)
-db.<coll>.delete({filter})                 (deleteOne removes only the first match)
-db.<coll>.createIndex({field: 1})
-db.<coll>.count({filter})
-db.<coll>.drop()
+db.<coll>.insert({...})  |  db.<coll>.insertMany([{...}, {...}])        (a list is all-or-nothing)
+db.<coll>.find({filter} [, {projection}]) [.sort(spec)] [.skip(n)] [.limit(n)] [.project({...})] [.count()] [.explain()]
+db.<coll>.findOne({filter} [, {projection}])
+db.<coll>.update({filter}, {update} [, {upsert: true, multi: false}])  (every match unless multi: false)
+db.<coll>.updateOne / updateMany({filter}, {operators} [, {upsert: true}])
+db.<coll>.replaceOne({filter}, {document} [, {upsert: true}])
+db.<coll>.delete({filter})  |  deleteOne({filter})  |  deleteMany({filter})
+db.<coll>.bulkWrite([{insertOne: {document}}, {updateOne|updateMany: {filter, update, upsert}},
+                     {replaceOne: {filter, replacement, upsert}}, {deleteOne|deleteMany: {filter}}])
+db.<coll>.count({filter})  |  countDocuments({filter})  |  distinct('field' [, {filter}])
+db.<coll>.aggregate([stage, ...])
+db.<coll>.explain({filter})
+db.<coll>.createIndex(spec [, {unique: true}])  |  dropIndex(name | spec)  |  getIndexes()
+db.<coll>.setSchema({required: [...], fields: {...}})  |  setSchema(null)  |  getSchema()
+db.<coll>.validate()  |  reindex()  |  drop()
 ```
 
-- Collections are created on first insert. `_id` may be an integer or string; one is generated if absent.
-- Filters: equality, dotted paths (`"addr.city"`), `$eq $ne $gt $gte $lt $lte $in $nin $exists $not`, `$and $or $nor`. Equality against an array field matches any element.
-- Updates: `$set`, `$unset`, `$inc`, `$push`, `$addToSet`, `$pull`; an update with no operators replaces the document.
+**Documents.** A document is a JSON object; values may be strings, 64-bit integers, finite doubles, booleans, null, arrays and nested objects, and are returned exactly as stored (`1` and `1.0` keep their types, though they compare equal). `_id` may be an integer, a string or an ObjectId (`{"$oid": "<24 hex>"}`); one is generated if absent and can never change. Rejected on insert and update, with nothing written: a non-object document, field names containing `.` or NUL or starting with `$` (extended-JSON wrappers `$oid $date $numberLong $binary` are values and allowed), NaN or infinite numbers, nesting deeper than 100 levels. Collections are created on first write. Object keys are stored sorted, not in insertion order.
+
+**Field paths.** `a.b.c` walks into objects; a numeric segment (`tags.0`) indexes an array; any other segment applied to an array walks into each object element (`items.sku` reaches the `sku` of every item). A field is *missing* when its path reaches nothing.
+
+**Filters.** `{field: value}` and `$eq` hold when any value the path reaches equals the operand, or is an array with an equal element; equality with `null` also matches a missing field. `$ne` and `$nin` are the exact negations of `$eq` and `$in`. `$gt $gte $lt $lte` compare only within one type class (numbers with numbers, strings with strings, booleans with booleans), so `{age: {$gt: 5}}` never matches a string age; against an array they hold if any element qualifies, and each condition may be met by a different element. `$in $nin $exists $not` (`$not` takes an operator object), `$type` (`null bool int double number string array object objectId date long binData`), `$size`, `$elemMatch` (one element meets every condition), and `$and $or $nor` (non-empty arrays). An unknown operator or malformed argument is an error even on an empty collection.
+
+**Updates.** `$set` (creates intermediate objects; an index past the end of an array pads with nulls), `$unset` (on an array element, sets it to null), `$inc` (numbers only; integer overflow is an error), `$push` and `$addToSet` (with optional `{$each: [...]}`; the target must be an array or missing), `$pull` (a value, an operator condition such as `{$gte: 3}`, or a filter on object elements), and `$setOnInsert` for upserts. Two paths in one update may not overlap. An update with no operators replaces the document and keeps `_id`. An upsert that matches nothing inserts the filter's top-level equality fields with the update applied. A failure on any matched document leaves every document unchanged. Not supported: positional `$` paths, `$rename $min $max $mul`, `$push` modifiers other than `$each`, pipeline updates.
+
+**Sort and projection.** A sort spec is `{field: 1|-1}` (applied in field-name order, because objects do not keep key order) or a list `[['b', -1], ['a', 1]]` to fix the order. Missing sorts as null, and types order null < bool < number < string < array < object; an array sorts by its whole value. Projections include (`{a: 1, 'b.c': 1}`, with `_id` unless `_id: 0`), exclude (`{a: 0}`), or compute (`{name: '$person.name', k: {$literal: 1}}`); inclusion and exclusion cannot be mixed except for `_id`.
+
+**Aggregation.** Stages `$match $project $group $sort $skip $limit $count $unwind`. `$group` takes `_id` (any expression; `null` for one group) and accumulators `$sum $avg $min $max $count $first $last $push $addToSet`; groups are returned in key order. `$sum`/`$avg` ignore non-numbers, `$min`/`$max` ignore missing and null. Expressions are field references (`'$a.b'`), `{$literal: v}`, and objects or arrays of those; other expression operators (`$add`, `$cond`, ...) and other stages (`$lookup`, `$addFields`, ...) are rejected with an error. A leading `$match` uses indexes.
+
+**Indexes.** `createIndex({field: 1})`, nested paths (`{'addr.city': 1}`), compound indexes (`createIndex(['a', 'b'])` or `[['a', 1], ['b', 1]]`; the object form `{a: 1, b: 1}` orders fields by name), and `{unique: true}`. Booleans, numbers and strings are indexed; each value a path reaches is an entry, array elements included. A document without the field has no entry, so a unique index allows any number of documents without it. A compound index cannot hold a document where two of its fields both have several values. Every write maintains the indexes in the same atomic step, and they are stored with the data.
+
+**Access paths** (`explain` reports them, with documents examined and matched): `id_lookup` for `_id` equality or `$in`; `index_scan` for equality or `$in` on a leftmost prefix of an index's fields, optionally followed by a range (`$gt $gte $lt $lte`) on the next field; otherwise `collection_scan`. Conditions under a top-level `$and` count; `$or` branches do not. Range bounds are scanned inclusively, and on a field that has ever held several values in one document only one bound is used, because different elements may meet different bounds. The full filter is always re-checked.
+
+**Schemas.** `setSchema({required: ['name'], fields: {name: 'string', age: ['int', 'null'], 'addr.zip': 'string'}})` makes every insert and update check that required paths are present and that typed paths, when present, hold one of the listed types (the `$type` names plus `any`). Other fields are unconstrained. Setting a schema fails if an existing document violates it; `setSchema(null)` removes it.
+
+**Consistency.** `validate()` checks every document (decodes, is stored under its `_id`, is a valid document, satisfies the schema) and that the index entries are exactly those the documents imply, including uniqueness; `reindex()` rebuilds the entries. All document commands run inside the current transaction, or atomically on their own, and are made durable through the write-ahead log.
+
 - JSON is accepted in strict form or shell form (unquoted keys, single-quoted strings).
-- Limits: JSON text may nest 128 levels and a stored document 100 levels, counting the innermost value.
-- A filter on `_id` is a direct lookup and equality on an indexed field an index lookup; everything else scans the collection.
+- Limits: JSON text may nest 128 levels and a stored document 100 levels, counting the innermost value. An index has at most 16 fields; an `$in` list expands to at most 256 index lookups before the planner uses fewer index fields.
 
 ### Key-value
 
@@ -133,7 +156,7 @@ The native protocol replies look like this:
 
 - **Redis:** strings only: `GET SET MGET MSET DEL EXISTS INCR DECR INCRBY DECRBY KEYS DBSIZE STRLEN APPEND GETSET SETNX TTL PING ECHO`. No expiry, lists, hashes, sets, pub/sub or `MULTI`.
 - **PostgreSQL:** the simple-query flow that psql, libpq and psycopg2 use. No server-side prepared statements (the extended protocol used by default in JDBC, asyncpg, node-postgres with parameters), no `COPY`, no `pg_catalog`, and the SQL is the subset listed below. Every polydb command works on this port, including `db.coll.find(...)` and `GET key`.
-- **MongoDB:** `insert find update delete count distinct drop createIndexes listCollections` and `aggregate` with `$match $sort $skip $limit $count`. One database (the database name is ignored), no cursors beyond the first batch, no change streams, no general `$group`. `mongosh` has not been tested.
+- **MongoDB:** `insert find update delete count distinct drop createIndexes listIndexes dropIndexes listCollections` and `aggregate`, with the filter, update, index and aggregation subset described under [Document](#document); anything outside it is an error. One database (the database name is ignored), no cursors beyond the first batch, no change streams, no transactions over this port, no authentication. Because documents do not keep key order, a compound index key or multi-field sort sent as a BSON document is applied in field-name order. Error codes: duplicate keys report 11000, schema violations 121, changing `_id` 66. `mongosh` has not been tested.
 - **No authentication or TLS on any port.** The server binds to 127.0.0.1 by default; only expose it on a network you trust.
 
 ## Concurrency and correctness
@@ -157,7 +180,7 @@ Equality filters on an indexed column or field (`WHERE city = 'London'`, `{city:
   native :7878    Redis :6380    PostgreSQL :5433    MongoDB :27018      server.rs, resp.rs,
        \              |                |                 /               pgwire.rs, mongo.rs
         +---------- one session per connection ---------+               lib.rs
-        |      SQL       |    documents    |  key-value  |               sql/, doc.rs, kv.rs  
+        |      SQL       |    documents    |  key-value  |               sql/, doc/, kv.rs   
         +------------------------------------------------+
         |  transaction overlay + read tracking (Ctx)     |               storage.rs
         |  ordered map  +  write-ahead log  +  snapshot  |

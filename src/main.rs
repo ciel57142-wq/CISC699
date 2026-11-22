@@ -26,11 +26,12 @@ RELATIONAL (SQL)
 
 DOCUMENT (NoSQL)
   db.events.insert({user: 1, type: 'login', tags: ['web']})
-  db.events.createIndex({type: 1})
-  db.events.find({type: 'login', user: {$gte: 1}}).sort({user: -1}).limit(5)
-  db.events.update({user: 1}, {$set: {seen: true}, $inc: {visits: 1}})
-  db.events.delete({type: 'login'})
-  db.events.count({})      db.events.drop()
+  db.events.createIndex({type: 1})      db.events.createIndex(['user', 'type'], {unique: true})
+  db.events.find({type: 'login', user: {$gte: 1}}, {type: 1}).sort({user: -1}).limit(5)
+  db.events.update({user: 1}, {$set: {seen: true}, $inc: {visits: 1}}, {upsert: true})
+  db.events.aggregate([{$match: {}}, {$group: {_id: '$type', n: {$sum: 1}}}])
+  db.events.delete({type: 'login'})     db.events.explain({type: 'login'})
+  db.events.count({})      db.events.distinct('type')      db.events.drop()
 
 KEY-VALUE
   SET session:42 some value      GET session:42      DEL session:42

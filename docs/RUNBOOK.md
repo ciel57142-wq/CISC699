@@ -11,7 +11,7 @@ How to build, start, check, stop, back up and recover polydb. Commands are run f
   (one thread             \                    |              |               /
    per connection)         +-------------- one session per connection -------+
                                                    |
-  data models                    SQL (sql/) | documents (doc.rs) | key-value (kv.rs)
+  data models                    SQL (sql/) | documents (doc/) | key-value (kv.rs)
                                                    |
   transactions                 write overlay + read tracking, validated at commit
                                                    |

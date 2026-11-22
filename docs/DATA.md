@@ -38,7 +38,7 @@ These are binary files in polydb's own format and contain whatever the user stor
 
 | Source | Where | Effect on reproducibility |
 |---|---|---|
-| Generated document `_id` | `src/doc.rs`: current time in milliseconds plus a sequence number | Ids differ between runs. Tests and the smoke script always supply `_id`, or check only the id's type. |
+| Generated document `_id` | `src/doc/mod.rs`: current time in milliseconds plus a sequence number | Ids differ between runs. Tests and the smoke script always supply `_id`, or check only the id's type. |
 | MongoDB `ObjectId` values | created by pymongo on the client | Same as above. |
 | Thread scheduling | concurrent-client tests | Tests assert only the final total, which is the same for every interleaving. |
 | Free ports | chosen by the operating system (port 0) | Port numbers differ between runs; no output depends on them. |

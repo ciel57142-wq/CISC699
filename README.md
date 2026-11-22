@@ -130,7 +130,7 @@ polydb calls no external service and needs no API key, token or account. It is i
 
 ## Driver check (optional)
 
-`tests/drivers.py` runs 39 checks through unmodified redis-py, psycopg2 and pymongo, including concurrent clients and one transaction read back through three protocols.
+`tests/drivers.py` runs 45 checks through unmodified redis-py, psycopg2 and pymongo, including concurrent clients and one transaction read back through three protocols.
 
 ```sh
 bash scripts/driver_checks.sh      # or: make drivers
@@ -153,9 +153,11 @@ The build compiles polydb, runs the Rust tests and the smoke comparison, and fai
 |---|---|---|
 | `cargo test --release --locked` | correct behaviour of all three models, transactions, recovery (`tests/integration.rs`) | 22 |
 | | failure paths: bad arguments, damaged files, port conflicts, garbage and deeply nested input on every port, killing the server (`tests/hardening.rs`) | 23 |
+| | SQL engine: constraints, foreign keys, joins, subqueries, indexes (`tests/relational.rs`) and parser unit tests | 37 + 6 |
+| | document model: types, paths, every query/update operator, bulk writes, indexes checked against unindexed results, aggregation, schemas, transactions, restarts and torn logs (`tests/document.rs`) | 24 |
 | | library example in `src/lib.rs` compiles | 1 |
 | `bash scripts/smoke.sh` | scripted session equals stored output | 64 lines |
-| `bash scripts/driver_checks.sh` | third-party drivers | 39 checks |
+| `bash scripts/driver_checks.sh` | third-party drivers | 45 checks |
 | `bash scripts/clean_run.sh` | all of the above in a fresh copy, with a log in `docs/evidence/` | |
 
 Tests are deterministic: fixed inputs, a fixed-seed byte generator for the garbage-input test, operating-system-assigned free ports, and no dependence on the clock.
@@ -203,7 +205,7 @@ polydb ships with **no dataset** and downloads none. Every test creates its own 
 Cargo.toml, Cargo.lock      package manifest and lock file (no dependencies)
 src/                        the engine (about 5,600 lines)
   storage.rs keys.rs          ordered map, write-ahead log, snapshot, key layout
-  sql/ doc.rs kv.rs           the three data models
+  sql/ doc/ kv.rs             the three data models
   lib.rs value.rs error.rs    sessions, transactions, value type, errors
   server.rs resp.rs           native and Redis listeners
   pgwire.rs mongo.rs          PostgreSQL and MongoDB listeners
@@ -211,7 +213,9 @@ src/                        the engine (about 5,600 lines)
 tests/
   integration.rs              22 behaviour tests
   hardening.rs                23 failure-path tests
-  drivers.py                  39 checks through third-party drivers
+  relational.rs               37 SQL engine tests
+  document.rs                 24 document-model tests
+  drivers.py                  45 checks through third-party drivers
   requirements-drivers.txt    pinned driver versions
   fixtures/                   smoke script and its expected output
 scripts/                    check_env, smoke, driver_checks, serve, clean_run
