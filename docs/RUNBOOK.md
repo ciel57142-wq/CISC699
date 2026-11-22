@@ -20,7 +20,7 @@ How to build, start, check, stop, back up and recover polydb. Commands are run f
   files in DIRECTORY        data.wal   data.snap   polydb.format   LOCK
 ```
 
-One process, no external services. All four listeners share one in-memory ordered map. Each model stores its entries under its own key prefix, so a table, a collection and a key with the same name never collide. A commit is validated against concurrent commits, written to `data.wal` as one checksummed record, flushed to disk with `fsync`, then applied. `CHECKPOINT` (or a log over 64 MB) writes the whole map to `data.snap` and empties the log; it is optional and never needed for durability. The full storage design is in [STORAGE.md](STORAGE.md).
+One process, no external services. All four listeners share one in-memory ordered map. Each model stores its entries under its own key prefix, so a table, a collection and a key with the same name never collide. A commit is validated against concurrent commits, written to `data.wal` as a `BEGIN` / data / `COMMIT` group of LSN-numbered, checksummed records, flushed to disk with `fsync`, then applied. `CHECKPOINT` (or a log over 64 MB) writes the whole map to `data.snap` and empties the log; it is optional and never needed for durability. The full storage design is in [STORAGE.md](STORAGE.md).
 
 ## Packaging flow
 

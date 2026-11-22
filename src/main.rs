@@ -88,6 +88,10 @@ fn open(path: Option<&str>, memory: bool) -> Database {
     if torn > 0 {
         eprintln!("recovery: discarded {torn} byte(s) of an interrupted final commit in '{path}'");
     }
+    let rolled_back = db.recovery_report().rolled_back.len();
+    if rolled_back > 0 {
+        eprintln!("recovery: rolled back {rolled_back} incomplete transaction(s) in '{path}'");
+    }
     db
 }
 

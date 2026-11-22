@@ -19,7 +19,7 @@ warnings only), `scripts/smoke.sh`, `tests/drivers.py` and
 ## Feature status
 
 ### Complete and tested
-- **Storage/WAL:** torn final record dropped; interior corruption refused (`Error::Corrupt`) with opt-in salvage; repeated recovery stable; interrupted checkpoints (stray temp file, rename-before-truncate) recover; uncommitted transactions vanish; killing a writing server loses no acknowledged write (tested with the real binary).
+- **Storage/WAL:** format 2 log with LSNs, transaction ids and BEGIN/PUT/DELETE/COMMIT/ABORT/CHECKPOINT records; recovery redoes committed and rolls back incomplete transactions (ABORT logged), idempotent and crash-safe itself; WAL flushed before every snapshot; deterministic fail points (`FailPoint`) around log writes, commit records, snapshots, checkpoint, log truncation and recovery; format 1 directories open unchanged and convert on first write; torn final record dropped; interior corruption refused (`Error::Corrupt`) with opt-in salvage; repeated recovery stable; interrupted checkpoints (stray temp file, rename-before-truncate) recover; uncommitted transactions vanish; killing a writing server loses no acknowledged write (tested with the real binary).
 - **Process safety:** exclusive directory lock, released on drop (explicit unlock) and on process death; concurrent sessions with serializable isolation (concurrent transfer test keeps totals; no lost increments).
 - **Relational:** CREATE/DROP/ALTER (add/drop/rename column, rename table, add/drop CHECK constraint), INSERT/UPDATE/DELETE (incl. INSERT … SELECT, DEFAULT), SELECT with WHERE/GROUP BY/HAVING/DISTINCT/ORDER BY/LIMIT/OFFSET, INNER/LEFT/RIGHT/FULL/CROSS joins, UNION [ALL], IN/EXISTS/scalar/correlated/derived subqueries, CASE/CAST/date-time/JSON paths/scalar functions, three-valued NULL logic. Differentially tested against SQLite.
 - **Constraints:** single and composite PK, single and multi-column UNIQUE, DEFAULT (literal and time functions), NOT NULL, CHECK, FOREIGN KEY with RESTRICT/CASCADE/SET NULL; enforced inside transactions, atomic per statement, persisted; property-tested invariants.
@@ -61,6 +61,7 @@ warnings only), `scripts/smoke.sh`, `tests/drivers.py` and
 | `tests/property.rs` (7) | index vs scan (tables, documents), rollback, restart, UNIQUE/FK invariants, expiry, PBSQL vs SQL vs document |
 | `tests/differential.rs` (1) | random queries vs SQLite (python3 sqlite3; skips with a message if absent) |
 | `tests/recovery.rs` (8) | WAL/recovery edge cases, kill test, locking, concurrency, large data, limits, malformed input |
+| `tests/wal_recovery.rs` (17), `src/storage.rs` unit tests (3) | fail-point crash tests: torn/corrupt records, crashes around the commit record, every checkpoint step, during recovery, crash storm; format 1 conversion |
 | `tests/streaming.rs` (6) | document indexes, early termination, spilling, RIGHT/FULL joins, cancellation |
 | `tests/kv.rs` (7), `tests/protocols.rs` (5) | KV and TTL cleanup; raw-wire PostgreSQL extended/cancel, Redis, Mongo indexes, native |
 | `tests/crossmodel.rs` (5), `tests/docsuite.rs` (6), `tests/documents.rs` (4) | cross-model integration; document CRUD and aggregation |

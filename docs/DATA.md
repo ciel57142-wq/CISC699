@@ -30,7 +30,7 @@ A database directory (default `./polydb-data`) holds at most three files:
 |---|---|
 | `polydb.format` | text: format magic, format version, whether a snapshot exists |
 | `LOCK` | empty; locked while a process has the database open |
-| `data.wal` | write-ahead log: one checksummed record per commit |
+| `data.wal` | write-ahead log: LSN-numbered checksummed records, `BEGIN` / data / `COMMIT` per transaction |
 | `data.snap` | full snapshot, written by `CHECKPOINT` or when the log passes 64 MB |
 | `data.snap.tmp`, `polydb.format.tmp` | exist only while a checkpoint or format update is being written |
 | `data.wal.corrupt` | only after opening a damaged log with `salvage` |

@@ -41,6 +41,7 @@ pub mod value;
 
 pub use doc::FindOptions;
 pub use error::{Error, Result};
+pub use storage::{FailPoint, Faults, RecoveryReport};
 pub use value::Value;
 
 use std::cell::RefCell;
@@ -299,6 +300,29 @@ impl Database {
     /// Open with explicit options, e.g. salvaging a log with interior corruption.
     pub fn open_with(path: impl AsRef<Path>, opts: &storage::OpenOptions) -> Result<Database> {
         Ok(Database::from_store(Store::open_with(path, opts)?))
+    }
+
+    /// [`Database::open_with`] with deterministic fail points armed; they
+    /// also cover the recovery that runs while opening. For crash testing.
+    pub fn open_with_faults(
+        path: impl AsRef<Path>,
+        opts: &storage::OpenOptions,
+        faults: Faults,
+    ) -> Result<Database> {
+        Ok(Database::from_store(Store::open_with_faults(
+            path, opts, faults,
+        )?))
+    }
+
+    /// Arm a fail point: the `nth` time execution reaches `point`, the store
+    /// behaves as if the process died there and refuses further writes.
+    pub fn inject_fault(&mut self, point: FailPoint, nth: u64) {
+        self.write_lock().store.inject(point, nth);
+    }
+
+    /// What crash recovery found and did when this database was opened.
+    pub fn recovery_report(&self) -> RecoveryReport {
+        self.read_lock().store.recovery_report().clone()
     }
 
     /// A database that lives only in memory.

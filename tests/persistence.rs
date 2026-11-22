@@ -689,17 +689,60 @@ fn a_newer_format_version_is_refused() {
     fs::remove_dir_all(&dir).unwrap();
 }
 
+/// CRC-32 (IEEE), as used by both on-disk formats.
+fn crc32(data: &[u8]) -> u32 {
+    let mut c = !0u32;
+    for &b in data {
+        c ^= b as u32;
+        for _ in 0..8 {
+            c = if c & 1 != 0 {
+                0xEDB8_8320 ^ (c >> 1)
+            } else {
+                c >> 1
+            };
+        }
+    }
+    !c
+}
+
+/// One commit in the format-1 record layout that polydb 0.2.0 wrote:
+/// `len | crc32(payload) | count | { tag | klen | key | vlen | value }*`.
+fn v1_record(entries: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
+    let mut payload = (entries.len() as u32).to_le_bytes().to_vec();
+    for (k, v) in entries {
+        payload.push(1);
+        payload.extend_from_slice(&(k.len() as u32).to_le_bytes());
+        payload.extend_from_slice(k);
+        payload.extend_from_slice(&(v.len() as u32).to_le_bytes());
+        payload.extend_from_slice(v);
+    }
+    let mut out = (payload.len() as u32).to_le_bytes().to_vec();
+    out.extend_from_slice(&crc32(&payload).to_le_bytes());
+    out.extend_from_slice(&payload);
+    out
+}
+
 #[test]
 fn directories_from_polydb_0_2_0_open_unchanged() {
-    // 0.2.0 wrote only data.wal / data.snap with the same record layout and no format file.
+    // 0.2.0 wrote only data.wal / data.snap in the format-1 record layout and
+    // no format file. Build such a directory byte for byte, holding exactly
+    // the entries the current engine stores for two keys.
+    let src = tmp("legacy-src");
+    polydb(&src, "SET before checkpoint\nSET after checkpoint\n").assert_no_errors();
+    let entries: Vec<(Vec<u8>, Vec<u8>)> = {
+        let store = polydb::storage::Store::open(&src).unwrap();
+        store
+            .scan(b"")
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    };
+    let is_after = |k: &[u8]| k.windows(5).any(|w| w == b"after");
+    let (logged, snapped): (Vec<_>, Vec<_>) = entries.into_iter().partition(|(k, _)| is_after(k));
+    assert!(!logged.is_empty() && !snapped.is_empty());
     let dir = tmp("legacy");
-    polydb(
-        &dir,
-        "SET before checkpoint\nCHECKPOINT\nSET after checkpoint\n",
-    )
-    .assert_no_errors();
-    fs::remove_file(dir.join("polydb.format")).unwrap();
-    fs::remove_file(dir.join("LOCK")).unwrap();
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("data.snap"), v1_record(&snapped)).unwrap();
+    fs::write(dir.join("data.wal"), v1_record(&logged)).unwrap();
     assert_eq!(file_names(&dir), vec!["data.snap", "data.wal"]);
     let wal_before = fs::read(dir.join("data.wal")).unwrap();
 
@@ -715,7 +758,30 @@ fn directories_from_polydb_0_2_0_open_unchanged() {
         format.starts_with("polydb-storage\nversion=1\n") && format.contains("snapshot=1"),
         "{format}"
     );
+
+    // The first write converts the directory to the current format.
+    polydb(&dir, "SET third write\n").assert_no_errors();
+    let format = fs::read_to_string(dir.join("polydb.format")).unwrap();
+    assert!(
+        format.starts_with("polydb-storage\nversion=2\n"),
+        "{format}"
+    );
+    for f in ["data.snap", "data.wal"] {
+        assert_eq!(
+            &fs::read(dir.join(f)).unwrap()[..2],
+            &[0xD7, 0xB1],
+            "{f} is in format 2"
+        );
+    }
+    let r = polydb(&dir, "GET before\nGET after\nGET third\n");
+    assert_eq!(
+        r.lines(),
+        vec!["checkpoint", "checkpoint", "write"],
+        "{}",
+        r.stdout
+    );
     fs::remove_dir_all(&dir).unwrap();
+    fs::remove_dir_all(&src).unwrap();
 }
 
 #[test]
