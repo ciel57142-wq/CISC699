@@ -45,6 +45,7 @@ Step 3 prints one `test result` line per test target. The three that matter are:
 
 ```
 test result: ok. 23 passed; 0 failed; 0 ignored; ...     (tests/hardening.rs)
+test result: ok. 9 passed; 0 failed; 0 ignored; ...      (tests/document.rs)
 test result: ok. 22 passed; 0 failed; 0 ignored; ...     (tests/integration.rs)
 test result: ok. 37 passed; 0 failed; 0 ignored; ...     (tests/relational.rs)
 test result: ok. 1 passed; 0 failed; 0 ignored; ...      (Doc-tests polydb)
@@ -153,7 +154,9 @@ The build compiles polydb, runs the Rust tests and the smoke comparison, and fai
 |---|---|---|
 | `cargo test --release --locked` | correct behaviour of all three models, transactions, recovery (`tests/integration.rs`) | 22 |
 | | failure paths: bad arguments, damaged files, port conflicts, garbage and deeply nested input on every port, killing the server (`tests/hardening.rs`) | 23 |
+| | document engine: indexed vs unindexed results on 7,200 random queries, planner choices, index maintenance, aggregation, legacy JSON databases, a WAL torn at every byte (`tests/document.rs`) | 9 |
 | | library example in `src/lib.rs` compiles | 1 |
+| `cargo run --release --example doc_bench` | document-engine timings; results and method in [docs/PERFORMANCE-DOCUMENT.md](docs/PERFORMANCE-DOCUMENT.md) | |
 | `bash scripts/smoke.sh` | scripted session equals stored output | 64 lines |
 | `bash scripts/driver_checks.sh` | third-party drivers | 39 checks |
 | `bash scripts/clean_run.sh` | all of the above in a fresh copy, with a log in `docs/evidence/` | |
@@ -192,7 +195,7 @@ polydb ships with **no dataset** and downloads none. Every test creates its own 
 - **Large-message allocation (open):** the Redis and PostgreSQL listeners accept a declared message length of up to 512 MB and 256 MB and allocate it before reading.
 - **Log damage:** recovery stops at the first log record that fails its checksum. A torn final record (the normal crash case) is handled correctly; damage in the middle of the log also drops the commits after it.
 - Commits wait for their own `fsync`, so write throughput is bounded by the disk.
-- Indexes serve equality only; range queries and joins scan.
+- Document sort specs apply their keys in alphabetical order (they are JSON objects, stored sorted). Document projection is top-level only.
 - SQL has no date/time types, views, CTEs (`WITH`), window functions, `RETURNING` or `ON ... SET DEFAULT`; foreign-key `NO ACTION` is checked immediately, like `RESTRICT`. Subqueries nest at most 6 deep.
 - No lock file: do not open the same directory from two processes at once.
 - Object keys in documents are stored sorted, not in insertion order.
@@ -203,7 +206,7 @@ polydb ships with **no dataset** and downloads none. Every test creates its own 
 Cargo.toml, Cargo.lock      package manifest and lock file (no dependencies)
 src/                        the engine (about 5,600 lines)
   storage.rs keys.rs          ordered map, write-ahead log, snapshot, key layout
-  sql/ doc.rs kv.rs           the three data models
+  sql/ doc/ kv.rs             the three data models (doc/: codec, filter, plan, exec, aggregate, update)
   lib.rs value.rs error.rs    sessions, transactions, value type, errors
   server.rs resp.rs           native and Redis listeners
   pgwire.rs mongo.rs          PostgreSQL and MongoDB listeners
@@ -211,6 +214,8 @@ src/                        the engine (about 5,600 lines)
 tests/
   integration.rs              22 behaviour tests
   hardening.rs                23 failure-path tests
+  relational.rs               37 SQL tests
+  document.rs                 9 document-engine tests
   drivers.py                  39 checks through third-party drivers
   requirements-drivers.txt    pinned driver versions
   fixtures/                   smoke script and its expected output
@@ -226,6 +231,7 @@ docs/
   AUDIT.md                    what the repository audit found and changed
   EVIDENCE.md                 file manifest with checksums
   REFERENCE.md                command syntax, library API, protocol subsets
+  PERFORMANCE-DOCUMENT.md     document engine profiling, changes, before/after numbers
   WALKTHROUGH.md              script for the recorded walkthrough
   evidence/                   clean-run logs
 ```

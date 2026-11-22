@@ -318,8 +318,39 @@ impl Database {
         self.run(true, |ctx| doc::insert(ctx, collection, doc))
     }
 
+    /// Insert documents in one atomic statement and return their `_id`s.
+    pub fn doc_insert_many(&mut self, collection: &str, docs: Vec<Value>) -> Result<Vec<Value>> {
+        self.run(true, |ctx| doc::insert_many(ctx, collection, docs))
+    }
+
     pub fn doc_find(&mut self, collection: &str, filter: &Value, opts: &FindOptions) -> Result<Vec<Value>> {
         self.run(false, |ctx| doc::find(ctx, collection, filter, opts))
+    }
+
+    /// Number of documents matching `filter`.
+    pub fn doc_count(&mut self, collection: &str, filter: &Value) -> Result<usize> {
+        self.run(false, |ctx| doc::count(ctx, collection, filter))
+    }
+
+    /// The access path `doc_find` would use (for tests and tuning).
+    pub fn doc_explain(&mut self, collection: &str, filter: &Value, opts: &FindOptions) -> Result<Value> {
+        self.run(false, |ctx| doc::explain(ctx, collection, filter, opts))
+    }
+
+    /// Run an aggregation pipeline (`$match $sort $skip $limit $project
+    /// $addFields $group $count $unwind`).
+    pub fn doc_aggregate(&mut self, collection: &str, pipeline: &[Value]) -> Result<Vec<Value>> {
+        self.run(false, |ctx| doc::aggregate(ctx, collection, pipeline))
+    }
+
+    /// Check that a collection's documents and index entries agree.
+    pub fn doc_validate(&mut self, collection: &str) -> Result<Value> {
+        self.run(false, |ctx| doc::validate(ctx, collection))
+    }
+
+    /// Rebuild a collection's indexes; returns how many.
+    pub fn doc_reindex(&mut self, collection: &str) -> Result<usize> {
+        self.run(true, |ctx| doc::reindex(ctx, collection))
     }
 
     /// Update every matching document; returns how many.
@@ -376,7 +407,7 @@ impl Database {
         let s = command.trim().trim_end_matches(';').trim_end();
         if let Some(rest) = s.strip_prefix("db.") {
             let method = rest.split_once('.').map_or("", |(_, m)| m.split('(').next().unwrap_or("")).to_ascii_lowercase();
-            let read = matches!(method.trim(), "find" | "findone" | "count" | "countdocuments");
+            let read = matches!(method.trim(), "find" | "findone" | "count" | "countdocuments" | "aggregate" | "validate");
             return self.run(!read, |ctx| doc_command(ctx, s));
         }
         let (word, rest) = match s.find(char::is_whitespace) {
@@ -578,31 +609,57 @@ fn doc_command(ctx: &mut Ctx, s: &str) -> Result<Output> {
         return Err(Error::Parse(format!("{method}() cannot be chained")));
     }
     match method.as_str() {
-        "insert" | "insertone" | "insertmany" => match need(0, "a document")? {
-            Value::Array(docs) => {
-                let mut ids = Vec::new();
-                for d in docs {
-                    ids.push(doc::insert(ctx, coll, d.clone())?);
-                }
-                Ok(Output::Scalar(Value::Array(ids)))
+        "insert" | "insertone" | "insertmany" => {
+            need(0, "a document")?;
+            // Move the parsed documents into the store instead of copying them.
+            let mut calls = calls;
+            match calls.swap_remove(0).1.swap_remove(0) {
+                Value::Array(docs) => Ok(Output::Scalar(Value::Array(doc::insert_many(ctx, coll, docs)?))),
+                d => Ok(Output::Scalar(doc::insert(ctx, coll, d)?)),
             }
-            d => Ok(Output::Scalar(doc::insert(ctx, coll, d.clone())?)),
-        },
+        }
         "find" | "findone" => {
             let mut opts = FindOptions::default();
+            if let Some(p) = args.get(1) {
+                opts.projection = Some(p.clone());
+            }
+            let mut explain = false;
             for (name, a) in &calls[1..] {
+                if name == "explain" {
+                    explain = true;
+                    continue;
+                }
                 let first = a.first().ok_or_else(|| Error::Parse(format!("{name}() needs an argument")))?;
                 match name.as_str() {
                     "sort" => opts.sort = Some(first.clone()),
                     "limit" => opts.limit = Some(as_count(first)?),
                     "skip" => opts.skip = as_count(first)?,
-                    _ => return Err(Error::Parse(format!("unknown modifier .{name}(); use sort, limit or skip"))),
+                    "projection" => opts.projection = Some(first.clone()),
+                    _ => {
+                        return Err(Error::Parse(format!(
+                            "unknown modifier .{name}(); use sort, limit, skip, projection or explain"
+                        )))
+                    }
                 }
             }
             if method == "findone" {
                 opts.limit = Some(1);
             }
+            if explain {
+                return Ok(Output::Docs(vec![doc::explain(ctx, coll, arg(0), &opts)?]));
+            }
             Ok(Output::Docs(doc::find(ctx, coll, arg(0), &opts)?))
+        }
+        "aggregate" => {
+            let Value::Array(pipeline) = need(0, "a pipeline array")? else {
+                return Err(Error::Parse("aggregate() takes an array of stages".into()));
+            };
+            Ok(Output::Docs(doc::aggregate(ctx, coll, pipeline)?))
+        }
+        "validate" => Ok(Output::Docs(vec![doc::validate(ctx, coll)?])),
+        "reindex" => {
+            let n = doc::reindex(ctx, coll)?;
+            Ok(Output::Done(format!("{n} index(es) rebuilt on {coll}")))
         }
         "update" | "updatemany" | "updateone" => {
             let multi = method != "updateone";
@@ -634,9 +691,7 @@ fn doc_command(ctx: &mut Ctx, s: &str) -> Result<Output> {
                 format!("{coll}.{field} is already indexed")
             }))
         }
-        "count" | "countdocuments" => {
-            Ok(Output::Scalar(Value::Int(doc::find(ctx, coll, arg(0), &FindOptions::default())?.len() as i64)))
-        }
+        "count" | "countdocuments" => Ok(Output::Scalar(Value::Int(doc::count(ctx, coll, arg(0))? as i64))),
         "drop" => {
             let existed = doc::drop(ctx, coll)?;
             Ok(Output::Done(if existed {
@@ -646,7 +701,7 @@ fn doc_command(ctx: &mut Ctx, s: &str) -> Result<Output> {
             }))
         }
         other => Err(Error::Parse(format!(
-            "unknown collection method '{other}': use insert, find, update, delete, count, createIndex or drop"
+            "unknown collection method '{other}': use insert, find, aggregate, update, delete, count, createIndex, reIndex, validate or drop"
         ))),
     }
 }

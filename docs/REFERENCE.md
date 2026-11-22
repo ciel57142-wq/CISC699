@@ -47,13 +47,16 @@ EXPLAIN SELECT ...        DESCRIBE t        CHECK TABLE t | CHECK TABLES        
 ### Document
 
 ```
-db.<coll>.insert({...})  |  db.<coll>.insert([{...}, {...}])
-db.<coll>.find({filter}) [.sort({field: 1|-1})] [.skip(n)] [.limit(n)]
-db.<coll>.findOne({filter})
+db.<coll>.insert({...})  |  db.<coll>.insertMany([{...}, {...}])   (a batch is one atomic statement)
+db.<coll>.find({filter} [, {projection}]) [.sort({field: 1|-1})] [.skip(n)] [.limit(n)] [.explain()]
+db.<coll>.findOne({filter} [, {projection}])
+db.<coll>.aggregate([{stage}, ...])
 db.<coll>.update({filter}, {update})       (updateOne changes only the first match)
 db.<coll>.delete({filter})                 (deleteOne removes only the first match)
 db.<coll>.createIndex({field: 1})
 db.<coll>.count({filter})
+db.<coll>.validate()                       (documents and index entries agree?)
+db.<coll>.reIndex()                        (rebuild every index of the collection)
 db.<coll>.drop()
 ```
 
@@ -62,7 +65,11 @@ db.<coll>.drop()
 - Updates: `$set`, `$unset`, `$inc`, `$push`, `$addToSet`, `$pull`; an update with no operators replaces the document.
 - JSON is accepted in strict form or shell form (unquoted keys, single-quoted strings).
 - Limits: JSON text may nest 128 levels and a stored document 100 levels, counting the innermost value.
-- A filter on `_id` is a direct lookup and equality on an indexed field an index lookup; everything else scans the collection.
+- Projection: top-level fields, `{a: 1, b: 1}` keeps those plus `_id` (`_id: 0` drops it), `{a: 0}` drops `a`. Only projected fields are decoded.
+- Sort specs are JSON objects, whose keys are kept sorted, so a multi-key sort applies its keys in alphabetical order (`{b: 1, a: -1}` sorts by `a` first).
+- Aggregation stages: `$match $sort $skip $limit $project $addFields/$set $group $count $unwind`. `$group` takes `_id: null | <literal> | "$path" | {name: "$path", ...}` and the accumulators `$sum $avg $min $max $first $last $push $addToSet $count`. Leading `$match`/`$sort`/`$skip`/`$limit` stages run as one indexed query; `$group` and `$count` read only the fields they use.
+- Access paths (shown by `.explain()`): `_id` equality or `$in` is a direct lookup and an `_id` range a key-range scan. An index serves equality, `$in`, ranges (`$gt $gte $lt $lte`, one type at a time), `null` / `$exists: false`, and a `sort` on the indexed field (when every document has a scalar there). Everything else scans the collection. Every candidate is still checked against the full filter, except where the lookup is exact (an integer/string `_id`, or a lone text/bool equality on an index).
+- Storage: documents are stored in a compact binary layout (see `src/doc/codec.rs`) that lets filters, sort keys and index maintenance read single fields without decoding the document. Databases written by 0.2 (JSON documents) are read as they are; a document is rewritten in the binary layout when it is updated. Indexes created by 0.2 work as before; `reIndex()` adds the entries that let them also serve `null` queries and sorts.
 
 ### Key-value
 
@@ -133,7 +140,7 @@ The native protocol replies look like this:
 
 - **Redis:** strings only: `GET SET MGET MSET DEL EXISTS INCR DECR INCRBY DECRBY KEYS DBSIZE STRLEN APPEND GETSET SETNX TTL PING ECHO`. No expiry, lists, hashes, sets, pub/sub or `MULTI`.
 - **PostgreSQL:** the simple-query flow that psql, libpq and psycopg2 use. No server-side prepared statements (the extended protocol used by default in JDBC, asyncpg, node-postgres with parameters), no `COPY`, no `pg_catalog`, and the SQL is the subset listed below. Every polydb command works on this port, including `db.coll.find(...)` and `GET key`.
-- **MongoDB:** `insert find update delete count distinct drop createIndexes listCollections` and `aggregate` with `$match $sort $skip $limit $count`. One database (the database name is ignored), no cursors beyond the first batch, no change streams, no general `$group`. `mongosh` has not been tested.
+- **MongoDB:** `insert find update delete count distinct drop createIndexes listCollections` and `aggregate` with the stages listed under [Document](#document). One database (the database name is ignored), no cursors beyond the first batch, no change streams, no expression operators beyond field paths and `$literal`. `mongosh` has not been tested.
 - **No authentication or TLS on any port.** The server binds to 127.0.0.1 by default; only expose it on a network you trust.
 
 ## Concurrency and correctness
@@ -149,7 +156,7 @@ CREATE INDEX users_city ON users (city)        DROP INDEX users_city ON users
 db.people.createIndex({city: 1})
 ```
 
-Equality filters on an indexed column or field (`WHERE city = 'London'`, `{city: 'London'}`, also combined with other conditions by `AND`) read only the matching entries instead of scanning. Indexes on array fields index each element. Primary keys and `_id` are always direct lookups. Range conditions (`>`, `<`, `LIKE`) still scan.
+Equality filters on an indexed column or field (`WHERE city = 'London'`, `{city: 'London'}`, also combined with other conditions by `AND`) read only the matching entries instead of scanning. Indexes on array fields index each element. Primary keys and `_id` are always direct lookups. SQL range scans are described under [Relational](#relational) (`EXPLAIN` shows the path); document indexes also serve `$in`, ranges, `null` and sorts (`.explain()` shows the path). `LIKE` scans.
 
 ## How it works
 
@@ -157,7 +164,7 @@ Equality filters on an indexed column or field (`WHERE city = 'London'`, `{city:
   native :7878    Redis :6380    PostgreSQL :5433    MongoDB :27018      server.rs, resp.rs,
        \              |                |                 /               pgwire.rs, mongo.rs
         +---------- one session per connection ---------+               lib.rs
-        |      SQL       |    documents    |  key-value  |               sql/, doc.rs, kv.rs  
+        |      SQL       |    documents    |  key-value  |               sql/, doc/, kv.rs    
         +------------------------------------------------+
         |  transaction overlay + read tracking (Ctx)     |               storage.rs
         |  ordered map  +  write-ahead log  +  snapshot  |

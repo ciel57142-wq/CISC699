@@ -332,96 +332,6 @@ fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
-fn aggregate(db: &mut Database, coll: &str, pipeline: &[Value]) -> Result<Vec<Value>, Error> {
-    let empty = Value::Object(BTreeMap::new());
-    let mut docs: Option<Vec<Value>> = None;
-    for (i, stage) in pipeline.iter().enumerate() {
-        let Value::Object(st) = stage else {
-            return Err(Error::Parse("pipeline stages must be objects".into()));
-        };
-        let Some((name, arg)) = st.iter().next() else {
-            continue;
-        };
-        if name == "$match" && i == 0 {
-            docs = Some(db.doc_find(coll, arg, &FindOptions::default())?);
-            continue;
-        }
-        let mut cur = match docs.take() {
-            Some(d) => d,
-            None => db.doc_find(coll, &empty, &FindOptions::default())?,
-        };
-        match name.as_str() {
-            "$match" => {
-                let mut kept = Vec::new();
-                for d in cur {
-                    if doc::matches(&d, arg)? {
-                        kept.push(d);
-                    }
-                }
-                cur = kept;
-            }
-            "$sort" => {
-                let Value::Object(spec) = arg else {
-                    return Err(Error::Type("$sort expects an object".into()));
-                };
-                cur.sort_by(|a, b| {
-                    for (path, dir) in spec {
-                        let (x, y) =
-                            (doc::get_path(a, path).unwrap_or(&Value::Null), doc::get_path(b, path).unwrap_or(&Value::Null));
-                        let o = x.total_cmp(y);
-                        if o != std::cmp::Ordering::Equal {
-                            return if dir.as_f64().map_or(false, |n| n < 0.0) { o.reverse() } else { o };
-                        }
-                    }
-                    std::cmp::Ordering::Equal
-                });
-            }
-            "$skip" => cur = cur.into_iter().skip(count_of(Some(arg)).unwrap_or(0)).collect(),
-            "$limit" => cur.truncate(count_of(Some(arg)).unwrap_or(0)),
-            "$count" => {
-                let field = arg.as_str().unwrap_or("count");
-                cur = if cur.is_empty() { vec![] } else { vec![obj(vec![(field, Value::Int(cur.len() as i64))])] };
-            }
-            "$group" => {
-                // Only the whole-set count that drivers send for countDocuments:
-                // {$group: {_id: <constant>, n: {$sum: 1}}}
-                let constant_id = !matches!(arg.get("_id"), Some(Value::Text(s)) if s.starts_with('$'));
-                let counters: Vec<&String> = match arg {
-                    Value::Object(g) => g
-                        .iter()
-                        .filter(|(k, v)| *k != "_id" && v.get("$sum").and_then(Value::as_f64) == Some(1.0))
-                        .map(|(k, _)| k)
-                        .collect(),
-                    _ => vec![],
-                };
-                let fields = match arg {
-                    Value::Object(g) => g.len(),
-                    _ => 0,
-                };
-                if !constant_id || counters.len() + 1 != fields {
-                    return Err(Error::Parse("$group is only supported for counting ({_id: 1, n: {$sum: 1}})".into()));
-                }
-                cur = if cur.is_empty() {
-                    vec![]
-                } else {
-                    let mut g = BTreeMap::new();
-                    g.insert("_id".to_string(), arg.get("_id").cloned().unwrap_or(Value::Null));
-                    for c in counters {
-                        g.insert(c.clone(), Value::Int(cur.len() as i64));
-                    }
-                    vec![Value::Object(g)]
-                };
-            }
-            other => return Err(Error::Parse(format!("unsupported aggregation stage {other}"))),
-        }
-        docs = Some(cur);
-    }
-    match docs {
-        Some(d) => Ok(d),
-        None => db.doc_find(coll, &empty, &FindOptions::default()),
-    }
-}
-
 /// Execute one database command and build its reply document.
 fn command(db: &mut Database, name: &str, cmd: &Value, conn_id: i64) -> Value {
     let empty = Value::Object(BTreeMap::new());
@@ -475,16 +385,13 @@ fn command(db: &mut Database, name: &str, cmd: &Value, conn_id: i64) -> Value {
                     sort: cmd.get("sort").filter(|s| matches!(s, Value::Object(o) if !o.is_empty())).cloned(),
                     skip: count_of(cmd.get("skip")).unwrap_or(0),
                     limit: count_of(cmd.get("limit")),
+                    projection: cmd.get("projection").filter(|p| matches!(p, Value::Object(_))).cloned(),
                 };
-                let mut docs = db.doc_find(coll, cmd.get("filter").unwrap_or(&empty), &opts)?;
-                if let Some(p) = cmd.get("projection") {
-                    docs = docs.into_iter().map(|d| doc::project(d, p)).collect();
-                }
-                cursor(&ns, docs)
+                cursor(&ns, db.doc_find(coll, cmd.get("filter").unwrap_or(&empty), &opts)?)
             }
-            "aggregate" => cursor(&ns, aggregate(db, coll, list(cmd, "pipeline"))?),
+            "aggregate" => cursor(&ns, db.doc_aggregate(coll, list(cmd, "pipeline"))?),
             "count" => {
-                let n = db.doc_find(coll, cmd.get("query").unwrap_or(&empty), &FindOptions::default())?.len();
+                let n = db.doc_count(coll, cmd.get("query").unwrap_or(&empty))?;
                 ok(vec![("n", Value::Int(n as i64))])
             }
             "distinct" => {

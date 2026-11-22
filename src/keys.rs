@@ -56,6 +56,12 @@ pub fn row_prefix(t: &str) -> Vec<u8> {
 pub fn doc_prefix(c: &str) -> Vec<u8> {
     key(&[b"d", c.as_bytes(), b""])
 }
+/// The first key after every document of collection `c`.
+pub fn doc_prefix_end(c: &str) -> Vec<u8> {
+    let mut k = key(&[b"d", c.as_bytes()]);
+    k.push(1);
+    k
+}
 
 /// Order-preserving encoding of a primary key / document id.
 /// Integers sort numerically, strings lexicographically, integers before strings.
@@ -120,6 +126,37 @@ pub fn encode_index_value(v: &Value) -> Option<Vec<u8>> {
             }
             out.extend_from_slice(&[0, 0]);
             Some(out)
+        }
+        _ => None,
+    }
+}
+
+/// First byte of a document-index entry for a document whose value at the
+/// indexed path is not an indexable scalar (missing, null, array or object).
+/// Below every scalar tag, so these entries sort first. Only indexes created
+/// with this marker (`nulls` in the collection metadata) have them.
+pub const INDEX_OTHER: u8 = 0;
+
+/// Length of the [`encode_index_value`] encoding (or the [`INDEX_OTHER`]
+/// marker) at the start of `b`.
+pub fn index_value_len(b: &[u8]) -> Option<usize> {
+    match *b.first()? {
+        INDEX_OTHER => Some(1),
+        1 => (b.len() >= 2).then_some(2),
+        2 => (b.len() >= 9).then_some(9),
+        4 => {
+            let mut i = 1;
+            while i + 1 < b.len() {
+                if b[i] == 0 {
+                    if b[i + 1] == 0 {
+                        return Some(i + 2);
+                    }
+                    i += 2; // escaped NUL (0, 0xff)
+                } else {
+                    i += 1;
+                }
+            }
+            None
         }
         _ => None,
     }
