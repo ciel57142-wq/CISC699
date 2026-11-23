@@ -27,10 +27,11 @@ pub mod error;
 mod keys;
 pub mod kv;
 pub mod mongo;
+pub mod pbsql;
 pub mod pgwire;
 pub mod resp;
 pub mod server;
-mod sql;
+pub(crate) mod sql;
 pub mod storage;
 pub mod value;
 
@@ -44,7 +45,6 @@ use std::fmt;
 use std::path::Path;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use storage::{Ctx, ReadSet, Store, WriteSet};
-use value::JsonParser;
 
 /// The result of one command.
 #[derive(Debug, Clone, PartialEq)]
@@ -284,10 +284,23 @@ impl Database {
 
     // ------------------------------------------------------------ typed API
 
-    /// Run one SQL statement.
+    /// Run one relational PBSQL statement (SELECT, INSERT, UPDATE, DELETE,
+    /// DDL, EXPLAIN of those). Other kinds of statement are refused; use
+    /// [`Database::execute`] for those.
     pub fn sql(&mut self, statement: &str) -> Result<Output> {
-        let read = sql::is_read_only(statement);
-        self.run(!read, |ctx| sql::execute(ctx, statement))
+        let stmt = pbsql::parse(statement)?;
+        let relational = match &stmt {
+            pbsql::ast::Statement::Sql(_) => true,
+            pbsql::ast::Statement::Explain { stmt, .. } => matches!(**stmt, pbsql::ast::Statement::Sql(_)),
+            _ => false,
+        };
+        if !relational {
+            return Err(Error::Parse(format!(
+                "sql() runs relational statements; this is a {} statement, use execute()",
+                stmt.kind()
+            )));
+        }
+        self.execute_statement(stmt)
     }
 
     pub fn kv_set(&mut self, key: &str, value: &[u8]) -> Result<()> {
@@ -365,288 +378,41 @@ impl Database {
 
     // ---------------------------------------------------- unified commands
 
-    /// Run one command in any of the three languages:
+    /// Run one PBSQL statement (see `docs/PBSQL.md`):
     ///
-    /// * SQL: `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `CREATE TABLE|[UNIQUE] INDEX`, `DROP TABLE|INDEX`,
-    ///   `ALTER TABLE`, `TRUNCATE`, `EXPLAIN`, `DESCRIBE`, `CHECK TABLE`, `REINDEX`
+    /// * relational: `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `CREATE TABLE|[UNIQUE] INDEX`,
+    ///   `DROP TABLE|INDEX`, `ALTER TABLE`, `TRUNCATE`, `DESCRIBE`, `CHECK TABLE`, `REINDEX`;
+    ///   a FROM clause may also read `DOCUMENT(collection)` and `KV('prefix')`
     /// * documents: `db.<collection>.<method>(...)`
-    /// * key-value: `SET`, `GET`, `DEL`, `EXISTS`, `KEYS`, `INCR`
-    /// * control: `BEGIN`, `COMMIT`, `ROLLBACK`, `CHECKPOINT`, `SHOW TABLES`, `SHOW COLLECTIONS`
+    /// * key-value: `SET`, `GET`, `DEL`, `EXISTS`, `KEYS`, `INCR`, `DECR`
+    /// * control: `BEGIN`, `COMMIT`, `ROLLBACK`, `EXPLAIN [ANALYZE]`, `CHECKPOINT`,
+    ///   `SHOW TABLES`, `SHOW COLLECTIONS`
+    ///
+    /// The statement is lexed, parsed and semantically checked before it
+    /// touches any data; then it runs as one atomic unit (or inside the
+    /// session's open transaction).
     pub fn execute(&mut self, command: &str) -> Result<Output> {
-        let s = command.trim().trim_end_matches(';').trim_end();
-        if let Some(rest) = s.strip_prefix("db.") {
-            let method = rest.split_once('.').map_or("", |(_, m)| m.split('(').next().unwrap_or("")).to_ascii_lowercase();
-            let read = matches!(method.trim(), "find" | "findone" | "count" | "countdocuments");
-            return self.run(!read, |ctx| doc_command(ctx, s));
-        }
-        let (word, rest) = match s.find(char::is_whitespace) {
-            Some(i) => (&s[..i], s[i..].trim_start()),
-            None => (s, ""),
-        };
-        match word.to_ascii_lowercase().as_str() {
-            "" => Err(Error::Parse("empty command".into())),
-            "begin" => self.begin().map(|_| Output::Done("transaction started".into())),
-            "commit" => self.commit().map(|_| Output::Done("committed".into())),
-            "rollback" => self.rollback().map(|_| Output::Done("rolled back".into())),
-            "checkpoint" => self.checkpoint().map(|_| Output::Done("checkpoint written".into())),
-            "show" => {
-                let what = rest.to_ascii_lowercase();
-                let (header, names) = match what.as_str() {
-                    "tables" => ("table", self.run(false, |ctx| Ok(sql::tables(ctx)))?),
-                    "collections" => ("collection", self.run(false, |ctx| Ok(doc::collections(ctx)))?),
-                    _ => return Err(Error::Parse("use SHOW TABLES or SHOW COLLECTIONS".into())),
-                };
-                Ok(Output::Rows {
-                    columns: vec![header.to_string()],
-                    rows: names.into_iter().map(|n| vec![Value::Text(n)]).collect(),
-                })
-            }
-            w @ ("get" | "exists" | "keys") => self.run(false, |ctx| kv_command(ctx, w, rest)),
-            w @ ("set" | "del" | "incr") => self.run(true, |ctx| kv_command(ctx, w, rest)),
-            "select" | "insert" | "update" | "delete" | "create" | "drop" | "alter" | "truncate" | "explain"
-            | "describe" | "desc" | "check" | "reindex" => self.sql(s),
-            other => Err(Error::Parse(format!(
-                "unknown command '{other}': expected SQL, a db.<collection>.<method>(...) call, or SET/GET/DEL/EXISTS/KEYS/INCR"
-            ))),
-        }
+        let stmt = pbsql::parse(command)?;
+        self.execute_statement(stmt)
     }
-}
 
-// ------------------------------------------------------- key-value commands
-
-/// Take one argument: a bare word, or a quoted string with backslash escapes.
-fn take_arg(s: &str) -> Result<(String, &str)> {
-    let s = s.trim_start();
-    let mut chars = s.char_indices();
-    match chars.next() {
-        None => Err(Error::Parse("missing argument".into())),
-        Some((_, q @ ('"' | '\''))) => {
-            let mut out = String::new();
-            let mut escaped = false;
-            for (i, c) in chars {
-                if escaped {
-                    out.push(match c {
-                        'n' => '\n',
-                        't' => '\t',
-                        other => other,
-                    });
-                    escaped = false;
-                } else if c == '\\' {
-                    escaped = true;
-                } else if c == q {
-                    return Ok((out, &s[i + 1..]));
-                } else {
-                    out.push(c);
-                }
-            }
-            Err(Error::Parse("unterminated quoted argument".into()))
-        }
-        Some(_) => {
-            let end = s.find(char::is_whitespace).unwrap_or(s.len());
-            Ok((s[..end].to_string(), &s[end..]))
-        }
-    }
-}
-
-fn no_more(rest: &str) -> Result<()> {
-    if rest.trim().is_empty() {
-        Ok(())
-    } else {
-        Err(Error::Parse(format!("unexpected extra argument '{}'", rest.trim())))
-    }
-}
-
-fn kv_command(ctx: &mut Ctx, word: &str, rest: &str) -> Result<Output> {
-    if word == "keys" {
-        let prefix = if rest.trim().is_empty() { String::new() } else { take_arg(rest)?.0 };
-        let rows = kv::keys(ctx, &prefix).into_iter().map(|k| vec![Value::Text(k)]).collect();
-        return Ok(Output::Rows { columns: vec!["key".into()], rows });
-    }
-    let (key, rest) = take_arg(rest)?;
-    match word {
-        "set" => {
-            let rest = rest.trim();
-            if rest.is_empty() {
-                return Err(Error::Parse("SET needs a key and a value".into()));
-            }
-            // A quoted value is unescaped; anything else is taken verbatim to the end of the line.
-            let value = if rest.starts_with('"') || rest.starts_with('\'') {
-                let (v, tail) = take_arg(rest)?;
-                no_more(tail)?;
-                v
-            } else {
-                rest.to_string()
-            };
-            kv::set(ctx, &key, value.as_bytes());
-            Ok(Output::Done("OK".into()))
-        }
-        "get" => {
-            no_more(rest)?;
-            Ok(Output::Scalar(match kv::get(ctx, &key) {
-                Some(v) => Value::Text(String::from_utf8_lossy(&v).into_owned()),
-                None => Value::Null,
-            }))
-        }
-        "del" => {
-            no_more(rest)?;
-            Ok(Output::Scalar(Value::Int(kv::del(ctx, &key) as i64)))
-        }
-        "exists" => {
-            no_more(rest)?;
-            Ok(Output::Scalar(Value::Bool(kv::get(ctx, &key).is_some())))
-        }
-        _ => {
-            let by = if rest.trim().is_empty() {
-                1
-            } else {
-                rest.trim().parse::<i64>().map_err(|_| Error::Parse("INCR amount must be an integer".into()))?
-            };
-            Ok(Output::Scalar(Value::Int(kv::incr(ctx, &key, by)?)))
-        }
-    }
-}
-
-// -------------------------------------------------------- document commands
-
-/// Parse `method(args...).method(args...)` where each argument is JSON.
-fn parse_calls(s: &str) -> Result<Vec<(String, Vec<Value>)>> {
-    let b = s.as_bytes();
-    let mut pos = 0;
-    let mut calls = Vec::new();
-    let skip_ws = |pos: &mut usize| {
-        while *pos < b.len() && b[*pos].is_ascii_whitespace() {
-            *pos += 1;
-        }
-    };
-    loop {
-        let start = pos;
-        while pos < b.len() && (b[pos].is_ascii_alphanumeric() || b[pos] == b'_') {
-            pos += 1;
-        }
-        let name = s[start..pos].to_ascii_lowercase();
-        if name.is_empty() || b.get(pos) != Some(&b'(') {
-            return Err(Error::Parse("expected db.<collection>.<method>(...)".into()));
-        }
-        pos += 1;
-        let mut args = Vec::new();
-        loop {
-            skip_ws(&mut pos);
-            match b.get(pos) {
-                None => return Err(Error::Parse("missing ')'".into())),
-                Some(b')') => {
-                    pos += 1;
-                    break;
-                }
-                Some(b',') => pos += 1,
-                Some(_) => {
-                    let mut jp = JsonParser::at(s, pos);
-                    args.push(jp.value()?);
-                    pos = jp.pos;
-                }
+    fn execute_statement(&mut self, stmt: pbsql::ast::Statement) -> Result<Output> {
+        use pbsql::ast::{Statement, TxnOp};
+        match stmt {
+            Statement::Txn(TxnOp::Begin) => self.begin().map(|_| Output::Done("transaction started".into())),
+            Statement::Txn(TxnOp::Commit) => self.commit().map(|_| Output::Done("committed".into())),
+            Statement::Txn(TxnOp::Rollback) => self.rollback().map(|_| Output::Done("rolled back".into())),
+            Statement::Checkpoint => self.checkpoint().map(|_| Output::Done("checkpoint written".into())),
+            stmt => {
+                let read = stmt.is_read_only();
+                self.run(!read, |ctx| pbsql::exec::execute(ctx, stmt))
             }
         }
-        calls.push((name, args));
-        skip_ws(&mut pos);
-        match b.get(pos) {
-            None => return Ok(calls),
-            Some(b'.') => pos += 1,
-            Some(_) => return Err(Error::Parse(format!("unexpected text after ')': '{}'", &s[pos..]))),
-        }
     }
-}
 
-fn doc_command(ctx: &mut Ctx, s: &str) -> Result<Output> {
-    let rest = &s[3..];
-    let dot = rest.find('.').ok_or_else(|| Error::Parse("expected db.<collection>.<method>(...)".into()))?;
-    let coll = &rest[..dot];
-    let calls = parse_calls(&rest[dot + 1..])?;
-    let (method, args) = &calls[0];
-    let empty = Value::Object(Default::default());
-    let arg = |i: usize| args.get(i).unwrap_or(&empty);
-    let need = |i: usize, what: &str| {
-        args.get(i).ok_or_else(|| Error::Parse(format!("{method}() needs {what}")))
-    };
-    let as_count = |v: &Value| {
-        v.as_i64()
-            .filter(|n| *n >= 0)
-            .map(|n| n as usize)
-            .ok_or_else(|| Error::Parse("expected a non-negative integer".into()))
-    };
-
-    let is_find = matches!(method.as_str(), "find" | "findone");
-    if !is_find && calls.len() > 1 {
-        return Err(Error::Parse(format!("{method}() cannot be chained")));
-    }
-    match method.as_str() {
-        "insert" | "insertone" | "insertmany" => match need(0, "a document")? {
-            Value::Array(docs) => {
-                let mut ids = Vec::new();
-                for d in docs {
-                    ids.push(doc::insert(ctx, coll, d.clone())?);
-                }
-                Ok(Output::Scalar(Value::Array(ids)))
-            }
-            d => Ok(Output::Scalar(doc::insert(ctx, coll, d.clone())?)),
-        },
-        "find" | "findone" => {
-            let mut opts = FindOptions::default();
-            for (name, a) in &calls[1..] {
-                let first = a.first().ok_or_else(|| Error::Parse(format!("{name}() needs an argument")))?;
-                match name.as_str() {
-                    "sort" => opts.sort = Some(first.clone()),
-                    "limit" => opts.limit = Some(as_count(first)?),
-                    "skip" => opts.skip = as_count(first)?,
-                    _ => return Err(Error::Parse(format!("unknown modifier .{name}(); use sort, limit or skip"))),
-                }
-            }
-            if method == "findone" {
-                opts.limit = Some(1);
-            }
-            Ok(Output::Docs(doc::find(ctx, coll, arg(0), &opts)?))
-        }
-        "update" | "updatemany" | "updateone" => {
-            let multi = method != "updateone";
-            let (n, _) = doc::update(
-                ctx,
-                coll,
-                need(0, "a filter and an update")?,
-                need(1, "a filter and an update")?,
-                multi,
-                false,
-            )?;
-            Ok(Output::Done(format!("{n} document(s) updated")))
-        }
-        "delete" | "deletemany" | "deleteone" | "remove" => {
-            let limit = (method == "deleteone").then_some(1);
-            let n = doc::delete(ctx, coll, need(0, "a filter ({} deletes everything)")?, limit)?;
-            Ok(Output::Done(format!("{n} document(s) deleted")))
-        }
-        "createindex" => {
-            let field = match need(0, "a field, e.g. createIndex({email: 1})")? {
-                Value::Text(f) => f.clone(),
-                Value::Object(o) if o.len() == 1 => o.keys().next().cloned().unwrap_or_default(),
-                _ => return Err(Error::Parse("createIndex takes one field: createIndex({email: 1})".into())),
-            };
-            let created = doc::create_index(ctx, coll, &field)?;
-            Ok(Output::Done(if created {
-                format!("index created on {coll}.{field}")
-            } else {
-                format!("{coll}.{field} is already indexed")
-            }))
-        }
-        "count" | "countdocuments" => {
-            Ok(Output::Scalar(Value::Int(doc::find(ctx, coll, arg(0), &FindOptions::default())?.len() as i64)))
-        }
-        "drop" => {
-            let existed = doc::drop(ctx, coll)?;
-            Ok(Output::Done(if existed {
-                format!("collection '{coll}' dropped")
-            } else {
-                format!("collection '{coll}' does not exist, nothing dropped")
-            }))
-        }
-        other => Err(Error::Parse(format!(
-            "unknown collection method '{other}': use insert, find, update, delete, count, createIndex or drop"
-        ))),
+    /// Check a statement against this database's catalog without running it.
+    pub fn validate(&mut self, command: &str) -> Result<()> {
+        let stmt = pbsql::parse(command)?;
+        self.run(false, |ctx| pbsql::check(&stmt, Some(ctx)))
     }
 }

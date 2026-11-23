@@ -155,10 +155,16 @@ pub fn insert(ctx: &mut Ctx, coll: &str, doc: Value) -> Result<Value> {
     Ok(id)
 }
 
-/// Documents that could match `filter`: a direct lookup when it pins `_id`,
-/// an index lookup when it pins an indexed field, otherwise a full scan.
-/// The caller still applies the filter.
-fn candidates(ctx: &Ctx, coll: &str, filter: &Value) -> Result<Vec<(Vec<u8>, Value)>> {
+/// How a filter will be answered.
+enum Access {
+    /// The filter pins `_id`: one direct lookup.
+    Id(Vec<u8>),
+    /// The filter pins an indexed field: entries under this index prefix.
+    Index { field: String, prefix: Vec<u8> },
+    Scan,
+}
+
+fn choose_access(ctx: &Ctx, coll: &str, filter: &Value) -> Result<Access> {
     check_name(coll)?;
     if let Some(id) = filter.get("_id") {
         let literal = match id {
@@ -167,11 +173,7 @@ fn candidates(ctx: &Ctx, coll: &str, filter: &Value) -> Result<Vec<(Vec<u8>, Val
             _ => false,
         };
         if literal {
-            let key = doc_key(coll, id)?;
-            return Ok(match ctx.get(&key) {
-                Some(raw) => vec![(key, decode(&raw)?)],
-                None => vec![],
-            });
+            return Ok(Access::Id(doc_key(coll, id)?));
         }
     }
     if let Value::Object(f) = filter {
@@ -189,6 +191,31 @@ fn candidates(ctx: &Ctx, coll: &str, filter: &Value) -> Result<Vec<(Vec<u8>, Val
             };
             let mut prefix = keys::index_prefix(&owner(coll), field);
             prefix.extend(enc);
+            return Ok(Access::Index { field: field.clone(), prefix });
+        }
+    }
+    Ok(Access::Scan)
+}
+
+/// The access path a filter will use, as shown by EXPLAIN.
+pub fn describe_access(ctx: &Ctx, coll: &str, filter: &Value) -> Result<String> {
+    Ok(match choose_access(ctx, coll, filter)? {
+        Access::Id(_) => format!("collection {coll}: _id lookup"),
+        Access::Index { field, .. } => format!("collection {coll}: index on {field}"),
+        Access::Scan => format!("collection {coll}: full scan"),
+    })
+}
+
+/// Documents that could match `filter`: a direct lookup when it pins `_id`,
+/// an index lookup when it pins an indexed field, otherwise a full scan.
+/// The caller still applies the filter.
+fn candidates(ctx: &Ctx, coll: &str, filter: &Value) -> Result<Vec<(Vec<u8>, Value)>> {
+    match choose_access(ctx, coll, filter)? {
+        Access::Id(key) => Ok(match ctx.get(&key) {
+            Some(raw) => vec![(key, decode(&raw)?)],
+            None => vec![],
+        }),
+        Access::Index { prefix, .. } => {
             let mut out = Vec::new();
             for (k, _) in ctx.scan(&prefix) {
                 let mut dk = keys::doc_prefix(coll);
@@ -198,10 +225,15 @@ fn candidates(ctx: &Ctx, coll: &str, filter: &Value) -> Result<Vec<(Vec<u8>, Val
                 }
             }
             out.sort_by(|a, b| a.0.cmp(&b.0));
-            return Ok(out);
+            Ok(out)
         }
+        Access::Scan => ctx.scan(&keys::doc_prefix(coll)).into_iter().map(|(k, raw)| Ok((k, decode(&raw)?))).collect(),
     }
-    ctx.scan(&keys::doc_prefix(coll)).into_iter().map(|(k, raw)| Ok((k, decode(&raw)?))).collect()
+}
+
+/// How many documents `filter` would read before filtering (for EXPLAIN ANALYZE).
+pub fn candidate_count(ctx: &Ctx, coll: &str, filter: &Value) -> Result<usize> {
+    Ok(candidates(ctx, coll, filter)?.len())
 }
 
 #[derive(Default)]

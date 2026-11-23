@@ -4,7 +4,7 @@
 use crate::value::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(super) enum Op {
+pub(crate) enum Op {
     Eq,
     Ne,
     Lt,
@@ -22,7 +22,7 @@ pub(super) enum Op {
 }
 
 impl Op {
-    pub(super) fn text(self) -> &'static str {
+    pub(crate) fn text(self) -> &'static str {
         match self {
             Op::Eq => "=",
             Op::Ne => "!=",
@@ -43,7 +43,7 @@ impl Op {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(super) enum AggFn {
+pub(crate) enum AggFn {
     Count,
     Sum,
     Avg,
@@ -52,7 +52,7 @@ pub(super) enum AggFn {
 }
 
 impl AggFn {
-    pub(super) fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             AggFn::Count => "count",
             AggFn::Sum => "sum",
@@ -66,13 +66,13 @@ impl AggFn {
 /// A subquery inside an expression. `id` is unique for the life of the
 /// process, so results can be cached per statement even when the tree is cloned.
 #[derive(Debug, Clone)]
-pub(super) struct SubQ {
+pub(crate) struct SubQ {
     pub id: usize,
     pub q: Box<Query>,
 }
 
 #[derive(Debug, Clone)]
-pub(super) enum Expr {
+pub(crate) enum Expr {
     Lit(Value),
     Col(Option<String>, String),
     Bin(Box<Expr>, Op, Box<Expr>),
@@ -96,7 +96,7 @@ pub(super) enum Expr {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(super) enum Ty {
+pub(crate) enum Ty {
     Int,
     Float,
     Text,
@@ -104,7 +104,7 @@ pub(super) enum Ty {
 }
 
 impl Ty {
-    pub(super) fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             Ty::Int => "int",
             Ty::Float => "real",
@@ -112,7 +112,7 @@ impl Ty {
             Ty::Bool => "bool",
         }
     }
-    pub(super) fn from_name(s: &str) -> Option<Ty> {
+    pub(crate) fn from_name(s: &str) -> Option<Ty> {
         Some(match s {
             "int" | "integer" | "bigint" | "smallint" | "int2" | "int4" | "int8" | "tinyint" => Ty::Int,
             "real" | "float" | "double" | "numeric" | "decimal" | "float4" | "float8" => Ty::Float,
@@ -124,7 +124,7 @@ impl Ty {
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct Column {
+pub(crate) struct Column {
     pub name: String,
     pub ty: Ty,
     pub not_null: bool,
@@ -137,7 +137,7 @@ pub(super) struct Column {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(super) enum FkAction {
+pub(crate) enum FkAction {
     /// RESTRICT and NO ACTION: refuse the change while child rows refer to the key.
     Restrict,
     Cascade,
@@ -145,14 +145,14 @@ pub(super) enum FkAction {
 }
 
 impl FkAction {
-    pub(super) fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             FkAction::Restrict => "restrict",
             FkAction::Cascade => "cascade",
             FkAction::SetNull => "set null",
         }
     }
-    pub(super) fn from_name(s: &str) -> Option<FkAction> {
+    pub(crate) fn from_name(s: &str) -> Option<FkAction> {
         Some(match s {
             "restrict" | "no action" => FkAction::Restrict,
             "cascade" => FkAction::Cascade,
@@ -163,7 +163,7 @@ impl FkAction {
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct FkDef {
+pub(crate) struct FkDef {
     pub name: Option<String>,
     pub cols: Vec<String>,
     pub ref_table: String,
@@ -174,7 +174,7 @@ pub(super) struct FkDef {
 }
 
 #[derive(Debug, Clone)]
-pub(super) enum Constraint {
+pub(crate) enum Constraint {
     PrimaryKey(Vec<String>),
     Unique(Option<String>, Vec<String>),
     Check(Option<String>, Expr),
@@ -183,13 +183,13 @@ pub(super) enum Constraint {
 
 /// A column definition as written: the column plus its DEFAULT expression.
 #[derive(Debug, Clone)]
-pub(super) struct ColumnDef {
+pub(crate) struct ColumnDef {
     pub col: Column,
     pub default: Option<Expr>,
 }
 
 #[derive(Debug)]
-pub(super) struct TableDef {
+pub(crate) struct TableDef {
     pub name: String,
     pub cols: Vec<ColumnDef>,
     pub constraints: Vec<Constraint>,
@@ -197,7 +197,7 @@ pub(super) struct TableDef {
 }
 
 #[derive(Debug)]
-pub(super) enum Alter {
+pub(crate) enum Alter {
     /// column, constraints written on the column
     AddColumn(ColumnDef, Vec<Constraint>),
     DropColumn { name: String, if_exists: bool },
@@ -211,19 +211,23 @@ pub(super) enum Alter {
 }
 
 #[derive(Debug, Clone)]
-pub(super) enum Source {
+pub(crate) enum Source {
     Table(String),
     Derived(Box<Query>),
+    /// `DOCUMENT(collection)`: a document collection read as rows.
+    Collection(String),
+    /// `KV('prefix')`: key-value pairs whose key starts with the prefix.
+    Kv(String),
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct FromItem {
+pub(crate) struct FromItem {
     pub src: Source,
     pub alias: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(super) enum JoinKind {
+pub(crate) enum JoinKind {
     Inner,
     Left,
     Right,
@@ -232,21 +236,21 @@ pub(super) enum JoinKind {
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct Join {
+pub(crate) struct Join {
     pub item: FromItem,
     pub kind: JoinKind,
     pub on: Option<Expr>,
 }
 
 #[derive(Debug, Clone)]
-pub(super) enum Item {
+pub(crate) enum Item {
     Star,
     TableStar(String),
     Expr(Expr, Option<String>),
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct OrderItem {
+pub(crate) struct OrderItem {
     pub expr: Expr,
     pub desc: bool,
     /// Explicit NULLS FIRST (true) / NULLS LAST (false).
@@ -254,7 +258,7 @@ pub(super) struct OrderItem {
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct Select {
+pub(crate) struct Select {
     pub distinct: bool,
     pub items: Vec<Item>,
     pub from: Option<FromItem>,
@@ -268,7 +272,7 @@ pub(super) struct Select {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(super) enum SetOp {
+pub(crate) enum SetOp {
     Union,
     Intersect,
     Except,
@@ -278,7 +282,7 @@ pub(super) enum SetOp {
 /// (evaluated left to right). For a single SELECT its own ORDER BY / LIMIT
 /// are used; for a compound query the ones here apply to the combined result.
 #[derive(Debug, Clone)]
-pub(super) struct Query {
+pub(crate) struct Query {
     pub head: Select,
     pub rest: Vec<(SetOp, bool, Select)>,
     pub order_by: Vec<OrderItem>,
@@ -287,7 +291,7 @@ pub(super) struct Query {
 }
 
 #[derive(Debug)]
-pub(super) enum InsertSource {
+pub(crate) enum InsertSource {
     /// Rows of expressions; `None` is the DEFAULT keyword.
     Values(Vec<Vec<Option<Expr>>>),
     Query(Query),
@@ -295,7 +299,7 @@ pub(super) enum InsertSource {
 }
 
 #[derive(Debug)]
-pub(super) enum Stmt {
+pub(crate) enum Stmt {
     CreateTable(TableDef),
     DropTable { name: String, if_exists: bool, cascade: bool },
     CreateIndex { name: String, table: String, cols: Vec<String>, unique: bool, if_not_exists: bool },

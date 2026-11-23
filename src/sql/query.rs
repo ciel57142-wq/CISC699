@@ -423,26 +423,34 @@ fn cmp_order(x: &Value, y: &Value, o: &OrderItem) -> Ordering {
     }
 }
 
-/// Rows and scope of one FROM item.
+/// Rows and scope of one FROM item. Base sources of every storage model are
+/// read through the common [`Relation`](super::sources::Relation) interface.
 fn source_rows(
     q: &QCtx,
     item: &FromItem,
     filter: Option<&Expr>,
+    fields: Vec<String>,
+    sole: bool,
     outer: Option<&Env>,
     level: usize,
 ) -> Result<(Scope, Vec<Vec<Value>>)> {
-    match &item.src {
-        Source::Table(name) => {
-            let s = Schema::load(q.ctx, name)?;
-            let rows = fetch(q, &s, &item.alias, filter)?.into_iter().map(|(_, r)| r).collect();
-            Ok((s.scope(&item.alias), rows))
+    let (columns, rows) = match super::sources::open(item, fields, sole) {
+        Some(rel) => {
+            let set = rel.read(q, filter)?;
+            if q.analyze {
+                let n = set.rows.len();
+                q.note(|| format!("{}: {n} row(s) read from {} storage", item.alias, rel.model().name()));
+            }
+            (set.columns, set.rows)
         }
-        Source::Derived(sub) => {
+        None => {
+            let Source::Derived(sub) = &item.src else { unreachable!("base sources are relations") };
             let (cols, rows) = run_query(q, sub, outer, level)?;
             q.note(|| format!("{}: derived table", item.alias));
-            Ok((cols.into_iter().map(|c| (item.alias.clone(), c)).collect(), rows))
+            (cols, rows)
         }
-    }
+    };
+    Ok((columns.into_iter().map(|c| (item.alias.clone(), c)).collect(), rows))
 }
 
 /// Equality conjuncts of an ON clause between a left column and a right column.
@@ -570,14 +578,19 @@ pub(super) fn select(q: &QCtx, s: &Select, outer: Option<&Env>, level: usize) ->
         // put NULLs into its columns.
         let preserves_first = s.joins.iter().all(|j| matches!(j.kind, JoinKind::Inner | JoinKind::Left | JoinKind::Cross));
         let pushdown = if preserves_first { s.filter.as_ref() } else { None };
-        let (sc, r) = source_rows(q, from, pushdown, outer, level)?;
+        let fields = |item: &FromItem| match item.src {
+            Source::Collection(_) => super::walk::fields_of(s, &item.alias),
+            _ => Vec::new(),
+        };
+        let sole = s.joins.is_empty() && outer.is_none();
+        let (sc, r) = source_rows(q, from, pushdown, fields(from), sole, outer, level)?;
         scope = sc;
         rows = r;
         for j in &s.joins {
             if scope.iter().any(|(a, _)| a == &j.item.alias) {
                 return Err(Error::Schema(format!("table name '{}' used twice; give it an alias", j.item.alias)));
             }
-            let (rscope, right) = source_rows(q, &j.item, None, outer, level)?;
+            let (rscope, right) = source_rows(q, &j.item, None, fields(&j.item), false, outer, level)?;
             rows = join(q, &mut scope, rows, rscope, right, j, outer, level)?;
         }
     }

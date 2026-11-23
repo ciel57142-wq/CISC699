@@ -7,6 +7,9 @@ polydb is a multi-model database engine written in Rust. One engine and one tran
 | Relational | SQL | `SELECT name FROM users WHERE age > 40` |
 | Document | MongoDB-style calls | `db.events.find({type: 'login'})` |
 | Key-value | Redis-style commands | `SET session:42 abc` |
+| All three | cross-model SQL | `SELECT u.name, o.total FROM users u JOIN DOCUMENT(orders) o ON o.user = u.id` |
+
+All of these are one language, **PBSQL**, with one lexer, parser and semantic checker: statements are type-checked against the catalog before they run, syntax errors give a line and column, and a single query can join and filter tables, documents and keys through each model's own engine. The language reference is [docs/PBSQL.md](docs/PBSQL.md).
 
 It runs as an interactive shell, as a library inside a Rust program, or as a network server. The server speaks its own line protocol and, on separate ports, subsets of the Redis, PostgreSQL and MongoDB wire protocols, so `redis-cli`, `psql` and the standard Python drivers can connect unchanged.
 
@@ -193,7 +196,8 @@ polydb ships with **no dataset** and downloads none. Every test creates its own 
 - **Log damage:** recovery stops at the first log record that fails its checksum. A torn final record (the normal crash case) is handled correctly; damage in the middle of the log also drops the commits after it.
 - Commits wait for their own `fsync`, so write throughput is bounded by the disk.
 - Indexes serve equality only; range queries and joins scan.
-- SQL has no date/time types, views, CTEs (`WITH`), window functions, `RETURNING` or `ON ... SET DEFAULT`; foreign-key `NO ACTION` is checked immediately, like `RESTRICT`. Subqueries nest at most 6 deep.
+- SQL has no date/time types, views, CTEs (`WITH`), window functions, `RETURNING` or `ON ... SET DEFAULT`; these fail with an explicit "not supported" error. Foreign-key `NO ACTION` is checked immediately, like `RESTRICT`. Subqueries nest at most 6 deep.
+- Cross-model joins read a document or key-value source in full unless the `WHERE` clause pins `_id`, an indexed field or a key; see [docs/PBSQL.md](docs/PBSQL.md#pushdown).
 - No lock file: do not open the same directory from two processes at once.
 - Object keys in documents are stored sorted, not in insertion order.
 
@@ -203,13 +207,16 @@ polydb ships with **no dataset** and downloads none. Every test creates its own 
 Cargo.toml, Cargo.lock      package manifest and lock file (no dependencies)
 src/                        the engine (about 5,600 lines)
   storage.rs keys.rs          ordered map, write-ahead log, snapshot, key layout
-  sql/ doc.rs kv.rs           the three data models
+  pbsql/                      PBSQL front end: lexer, statement parser, executor
+  sql/ doc.rs kv.rs           the three data models (sql/ also holds the relational
+                              parser, semantic checker and cross-model sources)
   lib.rs value.rs error.rs    sessions, transactions, value type, errors
   server.rs resp.rs           native and Redis listeners
   pgwire.rs mongo.rs          PostgreSQL and MongoDB listeners
   main.rs                     command-line shell, server and client
 tests/
   integration.rs              22 behaviour tests
+  pbsql.rs                    15 PBSQL execution tests across the three engines
   hardening.rs                23 failure-path tests
   drivers.py                  39 checks through third-party drivers
   requirements-drivers.txt    pinned driver versions

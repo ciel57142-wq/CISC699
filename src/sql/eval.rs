@@ -23,6 +23,8 @@ pub(super) struct QCtx<'a> {
     /// and its result is cached for the rest of the statement.
     min_level: Cell<usize>,
     pub explain: bool,
+    /// EXPLAIN ANALYZE: the plan also records how many rows each source produced.
+    pub analyze: bool,
     pub plan: RefCell<Vec<String>>,
 }
 
@@ -33,6 +35,7 @@ impl<'a> QCtx<'a> {
             cache: RefCell::new(HashMap::new()),
             min_level: Cell::new(usize::MAX),
             explain: false,
+            analyze: false,
             plan: RefCell::new(Vec::new()),
         }
     }
@@ -602,6 +605,35 @@ fn call(name: &str, args: &[Expr], env: &Env) -> Result<Value> {
                 other => return Err(Error::Type(format!("{name}() needs a number, got {}", other.to_json()))),
             }
         }
+        "get_path" => {
+            // get_path(value, 'a.b.0'): a field of a document value. Text that
+            // holds JSON (a key-value value, say) is read as JSON first.
+            arity(2, 2)?;
+            let Some(path) = text(&vals[1])? else {
+                return Ok(Value::Null);
+            };
+            let parsed;
+            let base = match &vals[0] {
+                Value::Text(t) => match Value::parse(t) {
+                    Ok(v @ (Value::Object(_) | Value::Array(_))) => {
+                        parsed = v;
+                        &parsed
+                    }
+                    _ => return Ok(Value::Null),
+                },
+                v => v,
+            };
+            crate::doc::get_path(base, &path).cloned().unwrap_or(Value::Null)
+        }
+        "json" => {
+            // json(text): parse JSON text into a document value.
+            arity(1, 1)?;
+            match &vals[0] {
+                Value::Null => Value::Null,
+                Value::Text(t) => Value::parse(t).map_err(|e| Error::Type(format!("json(): {e}")))?,
+                other => other.clone(),
+            }
+        }
         "typeof" => {
             arity(1, 1)?;
             Value::Text(
@@ -767,7 +799,19 @@ pub(super) fn label(e: &Expr) -> String {
     match e {
         Expr::Lit(v) => v.display(),
         Expr::Col(_, n) => n.clone(),
-        Expr::Bin(a, op, b) => format!("{} {} {}", label(a), op.text(), label(b)),
+        Expr::Bin(a, op, b) => {
+            // parenthesise operands that bind more loosely, so the header reads as the expression does
+            let p = super::printer::op_binding(*op);
+            let side = |x: &Expr, right: bool| {
+                let xp = super::printer::binding(x);
+                if xp < p || (right && xp == p && p != super::printer::op_binding(Op::Eq)) {
+                    format!("({})", label(x))
+                } else {
+                    label(x)
+                }
+            };
+            format!("{} {} {}", side(a, false), op.text(), side(b, true))
+        }
         Expr::Neg(a) => format!("-{}", label(a)),
         Expr::Not(a) => format!("not {}", label(a)),
         Expr::Agg(f, arg, distinct) => format!(
@@ -776,6 +820,10 @@ pub(super) fn label(e: &Expr) -> String {
             if *distinct { "distinct " } else { "" },
             arg.as_ref().map_or("*".to_string(), |a| label(a))
         ),
+        Expr::Func(n, args) if n == "get_path" && matches!(args.get(1), Some(Expr::Lit(Value::Text(_)))) => match &args[1] {
+            Expr::Lit(Value::Text(p)) => p.rsplit('.').next().unwrap_or(p).to_string(),
+            _ => unreachable!(),
+        },
         Expr::Func(n, args) => format!("{n}({})", args.iter().map(label).collect::<Vec<_>>().join(", ")),
         Expr::Cast(a, _) => label(a),
         Expr::Case(..) => "case".to_string(),

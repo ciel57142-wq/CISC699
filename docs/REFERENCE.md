@@ -1,6 +1,6 @@
 # polydb reference
 
-Command syntax, the library API and the wire-protocol subsets. For setup and running, see the [README](../README.md); for operations, see the [runbook](RUNBOOK.md).
+Command syntax, the library API and the wire-protocol subsets. For setup and running, see the [README](../README.md); for operations, see the [runbook](RUNBOOK.md). The full language definition (grammar, precedence, types, NULL rules, cross-model queries, EXPLAIN ANALYZE, normalization) is [PBSQL.md](PBSQL.md).
 
 ## Command reference
 
@@ -23,14 +23,14 @@ TRUNCATE [TABLE] t
 CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON t (col [, col ...])
 DROP INDEX [IF EXISTS] name [ON t]
 INSERT INTO t [(cols)] VALUES (... | DEFAULT), ...  |  INSERT INTO t [(cols)] SELECT ...  |  INSERT INTO t DEFAULT VALUES
-SELECT [DISTINCT] items FROM t [alias] | (SELECT ...) alias
+SELECT [DISTINCT] items FROM t [alias] | (SELECT ...) alias | DOCUMENT(c) [alias] | KV(['prefix']) [alias]
        [[INNER | LEFT | RIGHT | FULL [OUTER] | CROSS] JOIN t2 [alias] [ON expr] | , t2]...
        [WHERE expr] [GROUP BY exprs] [HAVING expr]
        [UNION | INTERSECT | EXCEPT [ALL] SELECT ...]...
        [ORDER BY expr [ASC|DESC] [NULLS FIRST|LAST], ...] [LIMIT n | ALL] [OFFSET n]
 UPDATE t SET col = expr | DEFAULT, ... [WHERE expr]
 DELETE FROM t [WHERE expr]
-EXPLAIN SELECT ...        DESCRIBE t        CHECK TABLE t | CHECK TABLES        REINDEX [TABLE t]
+EXPLAIN [ANALYZE] SELECT | INSERT | UPDATE | DELETE ...        DESCRIBE t        CHECK TABLE t | CHECK TABLES        REINDEX [TABLE t]
 ```
 
 - Types: `INT`, `REAL`, `TEXT`, `BOOL` (aliases such as `INTEGER`, `DOUBLE`, `BOOLEAN` are accepted). `VARCHAR(n)` / `CHAR(n)` enforce a maximum length in characters. `SERIAL` is `INT NOT NULL AUTOINCREMENT`. Values are checked strictly: a whole `REAL` is accepted for `INT`, anything else of the wrong type is a type error; non-finite numbers are refused.
@@ -68,10 +68,10 @@ db.<coll>.drop()
 
 ```
 SET key value...      GET key      DEL key      EXISTS key
-KEYS [prefix]         INCR key [amount]
+KEYS [prefix]         INCR key [amount]      DECR key [amount]
 ```
 
-Keys or values containing spaces can be quoted: `SET "my key" "my value"`.
+Keys or values containing spaces can be quoted: `SET "my key" "my value"`. Inside quotes, `\n \t \r \0 \\ \' \"` are escapes; an unquoted value is taken verbatim to the end of the line.
 
 In the native language `KEYS` takes a prefix (`KEYS session:`). Over the Redis port it takes a Redis glob pattern instead (`KEYS user:*`), as Redis clients expect.
 
@@ -79,7 +79,19 @@ In the native language `KEYS` takes a prefix (`KEYS session:`). Over the Redis p
 
 ```
 BEGIN   COMMIT   ROLLBACK   CHECKPOINT   SHOW TABLES   SHOW COLLECTIONS
+EXPLAIN [ANALYZE] <SELECT | INSERT | UPDATE | DELETE | db.c.find/count/update/delete | key-value command>
 ```
+
+### Cross-model queries
+
+```
+SELECT ... FROM users u
+  JOIN DOCUMENT(orders) o ON o.user = u.id          -- a collection as rows: _id plus its fields
+  LEFT JOIN KV('quota:') q ON q.key = 'quota:1'     -- keys with a prefix as rows: key, value
+ WHERE o.ship.city = 'Oslo'                         -- dotted names reach into documents
+```
+
+See [PBSQL.md](PBSQL.md#cross-model-queries).
 
 ## Use as a library
 

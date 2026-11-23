@@ -1027,7 +1027,7 @@ fn invalid_sql_is_rejected_with_typed_errors() {
         "SELECT 1 ; SELECT 2",
         "SELECT @x",
         "SELECT x::BLOB FROM customers",
-        "EXPLAIN DELETE FROM customers",
+        "EXPLAIN DROP TABLE customers",
     ] {
         fails(&mut db, sql, parse);
     }

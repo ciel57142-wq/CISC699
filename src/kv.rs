@@ -30,6 +30,14 @@ pub fn keys(ctx: &Ctx, prefix: &str) -> Vec<String> {
         .collect()
 }
 
+/// Key-value pairs whose key starts with `prefix`, in key order.
+pub fn scan(ctx: &Ctx, prefix: &str) -> Vec<(String, Vec<u8>)> {
+    ctx.scan(&keys::kv(prefix))
+        .into_iter()
+        .map(|(k, v)| (String::from_utf8_lossy(&k[keys::KV_PREFIX.len()..]).into_owned(), v))
+        .collect()
+}
+
 /// Add `by` to an integer value (missing keys count as 0) and return the result.
 pub fn incr(ctx: &mut Ctx, key: &str, by: i64) -> Result<i64> {
     let cur = match get(ctx, key) {

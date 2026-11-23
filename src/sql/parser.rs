@@ -1,156 +1,16 @@
-//! Lexer and recursive-descent parser, plus the printer that turns an
-//! expression back into SQL text (used to store CHECK constraints).
+//! Recursive-descent parser for the relational part of PBSQL, plus the
+//! printer that turns an expression back into SQL text (used to store CHECK
+//! constraints). Tokens come from the shared PBSQL lexer (`pbsql::lexer`),
+//! so every syntax error reports the line and column it was found at.
 
 use super::ast::*;
 use crate::error::{Error, Result};
 use crate::value::Value;
+use crate::pbsql::lexer::{self, Span, Tok, Token};
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-
-// ====================================================================== lexer
-
-#[derive(Debug, Clone, PartialEq)]
-enum Tok {
-    /// Unquoted word, lower-cased: a keyword or an identifier.
-    Word(String),
-    /// Quoted identifier, case preserved.
-    Ident(String),
-    Int(i64),
-    Float(f64),
-    Str(String),
-    Sym(&'static str),
-}
 
 pub(super) fn perr<T>(msg: impl Into<String>) -> Result<T> {
     Err(Error::Parse(msg.into()))
-}
-
-fn lex(src: &str) -> Result<Vec<Tok>> {
-    let cs: Vec<char> = src.chars().collect();
-    let mut i = 0;
-    let mut out = Vec::new();
-    while i < cs.len() {
-        let c = cs[i];
-        let next = cs.get(i + 1).copied();
-        if c.is_whitespace() {
-            i += 1;
-        } else if c == '-' && next == Some('-') {
-            while i < cs.len() && cs[i] != '\n' {
-                i += 1;
-            }
-        } else if c.is_alphabetic() || c == '_' {
-            let start = i;
-            while i < cs.len() && (cs[i].is_alphanumeric() || cs[i] == '_') {
-                i += 1;
-            }
-            out.push(Tok::Word(cs[start..i].iter().collect::<String>().to_lowercase()));
-        } else if c.is_ascii_digit() || (c == '.' && next.map_or(false, |n| n.is_ascii_digit())) {
-            let start = i;
-            let mut float = false;
-            while i < cs.len() && (cs[i].is_ascii_digit() || cs[i] == '.') {
-                float |= cs[i] == '.';
-                i += 1;
-            }
-            if i < cs.len() && (cs[i] == 'e' || cs[i] == 'E') {
-                let mut j = i + 1;
-                if j < cs.len() && (cs[j] == '+' || cs[j] == '-') {
-                    j += 1;
-                }
-                if j < cs.len() && cs[j].is_ascii_digit() {
-                    float = true;
-                    i = j;
-                    while i < cs.len() && cs[i].is_ascii_digit() {
-                        i += 1;
-                    }
-                }
-            }
-            let text: String = cs[start..i].iter().collect();
-            let tok = if float { None } else { text.parse::<i64>().ok().map(Tok::Int) };
-            match tok {
-                Some(t) => out.push(t),
-                None => match text.parse::<f64>() {
-                    Ok(f) => out.push(Tok::Float(f)),
-                    Err(_) => return perr(format!("invalid number '{text}'")),
-                },
-            }
-        } else if c == '\'' {
-            i += 1;
-            let mut s = String::new();
-            loop {
-                match cs.get(i) {
-                    None => return perr("unterminated string literal"),
-                    Some('\'') if cs.get(i + 1) == Some(&'\'') => {
-                        s.push('\'');
-                        i += 2;
-                    }
-                    Some('\'') => {
-                        i += 1;
-                        break;
-                    }
-                    Some(ch) => {
-                        s.push(*ch);
-                        i += 1;
-                    }
-                }
-            }
-            out.push(Tok::Str(s));
-        } else if c == '"' || c == '`' {
-            // A doubled quote inside a quoted identifier stands for itself.
-            i += 1;
-            let mut s = String::new();
-            loop {
-                match cs.get(i) {
-                    None => return perr("unterminated quoted identifier"),
-                    Some(&ch) if ch == c && cs.get(i + 1) == Some(&c) => {
-                        s.push(c);
-                        i += 2;
-                    }
-                    Some(&ch) if ch == c => {
-                        i += 1;
-                        break;
-                    }
-                    Some(&ch) => {
-                        s.push(ch);
-                        i += 1;
-                    }
-                }
-            }
-            out.push(Tok::Ident(s));
-        } else {
-            let two: Option<&'static str> = match (c, next) {
-                ('<', Some('=')) => Some("<="),
-                ('>', Some('=')) => Some(">="),
-                ('<', Some('>')) => Some("<>"),
-                ('!', Some('=')) => Some("!="),
-                ('|', Some('|')) => Some("||"),
-                (':', Some(':')) => Some("::"),
-                _ => None,
-            };
-            if let Some(s) = two {
-                out.push(Tok::Sym(s));
-                i += 2;
-                continue;
-            }
-            let one: &'static str = match c {
-                '(' => "(",
-                ')' => ")",
-                ',' => ",",
-                '*' => "*",
-                '=' => "=",
-                '<' => "<",
-                '>' => ">",
-                '+' => "+",
-                '-' => "-",
-                '/' => "/",
-                '%' => "%",
-                '.' => ".",
-                ';' => ";",
-                _ => return perr(format!("unexpected character '{c}'")),
-            };
-            out.push(Tok::Sym(one));
-            i += 1;
-        }
-    }
-    Ok(out)
 }
 
 // ===================================================================== parser
@@ -176,6 +36,10 @@ static NEXT_SUBQUERY_ID: AtomicUsize = AtomicUsize::new(1);
 
 struct P {
     t: Vec<Tok>,
+    /// Byte span of each token in `t`, for error positions.
+    spans: Vec<Span>,
+    /// Byte offset just past the statement, the position of "end of statement" errors.
+    end: usize,
     i: usize,
     /// How many nested sub-expressions the parser is currently inside.
     nest: usize,
@@ -198,7 +62,17 @@ fn bx(e: Expr) -> Box<Expr> {
 
 impl P {
     fn new(sql: &str) -> Result<P> {
-        Ok(P { t: lex(sql)?, i: 0, nest: 0, ops: 0, base_nest: 0, base_ops: 0, peak: 0, subq: 0 })
+        Ok(P::from_tokens(lexer::tokenize(sql)?, sql.len()))
+    }
+
+    fn from_tokens(toks: Vec<Token>, end: usize) -> P {
+        let (t, spans) = toks.into_iter().map(|t| (t.tok, t.span)).unzip();
+        P { t, spans, end, i: 0, nest: 0, ops: 0, base_nest: 0, base_ops: 0, peak: 0, subq: 0 }
+    }
+
+    /// Byte offset of the current token (or of the end of the statement).
+    fn here(&self) -> usize {
+        self.spans.get(self.i).map_or(self.end, |s| s.start)
     }
 
     fn peek(&self) -> Option<&Tok> {
@@ -206,14 +80,7 @@ impl P {
     }
 
     fn found(&self) -> String {
-        match self.peek() {
-            None => "end of statement".into(),
-            Some(Tok::Word(w)) | Some(Tok::Ident(w)) => format!("'{w}'"),
-            Some(Tok::Int(n)) => n.to_string(),
-            Some(Tok::Float(f)) => f.to_string(),
-            Some(Tok::Str(s)) => format!("'{s}'"),
-            Some(Tok::Sym(s)) => format!("'{s}'"),
-        }
+        self.peek().map_or_else(|| "end of statement".into(), Tok::describe)
     }
 
     fn peek_kw(&self, k: &str) -> bool {
@@ -363,6 +230,11 @@ impl P {
             return Ok(Stmt::Delete { table, filter });
         }
         if self.kw("create") {
+            for what in ["view", "trigger", "schema", "database", "sequence", "function", "procedure", "type", "role", "user"] {
+                if self.peek_kw(what) || (self.peek_kw("or") && self.peek_kw_at(2, what)) {
+                    return perr(format!("CREATE {} is not supported", what.to_uppercase()));
+                }
+            }
             let unique = self.kw("unique");
             if unique || self.kw("index") {
                 if unique {
@@ -428,6 +300,21 @@ impl P {
                 return Ok(Stmt::Reindex(None));
             }
             return Ok(Stmt::Reindex(Some(self.ident()?)));
+        }
+        if let Some(Tok::Word(w)) = self.peek() {
+            let what = match w.as_str() {
+                "with" => Some("WITH (common table expressions)"),
+                "merge" => Some("MERGE"),
+                "grant" | "revoke" => Some("GRANT / REVOKE (access control)"),
+                "savepoint" | "release" => Some("SAVEPOINT"),
+                "vacuum" | "analyze" => Some("VACUUM / ANALYZE"),
+                "copy" => Some("COPY"),
+                "upsert" | "replace" => Some("REPLACE / UPSERT"),
+                _ => None,
+            };
+            if let Some(what) = what {
+                return perr(format!("{what} is not supported"));
+            }
         }
         perr(format!("unsupported SQL statement starting at {}", self.found()))
     }
@@ -794,6 +681,34 @@ impl P {
             return Ok(FromItem { src: Source::Derived(sq.q), alias });
         }
         let name = self.ident()?;
+        // Cross-model sources: DOCUMENT(collection) and KV(['prefix']).
+        if self.sym("(") {
+            let (src, default_alias) = match name.as_str() {
+                "document" | "documents" => {
+                    let coll = self.ident()?;
+                    (Source::Collection(coll.clone()), coll)
+                }
+                "kv" => {
+                    let prefix = match self.peek().cloned() {
+                        Some(Tok::Str(p)) => {
+                            self.i += 1;
+                            p
+                        }
+                        _ if self.peek_sym(")") => String::new(),
+                        _ => return perr(format!("KV() takes an optional key prefix string, found {}", self.found())),
+                    };
+                    (Source::Kv(prefix), "kv".to_string())
+                }
+                other => {
+                    return perr(format!(
+                        "'{other}(...)' is not a table source; use a table name, DOCUMENT(collection) or KV('prefix')"
+                    ))
+                }
+            };
+            self.expect_sym(")")?;
+            let alias = self.alias()?.unwrap_or(default_alias);
+            return Ok(FromItem { src, alias });
+        }
         let alias = self.alias()?.unwrap_or_else(|| name.clone());
         Ok(FromItem { src: Source::Table(name), alias })
     }
@@ -1187,12 +1102,28 @@ impl P {
         Ok(Expr::Case(operand, whens, els))
     }
 
+    /// `col`, `alias.col`, or `alias.col.field.field...`: a longer dotted
+    /// name reaches into a document value and becomes `get_path(alias.col, 'field.field')`.
     fn column(&mut self, first: String) -> Result<Expr> {
-        if self.sym(".") {
-            Ok(Expr::Col(Some(first), self.ident()?))
-        } else {
-            Ok(Expr::Col(None, first))
+        if !self.sym(".") {
+            return Ok(Expr::Col(None, first));
         }
+        let col = Expr::Col(Some(first), self.ident()?);
+        let mut path = Vec::new();
+        while self.sym(".") {
+            path.push(match self.peek().cloned() {
+                Some(Tok::Int(n)) if n >= 0 => {
+                    self.i += 1;
+                    n.to_string()
+                }
+                _ => self.ident()?,
+            });
+        }
+        if path.is_empty() {
+            return Ok(col);
+        }
+        self.op()?;
+        Ok(Expr::Func("get_path".into(), vec![col, Expr::Lit(Value::Text(path.join(".")))]))
     }
 
     fn call(&mut self, name: String) -> Result<Expr> {
@@ -1243,11 +1174,17 @@ impl P {
     }
 }
 
+#[cfg(test)]
 pub(super) fn parse(sql: &str) -> Result<Stmt> {
-    let mut p = P::new(sql)?;
-    let st = p.statement()?;
-    p.finish()?;
-    Ok(st)
+    parse_tokens(sql, lexer::tokenize(sql)?)
+}
+
+/// Parse one statement from tokens of `src` (the whole command text, so
+/// that error positions are relative to what the user typed).
+pub(crate) fn parse_tokens(src: &str, toks: Vec<Token>) -> Result<Stmt> {
+    let mut p = P::from_tokens(toks, src.trim_end().len());
+    let res = p.statement().and_then(|st| p.finish().map(|_| st));
+    res.map_err(|e| lexer::locate(e, src, p.here()))
 }
 
 /// Parse a lone expression (stored CHECK constraints).
