@@ -47,23 +47,13 @@ fn run_cli(args: &[&str], stdin: &str) -> (Option<i32>, String, String) {
     });
     let out = child.wait_with_output().expect("wait for polydb");
     let _ = writer.join();
-    (
-        out.status.code(),
-        String::from_utf8_lossy(&out.stdout).into_owned(),
-        String::from_utf8_lossy(&out.stderr).into_owned(),
-    )
+    (out.status.code(), String::from_utf8_lossy(&out.stdout).into_owned(), String::from_utf8_lossy(&out.stderr).into_owned())
 }
 
 /// A server on free ports with every protocol enabled.
 fn start_all() -> (Database, server::Running) {
     let db = Database::in_memory();
-    let cfg = Config {
-        host: "127.0.0.1".into(),
-        native: Some(0),
-        redis: Some(0),
-        postgres: Some(0),
-        mongo: Some(0),
-    };
+    let cfg = Config { host: "127.0.0.1".into(), native: Some(0), redis: Some(0), postgres: Some(0), mongo: Some(0) };
     let running = server::start(&db, &cfg).expect("start server");
     (db, running)
 }
@@ -71,17 +61,12 @@ fn start_all() -> (Database, server::Running) {
 /// Send one native-protocol command and parse the JSON reply.
 fn ask(addr: SocketAddr, cmd: &str) -> Value {
     let stream = TcpStream::connect(addr).expect("connect native port");
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
     let mut w = stream.try_clone().unwrap();
     w.write_all(format!("{cmd}\n").as_bytes()).unwrap();
     let mut line = String::new();
-    BufReader::new(stream)
-        .read_line(&mut line)
-        .expect("read reply");
-    Value::parse(line.trim())
-        .unwrap_or_else(|e| panic!("reply to {cmd:?} is not JSON ({e}): {line:?}"))
+    BufReader::new(stream).read_line(&mut line).expect("read reply");
+    Value::parse(line.trim()).unwrap_or_else(|e| panic!("reply to {cmd:?} is not JSON ({e}): {line:?}"))
 }
 
 /// Deterministic pseudo-random bytes (fixed seed, no clock, no OS entropy).
@@ -89,9 +74,7 @@ fn noise(seed: u64, len: usize) -> Vec<u8> {
     let mut x = seed;
     (0..len)
         .map(|_| {
-            x = x
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
             (x >> 33) as u8
         })
         .collect()
@@ -117,10 +100,7 @@ fn cli_help_prints_usage_and_exits_zero() {
     for flag in ["--help", "-h", "help"] {
         let (code, out, _) = run_cli(&[flag], "");
         assert_eq!(code, Some(0), "{flag}");
-        assert!(
-            out.contains("USAGE") && out.contains("polydb serve"),
-            "{flag}: {out}"
-        );
+        assert!(out.contains("USAGE") && out.contains("polydb serve"), "{flag}: {out}");
     }
 }
 
@@ -128,14 +108,8 @@ fn cli_help_prints_usage_and_exits_zero() {
 fn cli_rejects_bad_server_options_with_a_message() {
     let cases: [(&[&str], &str); 4] = [
         (&["serve", "--memory", "--bogus"], "unknown option --bogus"),
-        (
-            &["serve", "--memory", "--port", "notaport"],
-            "'notaport' is not a port number",
-        ),
-        (
-            &["serve", "--memory", "--port", "70000"],
-            "'70000' is not a port number",
-        ),
+        (&["serve", "--memory", "--port", "notaport"], "'notaport' is not a port number"),
+        (&["serve", "--memory", "--port", "70000"], "'70000' is not a port number"),
         (&["serve", "--memory", "--port"], "--port needs a value"),
     ];
     for (args, want) in cases {
@@ -148,11 +122,7 @@ fn cli_rejects_bad_server_options_with_a_message() {
 #[test]
 fn cli_client_reports_unreachable_server() {
     // Bind then drop to get a port that is very likely closed.
-    let port = TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
     let (code, _, err) = run_cli(&["client", &format!("127.0.0.1:{port}")], "");
     assert_eq!(code, Some(1));
     assert!(err.contains("cannot connect to"), "stderr was {err:?}");
@@ -174,16 +144,11 @@ fn cli_database_path_that_is_a_file_is_a_clean_error() {
 #[test]
 fn cli_scripted_run_matches_golden_output() {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
-    let commands =
-        fs::read_to_string(dir.join("smoke.commands")).expect("tests/fixtures/smoke.commands");
-    let expected =
-        fs::read_to_string(dir.join("smoke.expected")).expect("tests/fixtures/smoke.expected");
+    let commands = fs::read_to_string(dir.join("smoke.commands")).expect("tests/fixtures/smoke.commands");
+    let expected = fs::read_to_string(dir.join("smoke.expected")).expect("tests/fixtures/smoke.expected");
     let (code, out, err) = run_cli(&["--memory"], &commands);
     assert_eq!(code, Some(0), "stderr: {err}");
-    assert_eq!(
-        out, expected,
-        "output differs from tests/fixtures/smoke.expected"
-    );
+    assert_eq!(out, expected, "output differs from tests/fixtures/smoke.expected");
     // and it is repeatable
     let (_, again, _) = run_cli(&["--memory"], &commands);
     assert_eq!(again, expected);
@@ -204,8 +169,7 @@ fn cli_errors_do_not_stop_a_piped_script() {
 #[test]
 fn invalid_statements_return_typed_errors_and_change_nothing() {
     let mut db = Database::in_memory();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT NOT NULL)")
-        .unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT NOT NULL)").unwrap();
     db.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
     let before = db.entry_count();
 
@@ -213,20 +177,12 @@ fn invalid_statements_return_typed_errors_and_change_nothing() {
         ("", |e| matches!(e, Error::Parse(_))),
         ("SELECT", |e| matches!(e, Error::Parse(_))),
         ("SELECT * FROM t WHERE", |e| matches!(e, Error::Parse(_))),
-        ("INSERT INTO t VALUES (1, 'dup')", |e| {
-            matches!(e, Error::Constraint(_))
-        }),
-        ("INSERT INTO t VALUES (2, NULL)", |e| {
-            matches!(e, Error::Constraint(_))
-        }),
-        ("INSERT INTO t VALUES ('x', 'y')", |e| {
-            matches!(e, Error::Type(_))
-        }),
+        ("INSERT INTO t VALUES (1, 'dup')", |e| matches!(e, Error::Constraint(_))),
+        ("INSERT INTO t VALUES (2, NULL)", |e| matches!(e, Error::Constraint(_))),
+        ("INSERT INTO t VALUES ('x', 'y')", |e| matches!(e, Error::Type(_))),
         ("SELECT * FROM missing", |e| matches!(e, Error::Schema(_))),
         ("SELECT nope FROM t", |e| matches!(e, Error::Schema(_))),
-        ("db.c.insert({unterminated", |e| {
-            matches!(e, Error::Parse(_))
-        }),
+        ("db.c.insert({unterminated", |e| matches!(e, Error::Parse(_))),
         ("COMMIT", |e| matches!(e, Error::Txn(_))),
     ];
     for (cmd, is_expected) in cases {
@@ -235,65 +191,38 @@ fn invalid_statements_return_typed_errors_and_change_nothing() {
             Err(e) => assert!(is_expected(&e), "{cmd:?} gave the wrong error kind: {e:?}"),
         }
     }
-    assert_eq!(
-        db.entry_count(),
-        before,
-        "a failed statement left data behind"
-    );
+    assert_eq!(db.entry_count(), before, "a failed statement left data behind");
     // a multi-row insert that fails on its last row inserts none of them
-    assert!(db
-        .execute("INSERT INTO t VALUES (5, 'e'), (6, 'f'), (1, 'dup')")
-        .is_err());
+    assert!(db.execute("INSERT INTO t VALUES (5, 'e'), (6, 'f'), (1, 'dup')").is_err());
     assert_eq!(db.entry_count(), before);
 }
 
 #[test]
 fn division_by_zero_and_integer_overflow_do_not_panic() {
     let mut db = Database::in_memory();
-    db.execute("CREATE TABLE n (id INT PRIMARY KEY, v INT)")
-        .unwrap();
-    db.execute("INSERT INTO n VALUES (1, 9223372036854775807)")
-        .unwrap();
+    db.execute("CREATE TABLE n (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("INSERT INTO n VALUES (1, 9223372036854775807)").unwrap();
     // Either an error or a value is acceptable; a panic is not.
-    for sql in [
-        "SELECT 1 / 0 FROM n",
-        "SELECT 1 % 0 FROM n",
-        "SELECT v + 1 FROM n",
-        "SELECT v * v FROM n",
-        "SELECT -v - 2 FROM n",
-    ] {
+    for sql in ["SELECT 1 / 0 FROM n", "SELECT 1 % 0 FROM n", "SELECT v + 1 FROM n", "SELECT v * v FROM n", "SELECT -v - 2 FROM n"] {
         let _ = db.execute(sql);
     }
     db.execute("SET counter 9223372036854775807").unwrap();
-    assert!(
-        db.execute("INCR counter").is_err(),
-        "INCR past i64::MAX must be an error, not a wrap"
-    );
-    assert_eq!(
-        db.execute("GET counter").unwrap(),
-        Output::Scalar(t("9223372036854775807"))
-    );
+    assert!(db.execute("INCR counter").is_err(), "INCR past i64::MAX must be an error, not a wrap");
+    assert_eq!(db.execute("GET counter").unwrap(), Output::Scalar(t("9223372036854775807")));
 }
 
 /// Deeply nested input must be rejected, not crash the process. Run in a
 /// child process so a stack overflow shows up as a failed exit status
 /// instead of taking the test runner down.
 fn nested_input_survives(command: &str) -> bool {
-    let (code, out, _) = run_cli(
-        &["--memory"],
-        &format!("{command}\nSET alive yes\nGET alive\n"),
-    );
+    let (code, out, _) = run_cli(&["--memory"], &format!("{command}\nSET alive yes\nGET alive\n"));
     code == Some(0) && out.lines().last() == Some("yes")
 }
 
 #[test]
 fn moderately_nested_input_is_handled() {
     let depth = 200;
-    let json = format!(
-        "db.c.insert({{a: {}1{}}})",
-        "[".repeat(depth),
-        "]".repeat(depth)
-    );
+    let json = format!("db.c.insert({{a: {}1{}}})", "[".repeat(depth), "]".repeat(depth));
     let sql = format!("SELECT {}1{} FROM t", "(".repeat(depth), ")".repeat(depth));
     assert!(nested_input_survives(&json));
     assert!(nested_input_survives(&sql));
@@ -304,15 +233,8 @@ fn moderately_nested_input_is_handled() {
 #[test]
 fn extremely_nested_json_does_not_crash_the_process() {
     let depth = 200_000;
-    let json = format!(
-        "db.c.insert({{a: {}1{}}})",
-        "[".repeat(depth),
-        "]".repeat(depth)
-    );
-    assert!(
-        nested_input_survives(&json),
-        "process died on {depth}-deep JSON"
-    );
+    let json = format!("db.c.insert({{a: {}1{}}})", "[".repeat(depth), "]".repeat(depth));
+    assert!(nested_input_survives(&json), "process died on {depth}-deep JSON");
 }
 
 #[test]
@@ -324,17 +246,9 @@ fn extremely_nested_sql_does_not_crash_the_process() {
         format!("SELECT 1 FROM t WHERE {}true", "NOT ".repeat(depth)),
         format!("SELECT 1{} FROM t", "+1".repeat(depth)),
         format!("SELECT 1 FROM t WHERE true{}", " OR true".repeat(depth)),
-        format!(
-            "SELECT {}1{} FROM t",
-            "abs(".repeat(depth),
-            ")".repeat(depth)
-        ),
+        format!("SELECT {}1{} FROM t", "abs(".repeat(depth), ")".repeat(depth)),
     ] {
-        assert!(
-            nested_input_survives(&sql),
-            "process died on SQL starting {:?}",
-            &sql[..40]
-        );
+        assert!(nested_input_survives(&sql), "process died on SQL starting {:?}", &sql[..40]);
     }
 }
 
@@ -347,15 +261,8 @@ fn nesting_limits_are_enforced_at_their_documented_values() {
     db.execute("INSERT INTO t VALUES (1)").unwrap();
 
     // Stored documents: 100 levels. {a: [[..1..]]} with k arrays has k + 2 levels.
-    let doc = |arrays: usize| {
-        format!(
-            "db.c.insert({{_id: {arrays}, a: {}1{}}})",
-            "[".repeat(arrays),
-            "]".repeat(arrays)
-        )
-    };
-    db.execute(&doc(98))
-        .expect("a 100-level document is accepted");
+    let doc = |arrays: usize| format!("db.c.insert({{_id: {arrays}, a: {}1{}}})", "[".repeat(arrays), "]".repeat(arrays));
+    db.execute(&doc(98)).expect("a 100-level document is accepted");
     match db.execute(&doc(99)) {
         Err(Error::Type(m)) => assert!(m.contains("deeper than 100 levels"), "{m}"),
         other => panic!("a 101-level document should be a type error, got {other:?}"),
@@ -370,17 +277,12 @@ fn nesting_limits_are_enforced_at_their_documented_values() {
         Output::Docs(d) => assert_eq!(d.len(), 1),
         other => panic!("{other:?}"),
     }
-    db.execute("db.c.update({_id: 98}, {$set: {b: 1}})")
-        .unwrap();
-    assert_eq!(
-        db.execute("db.c.count({b: 1})").unwrap(),
-        Output::Scalar(Value::Int(1))
-    );
+    db.execute("db.c.update({_id: 98}, {$set: {b: 1}})").unwrap();
+    assert_eq!(db.execute("db.c.count({b: 1})").unwrap(), Output::Scalar(Value::Int(1)));
 
     // SQL nesting: 32 levels (the expression itself is level 1)
     let parens = |n: usize| format!("SELECT {}1{} FROM t", "(".repeat(n), ")".repeat(n));
-    db.execute(&parens(31))
-        .expect("31 nested parentheses are accepted");
+    db.execute(&parens(31)).expect("31 nested parentheses are accepted");
     match db.execute(&parens(32)) {
         Err(Error::Parse(m)) => assert!(m.contains("nested deeper than 32 levels"), "{m}"),
         other => panic!("32 nested parentheses should be a parse error, got {other:?}"),
@@ -397,35 +299,17 @@ fn nesting_limits_are_enforced_at_their_documented_values() {
         other => panic!("101 operators should be a parse error, got {other:?}"),
     }
     // nesting and chaining share the budget: 30 NOTs around a 71-operator chain is 101
-    let mixed = |n: usize| {
-        format!(
-            "SELECT id FROM t WHERE {}(0{} = 0)",
-            "NOT ".repeat(30),
-            "+1".repeat(n)
-        )
-    };
+    let mixed = |n: usize| format!("SELECT id FROM t WHERE {}(0{} = 0)", "NOT ".repeat(30), "+1".repeat(n));
     assert!(db.execute(&mixed(60)).is_ok());
     assert!(matches!(db.execute(&mixed(100)), Err(Error::Parse(_))));
     // function arguments sit side by side, so they do not add up
-    let args = (0..50)
-        .map(|i| format!("{i}+1+1"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    db.execute(&format!("SELECT COALESCE({args}) FROM t"))
-        .expect("50 small arguments are not a deep expression");
+    let args = (0..50).map(|i| format!("{i}+1+1")).collect::<Vec<_>>().join(", ");
+    db.execute(&format!("SELECT COALESCE({args}) FROM t")).expect("50 small arguments are not a deep expression");
     // the budget is per expression, not per statement, and lists are not chains
-    let many_rows = (2..2000)
-        .map(|i| format!("({i} + 0)"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    db.execute(&format!("INSERT INTO t VALUES {many_rows}"))
-        .expect("a long VALUES list is not a deep expression");
-    let in_list = (0..5000)
-        .map(|i| format!("-{i}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    db.execute(&format!("SELECT id FROM t WHERE id IN ({in_list})"))
-        .expect("a long IN list is not a deep expression");
+    let many_rows = (2..2000).map(|i| format!("({i} + 0)")).collect::<Vec<_>>().join(", ");
+    db.execute(&format!("INSERT INTO t VALUES {many_rows}")).expect("a long VALUES list is not a deep expression");
+    let in_list = (0..5000).map(|i| format!("-{i}")).collect::<Vec<_>>().join(", ");
+    db.execute(&format!("SELECT id FROM t WHERE id IN ({in_list})")).expect("a long IN list is not a deep expression");
 }
 
 /// An update with a long dotted path could build a document deeper than the
@@ -435,9 +319,7 @@ fn updates_cannot_create_documents_too_deep_to_read_back() {
     let mut db = Database::in_memory();
     db.execute("db.c.insert({_id: 1})").unwrap();
     let path = vec!["a"; 200].join(".");
-    match db.execute(&format!(
-        "db.c.update({{_id: 1}}, {{$set: {{'{path}': 1}}}})"
-    )) {
+    match db.execute(&format!("db.c.update({{_id: 1}}, {{$set: {{'{path}': 1}}}})")) {
         Err(Error::Type(m)) => assert!(m.contains("deeper than 100 levels"), "{m}"),
         other => panic!("expected a type error, got {other:?}"),
     }
@@ -450,8 +332,7 @@ fn updates_cannot_create_documents_too_deep_to_read_back() {
 // ------------------------------------------------------------ damaged files
 
 fn seed(db: &mut Database) {
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
-        .unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").unwrap();
     db.execute("INSERT INTO t VALUES (1, 'one')").unwrap();
     db.execute("db.c.insert({_id: 1, v: 'doc'})").unwrap();
     db.execute("SET k value").unwrap();
@@ -534,108 +415,6 @@ fn damage_in_the_middle_of_the_log_is_reported_and_can_be_salvaged() {
     fs::remove_dir_all(&dir).unwrap();
 }
 
-#[test]
-fn torn_final_record_is_dropped_and_earlier_commits_survive() {
-    let dir = tmp("torn-wal");
-    {
-        let mut db = Database::open(&dir).unwrap();
-        db.execute("SET a 1").unwrap();
-        db.execute("SET b 2").unwrap();
-    }
-    let wal = dir.join("data.wal");
-    let bytes = fs::read(&wal).unwrap();
-    // cut the last record in half, as a crash during its write would
-    fs::write(&wal, &bytes[..bytes.len() - 5]).unwrap();
-    let mut db = Database::open(&dir).unwrap();
-    assert_eq!(db.execute("GET a").unwrap(), Output::Scalar(t("1")));
-    assert_eq!(db.execute("GET b").unwrap(), Output::Scalar(Value::Null));
-    drop(db);
-    // a damaged (bit-flipped) final record is also a torn tail
-    let mut db = Database::open(&dir).unwrap();
-    db.execute("SET c 3").unwrap();
-    drop(db);
-    let mut bytes = fs::read(&wal).unwrap();
-    let n = bytes.len();
-    bytes[n - 1] ^= 0xff;
-    fs::write(&wal, &bytes).unwrap();
-    let mut db = Database::open(&dir).unwrap();
-    assert_eq!(db.execute("GET a").unwrap(), Output::Scalar(t("1")));
-    assert_eq!(db.execute("GET c").unwrap(), Output::Scalar(Value::Null));
-    drop(db);
-    // a zero-filled tail (file extended but data never written)
-    let mut bytes = fs::read(&wal).unwrap();
-    bytes.extend_from_slice(&[0u8; 64]);
-    fs::write(&wal, &bytes).unwrap();
-    let mut db = Database::open(&dir).unwrap();
-    assert_eq!(db.execute("GET a").unwrap(), Output::Scalar(t("1")));
-    drop(db);
-    fs::remove_dir_all(&dir).unwrap();
-}
-
-#[test]
-fn a_database_directory_cannot_be_opened_twice() {
-    let dir = tmp("lock");
-    let db = Database::open(&dir).unwrap();
-    match Database::open(&dir) {
-        Err(Error::Io(e)) => assert!(e.to_string().contains("locked"), "{e}"),
-        Err(other) => panic!("expected a lock error, got {other:?}"),
-        Ok(_) => panic!("two handles opened the same directory"),
-    }
-    // the lock is also held against another process
-    let (code, _, err) = run_cli(&[dir.to_str().unwrap()], "SET k v\n");
-    assert_ne!(
-        code,
-        Some(0),
-        "second process should not open a locked directory"
-    );
-    assert!(err.contains("locked"), "{err}");
-    drop(db);
-    Database::open(&dir).expect("lock is released when the database is dropped");
-    fs::remove_dir_all(&dir).unwrap();
-}
-
-#[test]
-fn oversized_native_request_is_refused_not_executed() {
-    let db = Database::in_memory();
-    let cfg = Config {
-        host: "127.0.0.1".into(),
-        native: Some(0),
-        redis: Some(0),
-        postgres: None,
-        mongo: None,
-    };
-    let limits = server::Limits {
-        max_request_bytes: 4096,
-        ..Default::default()
-    };
-    let r = server::start_with_limits(&db, &cfg, limits).unwrap();
-    let mut s = TcpStream::connect(r.native.unwrap()).unwrap();
-    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    let big = format!("SET big {}\n", "x".repeat(10_000));
-    let _ = s.write_all(big.as_bytes());
-    let mut reply = String::new();
-    let _ = BufReader::new(&s).read_line(&mut reply);
-    assert!(reply.contains("limit"), "{reply}");
-    let mut db2 = db.session();
-    assert_eq!(
-        db2.execute("GET big").unwrap(),
-        Output::Scalar(Value::Null),
-        "truncated command must not run"
-    );
-    // RESP bulk string over the limit closes the connection without allocating it
-    let mut s = TcpStream::connect(r.redis.unwrap()).unwrap();
-    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    let _ = s.write_all(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$999999999\r\n");
-    let mut buf = [0u8; 16];
-    let n = s.read(&mut buf).unwrap_or(0);
-    assert_eq!(n, 0, "server should close the connection");
-    // the server is still alive
-    assert_eq!(
-        ask(r.native.unwrap(), "SET ok 1").get("ok"),
-        Some(&Value::Bool(true))
-    );
-}
-
 // ------------------------------------------------------------------ network
 
 #[test]
@@ -643,38 +422,14 @@ fn port_already_in_use_is_a_clean_error() {
     let taken = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = taken.local_addr().unwrap().port();
     let db = Database::in_memory();
-    let cfg = Config {
-        host: "127.0.0.1".into(),
-        native: Some(port),
-        redis: None,
-        postgres: None,
-        mongo: None,
-    };
+    let cfg = Config { host: "127.0.0.1".into(), native: Some(port), redis: None, postgres: None, mongo: None };
     match server::start(&db, &cfg) {
-        Err(Error::Io(e)) => assert!(
-            e.to_string()
-                .contains(&format!("cannot listen on 127.0.0.1:{port}")),
-            "{e}"
-        ),
+        Err(Error::Io(e)) => assert!(e.to_string().contains(&format!("cannot listen on 127.0.0.1:{port}")), "{e}"),
         Err(other) => panic!("expected an Io error, got {other:?}"),
         Ok(_) => panic!("binding a port that is in use should fail"),
     }
     // the same thing from the command line: exit 1 and say which port
-    let (code, _, err) = run_cli(
-        &[
-            "serve",
-            "--memory",
-            "--port",
-            &port.to_string(),
-            "--redis-port",
-            "off",
-            "--pg-port",
-            "off",
-            "--mongo-port",
-            "off",
-        ],
-        "",
-    );
+    let (code, _, err) = run_cli(&["serve", "--memory", "--port", &port.to_string(), "--redis-port", "off", "--pg-port", "off", "--mongo-port", "off"], "");
     assert_eq!(code, Some(1));
     assert!(err.contains("cannot listen on"), "stderr was {err:?}");
 }
@@ -682,13 +437,7 @@ fn port_already_in_use_is_a_clean_error() {
 #[test]
 fn disabled_listeners_are_not_opened() {
     let db = Database::in_memory();
-    let cfg = Config {
-        host: "127.0.0.1".into(),
-        native: Some(0),
-        redis: None,
-        postgres: None,
-        mongo: None,
-    };
+    let cfg = Config { host: "127.0.0.1".into(), native: Some(0), redis: None, postgres: None, mongo: None };
     let r = server::start(&db, &cfg).unwrap();
     assert!(r.native.is_some() && r.redis.is_none() && r.postgres.is_none() && r.mongo.is_none());
 }
@@ -697,17 +446,9 @@ fn disabled_listeners_are_not_opened() {
 fn garbage_on_every_port_leaves_the_server_running() {
     let (_db, r) = start_all();
     let native = r.native.unwrap();
-    assert_eq!(
-        ask(native, "SET canary alive").get("ok"),
-        Some(&Value::Bool(true))
-    );
+    assert_eq!(ask(native, "SET canary alive").get("ok"), Some(&Value::Bool(true)));
 
-    let ports = [
-        native,
-        r.redis.unwrap(),
-        r.postgres.unwrap(),
-        r.mongo.unwrap(),
-    ];
+    let ports = [native, r.redis.unwrap(), r.postgres.unwrap(), r.mongo.unwrap()];
     for (i, addr) in ports.iter().enumerate() {
         // random bytes of several sizes, same bytes on every run
         for (j, len) in [1usize, 7, 64, 1024, 65536].iter().enumerate() {
@@ -730,20 +471,10 @@ fn garbage_on_every_port_leaves_the_server_running() {
     poke(pg, &[0, 0, 0, 3]); // startup shorter than its own header
     poke(pg, &[0, 0, 0, 8, 0x04, 0xd2, 0x16, 0x2f]); // SSLRequest then nothing
     let mongo = r.mongo.unwrap();
-    poke(
-        mongo,
-        &[16, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0xdd, 0x07, 0, 0],
-    ); // OP_MSG, empty body
-    poke(
-        mongo,
-        &[
-            0xff, 0xff, 0xff, 0x7f, 1, 0, 0, 0, 0, 0, 0, 0, 0xdd, 0x07, 0, 0,
-        ],
-    ); // 2 GB message
+    poke(mongo, &[16, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0xdd, 0x07, 0, 0]); // OP_MSG, empty body
+    poke(mongo, &[0xff, 0xff, 0xff, 0x7f, 1, 0, 0, 0, 0, 0, 0, 0, 0xdd, 0x07, 0, 0]); // 2 GB message
     poke(mongo, &[4, 0, 0, 0]); // length smaller than a header
-    let mut bad_bson = vec![
-        26, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0xdd, 0x07, 0, 0, 0, 0, 0, 0, 0,
-    ];
+    let mut bad_bson = vec![26, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0xdd, 0x07, 0, 0, 0, 0, 0, 0, 0];
     bad_bson.extend_from_slice(&[0xff, 0xff, 0xff, 0x7f, 0]); // document claiming 2 GB
     poke(mongo, &bad_bson);
     // native: not UTF-8, and a very long line
@@ -754,8 +485,7 @@ fn garbage_on_every_port_leaves_the_server_running() {
 
     // every listener still accepts, and the data is untouched
     for addr in ports {
-        TcpStream::connect(addr)
-            .unwrap_or_else(|e| panic!("{addr} no longer accepts connections: {e}"));
+        TcpStream::connect(addr).unwrap_or_else(|e| panic!("{addr} no longer accepts connections: {e}"));
     }
     assert_eq!(ask(native, "GET canary").get("value"), Some(&t("alive")));
 }
@@ -764,9 +494,7 @@ fn garbage_on_every_port_leaves_the_server_running() {
 fn native_protocol_reports_errors_as_json_and_keeps_the_connection() {
     let (_db, r) = start_all();
     let stream = TcpStream::connect(r.native.unwrap()).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
     let mut w = stream.try_clone().unwrap();
     let mut reader = BufReader::new(stream);
     let mut ask = |cmd: &str| {
@@ -783,12 +511,7 @@ fn native_protocol_reports_errors_as_json_and_keeps_the_connection() {
     ] {
         let reply = ask(cmd);
         assert_eq!(reply.get("ok"), Some(&Value::Bool(false)), "{cmd}");
-        assert_eq!(
-            reply.get("kind"),
-            Some(&t(kind)),
-            "{cmd}: {}",
-            reply.to_json()
-        );
+        assert_eq!(reply.get("kind"), Some(&t(kind)), "{cmd}: {}", reply.to_json());
     }
     // same connection is still usable afterwards
     assert_eq!(ask("SET after errors").get("ok"), Some(&Value::Bool(true)));
@@ -810,10 +533,7 @@ fn a_client_that_disconnects_mid_transaction_leaves_nothing_behind() {
     } // dropped without COMMIT
     std::thread::sleep(Duration::from_millis(100));
     let mut local = db.session();
-    assert_eq!(
-        local.execute("GET orphan").unwrap(),
-        Output::Scalar(Value::Null)
-    );
+    assert_eq!(local.execute("GET orphan").unwrap(), Output::Scalar(Value::Null));
     assert_eq!(local.entry_count(), 0);
 }
 
@@ -824,24 +544,13 @@ fn a_client_that_disconnects_mid_transaction_leaves_nothing_behind() {
 fn deeply_nested_input_over_the_network_does_not_stop_the_server() {
     let (_db, r) = start_all();
     let native = r.native.unwrap();
-    assert_eq!(
-        ask(native, "CREATE TABLE t (id INT PRIMARY KEY)").get("ok"),
-        Some(&Value::Bool(true))
-    );
+    assert_eq!(ask(native, "CREATE TABLE t (id INT PRIMARY KEY)").get("ok"), Some(&Value::Bool(true)));
     ask(native, "INSERT INTO t VALUES (1)");
 
     let depth = 100_000;
     let rejected = [
-        format!(
-            "db.c.insert({{a: {}1{}}})",
-            "[".repeat(depth),
-            "]".repeat(depth)
-        ),
-        format!(
-            "db.c.find({{a: {}1{}}})",
-            "{b: ".repeat(depth),
-            "}".repeat(depth)
-        ),
+        format!("db.c.insert({{a: {}1{}}})", "[".repeat(depth), "]".repeat(depth)),
+        format!("db.c.find({{a: {}1{}}})", "{b: ".repeat(depth), "}".repeat(depth)),
         format!("SELECT {}1{} FROM t", "(".repeat(depth), ")".repeat(depth)),
         format!("SELECT 1{} FROM t", "+1".repeat(depth)),
     ];
@@ -851,11 +560,7 @@ fn deeply_nested_input_over_the_network_does_not_stop_the_server() {
     }
     // the deepest inputs that are allowed, evaluated on a connection thread
     let accepted = [
-        format!(
-            "db.c.insert({{_id: 1, a: {}1{}}})",
-            "[".repeat(98),
-            "]".repeat(98)
-        ),
+        format!("db.c.insert({{_id: 1, a: {}1{}}})", "[".repeat(98), "]".repeat(98)),
         "db.c.find({_id: 1})".to_string(),
         format!("SELECT {}1{} FROM t", "(".repeat(31), ")".repeat(31)),
         format!("SELECT 0{} FROM t", "+1".repeat(100)),
@@ -865,12 +570,7 @@ fn deeply_nested_input_over_the_network_does_not_stop_the_server() {
     ];
     for cmd in &accepted {
         let reply = ask(native, cmd);
-        assert_eq!(
-            reply.get("ok"),
-            Some(&Value::Bool(true)),
-            "{}",
-            reply.to_json()
-        );
+        assert_eq!(reply.get("ok"), Some(&Value::Bool(true)), "{}", reply.to_json());
     }
 
     // MongoDB port: an OP_MSG whose BSON document is nested 50,000 levels deep
@@ -892,11 +592,7 @@ fn deeply_nested_input_over_the_network_does_not_stop_the_server() {
     msg.extend_from_slice(&bson);
     poke(r.mongo.unwrap(), &msg);
 
-    assert_eq!(
-        ask(native, "SELECT COUNT(*) FROM t").get("ok"),
-        Some(&Value::Bool(true)),
-        "server stopped"
-    );
+    assert_eq!(ask(native, "SELECT COUNT(*) FROM t").get("ok"), Some(&Value::Bool(true)), "server stopped");
     TcpStream::connect(r.mongo.unwrap()).expect("MongoDB listener stopped");
 }
 
@@ -908,24 +604,9 @@ fn deeply_nested_input_over_the_network_does_not_stop_the_server() {
 #[test]
 fn acknowledged_writes_survive_killing_the_server() {
     let dir = tmp("kill");
-    let port = TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
     let mut child = Command::new(BIN)
-        .args([
-            "serve",
-            dir.to_str().unwrap(),
-            "--port",
-            &port.to_string(),
-            "--redis-port",
-            "off",
-            "--pg-port",
-            "off",
-            "--mongo-port",
-            "off",
-        ])
+        .args(["serve", dir.to_str().unwrap(), "--port", &port.to_string(), "--redis-port", "off", "--pg-port", "off", "--mongo-port", "off"])
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
@@ -941,24 +622,12 @@ fn acknowledged_writes_survive_killing_the_server() {
         std::thread::sleep(Duration::from_millis(50));
     }
 
-    assert_eq!(
-        ask(addr, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").get("ok"),
-        Some(&Value::Bool(true))
-    );
+    assert_eq!(ask(addr, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").get("ok"), Some(&Value::Bool(true)));
     for i in 0..50 {
-        assert_eq!(
-            ask(addr, &format!("INSERT INTO t VALUES ({i}, 'row{i}')")).get("ok"),
-            Some(&Value::Bool(true))
-        );
+        assert_eq!(ask(addr, &format!("INSERT INTO t VALUES ({i}, 'row{i}')")).get("ok"), Some(&Value::Bool(true)));
     }
-    assert_eq!(
-        ask(addr, "db.c.insert({_id: 1, v: 'doc'})").get("ok"),
-        Some(&Value::Bool(true))
-    );
-    assert_eq!(
-        ask(addr, "SET k durable").get("ok"),
-        Some(&Value::Bool(true))
-    );
+    assert_eq!(ask(addr, "db.c.insert({_id: 1, v: 'doc'})").get("ok"), Some(&Value::Bool(true)));
+    assert_eq!(ask(addr, "SET k durable").get("ok"), Some(&Value::Bool(true)));
 
     child.kill().expect("kill server"); // SIGKILL on Unix: no chance to flush
     child.wait().unwrap();

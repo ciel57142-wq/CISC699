@@ -15,13 +15,15 @@ pub enum Error {
     Type(String),
     /// On-disk data failed validation.
     Corrupt(String),
+    /// The database directory cannot be used safely: it is not a polydb
+    /// directory, has an unsupported format version, or an earlier write
+    /// failed in a way that makes further writes unsafe.
+    Storage(String),
     /// Misuse of BEGIN / COMMIT / ROLLBACK.
     Txn(String),
     /// The transaction read data that another session changed before it
     /// could commit. Nothing was written; retry the transaction.
     Conflict(String),
-    /// The statement was cancelled (by a cancel request or a resource limit).
-    Cancelled(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -35,9 +37,9 @@ impl fmt::Display for Error {
             Error::Constraint(m) => write!(f, "constraint violation: {m}"),
             Error::Type(m) => write!(f, "type error: {m}"),
             Error::Corrupt(m) => write!(f, "corrupt data: {m}"),
+            Error::Storage(m) => write!(f, "storage error: {m}"),
             Error::Txn(m) => write!(f, "transaction error: {m}"),
             Error::Conflict(m) => write!(f, "serialization conflict: {m}"),
-            Error::Cancelled(m) => write!(f, "cancelled: {m}"),
         }
     }
 }

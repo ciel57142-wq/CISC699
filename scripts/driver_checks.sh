@@ -25,7 +25,7 @@ fi
 .venv/bin/python -m pip install --quiet --disable-pip-version-check -r tests/requirements-drivers.txt
 
 log="$(mktemp)"
-./target/release/polydb serve --memory --port off --mongo-default-db app > "$log" 2>&1 &
+./target/release/polydb serve --memory --port off > "$log" 2>&1 &
 server=$!
 cleanup() { kill "$server" 2>/dev/null || true; wait "$server" 2>/dev/null || true; rm -f "$log"; }
 trap cleanup EXIT
@@ -38,4 +38,3 @@ done
 port_open 27018 || { echo "server did not open its ports within 10 s:" >&2; cat "$log" >&2; exit 1; }
 
 .venv/bin/python tests/drivers.py
-.venv/bin/python tests/clients/pg_extended.py

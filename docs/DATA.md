@@ -28,9 +28,14 @@ A database directory (default `./polydb-data`) holds at most three files:
 
 | File | Content |
 |---|---|
-| `data.wal` | write-ahead log: one checksummed record per commit |
+| `polydb.format` | text: format magic, format version, whether a snapshot exists |
+| `LOCK` | empty; locked while a process has the database open |
+| `data.wal` | write-ahead log: LSN-numbered checksummed records, `BEGIN` / data / `COMMIT` per transaction |
 | `data.snap` | full snapshot, written by `CHECKPOINT` or when the log passes 64 MB |
-| `data.snap.tmp` | exists only while a checkpoint is being written |
+| `data.snap.tmp`, `polydb.format.tmp` | exist only while a checkpoint or format update is being written |
+| `data.wal.corrupt` | only after opening a damaged log with `salvage` |
+
+`--memory` creates none of them. Details are in [STORAGE.md](STORAGE.md).
 
 These are binary files in polydb's own format and contain whatever the user stored. They are listed in `.gitignore` and must not be committed. Tests that need files create them under the operating system's temporary directory in folders named `polydb-test-*` and `polydb-harden-*`, and delete them when the test passes. A failed test can leave its folder behind; it is safe to delete.
 
@@ -38,7 +43,7 @@ These are binary files in polydb's own format and contain whatever the user stor
 
 | Source | Where | Effect on reproducibility |
 |---|---|---|
-| Generated document `_id` | `src/doc.rs`: current time in milliseconds plus a sequence number | Ids differ between runs. Tests and the smoke script always supply `_id`, or check only the id's type. |
+| Generated document `_id` | `src/doc/mod.rs`: current time in milliseconds plus a sequence number | Ids differ between runs. Tests and the smoke script always supply `_id`, or check only the id's type. |
 | MongoDB `ObjectId` values | created by pymongo on the client | Same as above. |
 | Thread scheduling | concurrent-client tests | Tests assert only the final total, which is the same for every interleaving. |
 | Free ports | chosen by the operating system (port 0) | Port numbers differ between runs; no output depends on them. |

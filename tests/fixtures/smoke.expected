@@ -52,7 +52,7 @@ committed
 (1 row(s))
 3
 4
-error: parse error: unknown command 'selekt': expected SQL, a db.<collection>.<method>(...) call, or SET/GET/DEL/EXISTS/KEYS/INCR
+error: parse error: unknown command 'selekt': expected SQL, a db.<collection>.<method>(...) call, SET/GET/DEL/EXISTS/KEYS/INCR/DECR, or BEGIN/COMMIT/ROLLBACK (at line 1, column 1)
 error: constraint violation: duplicate primary key 1 in table 'users'
  table
 -------

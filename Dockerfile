@@ -22,7 +22,10 @@ RUN cargo build --release --locked \
  && install -m 0755 target/release/polydb /usr/local/bin/polydb
 
 # Run as an unprivileged user; /data holds data.wal and data.snap.
-RUN useradd --system --home /data --create-home polydb
+# /data is created empty (no --create-home, which would copy /etc/skel
+# dotfiles into it): polydb only initialises a database in an empty directory.
+RUN useradd --system --home /data --no-create-home polydb \
+ && mkdir /data && chown polydb:polydb /data
 USER polydb
 VOLUME /data
 EXPOSE 7878 6380 5433 27018

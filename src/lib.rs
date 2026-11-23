@@ -22,25 +22,22 @@
 //! println!("{}", db.execute("SELECT * FROM users").unwrap());
 //! ```
 
-pub mod aggregate;
 pub mod doc;
-pub mod docindex;
 pub mod error;
-pub mod keys;
+mod keys;
 pub mod kv;
 pub mod mongo;
 pub mod pbsql;
 pub mod pgwire;
-pub mod query;
-pub mod rel;
 pub mod resp;
 pub mod server;
-mod sql;
+pub(crate) mod sql;
 pub mod storage;
 pub mod value;
 
 pub use doc::FindOptions;
 pub use error::{Error, Result};
+pub use storage::{FailPoint, Faults, RecoveryReport};
 pub use value::Value;
 
 use std::cell::RefCell;
@@ -49,7 +46,6 @@ use std::fmt;
 use std::path::Path;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use storage::{Ctx, ReadSet, Store, WriteSet};
-use value::JsonParser;
 
 /// The result of one command.
 #[derive(Debug, Clone, PartialEq)]
@@ -57,10 +53,7 @@ pub enum Output {
     /// A status message ("3 row(s) inserted").
     Done(String),
     /// A relational result set.
-    Rows {
-        columns: Vec<String>,
-        rows: Vec<Vec<Value>>,
-    },
+    Rows { columns: Vec<String>, rows: Vec<Vec<Value>> },
     /// Documents returned by a collection query.
     Docs(Vec<Value>),
     /// A single value (key-value reads, counts, generated ids).
@@ -79,10 +72,7 @@ impl fmt::Display for Output {
                 write!(f, "({} document(s))", docs.len())
             }
             Output::Rows { columns, rows } => {
-                let cells: Vec<Vec<String>> = rows
-                    .iter()
-                    .map(|r| r.iter().map(|v| v.display()).collect())
-                    .collect();
+                let cells: Vec<Vec<String>> = rows.iter().map(|r| r.iter().map(|v| v.display()).collect()).collect();
                 let mut w: Vec<usize> = columns.iter().map(|c| c.chars().count()).collect();
                 for r in &cells {
                     for (i, c) in r.iter().enumerate() {
@@ -92,24 +82,12 @@ impl fmt::Display for Output {
                 let line = |f: &mut fmt::Formatter<'_>, cols: &[String]| -> fmt::Result {
                     for (i, c) in cols.iter().enumerate() {
                         let pad = w[i] - c.chars().count();
-                        write!(
-                            f,
-                            "{}{c}{}",
-                            if i == 0 { " " } else { " | " },
-                            " ".repeat(pad)
-                        )?;
+                        write!(f, "{}{c}{}", if i == 0 { " " } else { " | " }, " ".repeat(pad))?;
                     }
                     writeln!(f)
                 };
                 line(f, columns)?;
-                writeln!(
-                    f,
-                    "{}",
-                    w.iter()
-                        .map(|n| "-".repeat(n + 2))
-                        .collect::<Vec<_>>()
-                        .join("+")
-                )?;
+                writeln!(f, "{}", w.iter().map(|n| "-".repeat(n + 2)).collect::<Vec<_>>().join("+"))?;
                 for r in &cells {
                     line(f, r)?;
                 }
@@ -136,8 +114,7 @@ impl Shared {
         if ws.is_empty() {
             return Ok(());
         }
-        let keys: Option<Vec<Vec<u8>>> =
-            (!self.active.is_empty()).then(|| ws.keys().cloned().collect());
+        let keys: Option<Vec<Vec<u8>>> = (!self.active.is_empty()).then(|| ws.keys().cloned().collect());
         self.store.commit(ws)?;
         self.version += 1;
         if let Some(keys) = keys {
@@ -156,7 +133,7 @@ impl Shared {
         match self.active.keys().next().copied() {
             None => self.log.clear(),
             Some(oldest) => {
-                while self.log.front().is_some_and(|(v, _)| *v <= oldest) {
+                while self.log.front().map_or(false, |(v, _)| *v <= oldest) {
                     self.log.pop_front();
                 }
             }
@@ -183,10 +160,6 @@ struct Txn {
 pub struct Database {
     shared: Arc<RwLock<Shared>>,
     txn: Option<Txn>,
-    /// Memory budget of each blocking query operator (sort, aggregation, hash join).
-    mem_limit: usize,
-    /// Set from any thread to cancel this session's running statement.
-    cancel: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Drop for Database {
@@ -199,92 +172,18 @@ impl Drop for Database {
 
 impl Database {
     fn from_store(store: Store) -> Database {
-        let shared = Shared {
-            store,
-            version: 0,
-            log: VecDeque::new(),
-            active: BTreeMap::new(),
-        };
-        let db = Database {
-            shared: Arc::new(RwLock::new(shared)),
-            txn: None,
-            mem_limit: query::exec::DEFAULT_MEM_LIMIT,
-            cancel: Default::default(),
-        };
-        // expiry index for TTLs written by an earlier format, then drop what already expired
-        {
-            let mut g = db.write_lock();
-            let mut ctx = Ctx {
-                store: &g.store,
-                writes: WriteSet::new(),
-                reads: None,
-                exec: Default::default(),
-                undo: None,
-            };
-            kv::index_untracked_expiries(&mut ctx);
-            let _ = rel::upgrade_indexes(&mut ctx);
-            while kv::purge_expired(&mut ctx, kv::now_ms(), 10_000) > 0 {}
-            let ws = ctx.writes;
-            let _ = g.commit(ws);
-        }
-        Database::start_reaper(Arc::downgrade(&db.shared));
-        db
+        let shared = Shared { store, version: 0, log: VecDeque::new(), active: BTreeMap::new() };
+        Database { shared: Arc::new(RwLock::new(shared)), txn: None }
     }
 
-    /// Background expiry: every `REAP_INTERVAL`, if the earliest expiry is due,
-    /// delete due key-value entries in small committed batches. The thread
-    /// holds only a weak reference and ends when the database is dropped.
-    fn start_reaper(weak: std::sync::Weak<RwLock<Shared>>) {
-        const REAP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
-        let _ = std::thread::Builder::new()
-            .name("polydb-expiry".into())
-            .spawn(move || loop {
-                std::thread::sleep(REAP_INTERVAL);
-                let Some(shared) = weak.upgrade() else { return };
-                let due = {
-                    let g = shared.read().unwrap_or_else(|e| e.into_inner());
-                    let ctx = Ctx {
-                        store: &g.store,
-                        writes: WriteSet::new(),
-                        reads: None,
-                        exec: Default::default(),
-                        undo: None,
-                    };
-                    kv::next_expiry(&ctx).is_some_and(|at| at <= kv::now_ms())
-                };
-                if due {
-                    let mut g = shared.write().unwrap_or_else(|e| e.into_inner());
-                    let mut ctx = Ctx {
-                        store: &g.store,
-                        writes: WriteSet::new(),
-                        reads: None,
-                        exec: Default::default(),
-                        undo: None,
-                    };
-                    kv::purge_expired(&mut ctx, kv::now_ms(), 1000);
-                    let ws = ctx.writes;
-                    let _ = g.commit(ws);
-                }
-                drop(shared);
-            });
-    }
-
-    /// Delete expired key-value entries now (the background reaper does this
-    /// periodically); returns how many were removed.
-    pub fn purge_expired(&mut self) -> Result<usize> {
-        self.run(true, |ctx| {
-            let mut n = 0;
-            loop {
-                let k = kv::purge_expired(ctx, kv::now_ms(), 10_000);
-                n += k;
-                if k == 0 {
-                    return Ok(n);
-                }
-            }
-        })
-    }
-
-    /// Open or create a durable database in directory `path`.
+    /// Open the durable database in directory `path`, or create one there if
+    /// `path` does not exist or is an empty directory.
+    ///
+    /// Every successful commit is in the write-ahead log and fsynced before
+    /// it is acknowledged, so it survives the process being killed. Opening
+    /// recovers automatically; it fails (instead of starting empty) if the
+    /// directory is locked, holds non-polydb files, is missing files it is
+    /// known to have, or is damaged in a way a crash cannot explain.
     pub fn open(path: impl AsRef<Path>) -> Result<Database> {
         Ok(Database::from_store(Store::open(path)?))
     }
@@ -292,6 +191,41 @@ impl Database {
     /// Open with explicit options, e.g. salvaging a log with interior corruption.
     pub fn open_with(path: impl AsRef<Path>, opts: &storage::OpenOptions) -> Result<Database> {
         Ok(Database::from_store(Store::open_with(path, opts)?))
+    }
+
+    /// [`Database::open_with`] with deterministic fail points armed; they
+    /// also cover the recovery that runs while opening. For crash testing.
+    pub fn open_with_faults(path: impl AsRef<Path>, opts: &storage::OpenOptions, faults: Faults) -> Result<Database> {
+        Ok(Database::from_store(Store::open_with_faults(path, opts, faults)?))
+    }
+
+    /// Arm a fail point: the `nth` time execution reaches `point`, the store
+    /// behaves as if the process died there and refuses further writes.
+    pub fn inject_fault(&mut self, point: FailPoint, nth: u64) {
+        self.write_lock().store.inject(point, nth);
+    }
+
+    /// What crash recovery found and did when this database was opened.
+    pub fn recovery_report(&self) -> RecoveryReport {
+        self.read_lock().store.recovery_report().clone()
+    }
+
+    /// Open a durable database and, after recovery, verify every relational
+    /// index entry against the rows, rebuilding the indexes of any table
+    /// where they disagree. Costs one pass over the data; returns what it
+    /// found. Rows and index entries are written in the same atomic commit,
+    /// so on an undamaged database this finds nothing; it is the repair path
+    /// for data written by other tools or damaged outside the engine.
+    pub fn open_verified(path: impl AsRef<Path>) -> Result<(Database, sql::RepairReport)> {
+        let mut db = Database::open(path)?;
+        let report = db.repair_indexes()?;
+        Ok((db, report))
+    }
+
+    /// Verify every relational index against its rows and rebuild the
+    /// indexes of tables where they disagree, as one atomic commit.
+    pub fn repair_indexes(&mut self) -> Result<sql::RepairReport> {
+        self.run(true, sql::repair_indexes)
     }
 
     /// A database that lives only in memory.
@@ -302,31 +236,7 @@ impl Database {
     /// Another session on the same data, with its own transaction state.
     /// Sessions are `Send`: give one to each thread.
     pub fn session(&self) -> Database {
-        Database {
-            shared: self.shared.clone(),
-            txn: None,
-            mem_limit: self.mem_limit,
-            cancel: Default::default(),
-        }
-    }
-
-    /// Memory budget (bytes) of each blocking query operator; beyond it,
-    /// sorts, aggregations and hash joins spill to temporary files.
-    pub fn set_memory_limit(&mut self, bytes: usize) {
-        self.mem_limit = bytes.max(1);
-    }
-
-    /// A flag that cancels this session's running statement when set (from
-    /// any thread). It is cleared when the next statement starts.
-    pub fn cancel_handle(&self) -> Arc<std::sync::atomic::AtomicBool> {
-        self.cancel.clone()
-    }
-
-    fn exec_opts(&self) -> query::exec::ExecOpts {
-        query::exec::ExecOpts {
-            mem_limit: self.mem_limit,
-            cancel: Some(self.cancel.clone()),
-        }
+        Database { shared: self.shared.clone(), txn: None }
     }
 
     fn read_lock(&self) -> RwLockReadGuard<'_, Shared> {
@@ -344,29 +254,34 @@ impl Database {
         self.write_lock().store.sync = sync;
     }
 
+    /// Fold the log into a snapshot automatically once it passes `bytes`
+    /// (default 64 MB). This bounds log size and recovery time; it has no
+    /// effect on durability, which comes from the log alone.
+    pub fn set_checkpoint_threshold(&mut self, bytes: u64) {
+        self.write_lock().store.checkpoint_bytes = bytes;
+    }
+
+    /// Whether this database is backed by files (false for [`Database::in_memory`]).
+    pub fn is_durable(&self) -> bool {
+        self.read_lock().store.is_durable()
+    }
+
+    /// Bytes of an interrupted, never-acknowledged final commit that recovery
+    /// discarded when the database was opened (0 after a clean shutdown).
+    pub fn recovered_torn_bytes(&self) -> u64 {
+        self.read_lock().store.discarded_tail_bytes()
+    }
+
     /// Run `f` inside this session's open transaction, or as its own atomic
     /// statement. A failing statement leaves no partial writes behind.
     fn run<T>(&mut self, writes: bool, f: impl FnOnce(&mut Ctx) -> Result<T>) -> Result<T> {
         if let Some(mut t) = self.txn.take() {
             let guard = self.shared.read().unwrap_or_else(|e| e.into_inner());
-            let mut ctx = Ctx {
-                store: &guard.store,
-                writes: t.writes,
-                reads: Some(RefCell::new(t.reads)),
-                exec: self.exec_opts(),
-                undo: None,
-            };
-            ctx.begin_statement();
+            let savepoint = t.writes.clone();
+            let mut ctx = Ctx { store: &guard.store, writes: t.writes, reads: Some(RefCell::new(t.reads)) };
             let res = f(&mut ctx);
-            if res.is_err() {
-                ctx.undo_statement(); // a failing statement leaves the transaction as it was
-            }
-            t.reads = ctx
-                .reads
-                .take()
-                .map(RefCell::into_inner)
-                .unwrap_or_default();
-            t.writes = ctx.writes;
+            t.reads = ctx.reads.take().map(RefCell::into_inner).unwrap_or_default();
+            t.writes = if res.is_ok() { ctx.writes } else { savepoint };
             drop(guard);
             self.txn = Some(t);
             return res;
@@ -374,26 +289,14 @@ impl Database {
         if writes {
             // Hold the write lock across read-modify-write so the statement is atomic.
             let mut guard = self.shared.write().unwrap_or_else(|e| e.into_inner());
-            let mut ctx = Ctx {
-                store: &guard.store,
-                writes: WriteSet::new(),
-                reads: None,
-                exec: self.exec_opts(),
-                undo: None,
-            };
+            let mut ctx = Ctx { store: &guard.store, writes: WriteSet::new(), reads: None };
             let out = f(&mut ctx)?;
             let ws = ctx.writes;
             guard.commit(ws)?;
             Ok(out)
         } else {
             let guard = self.shared.read().unwrap_or_else(|e| e.into_inner());
-            let mut ctx = Ctx {
-                store: &guard.store,
-                writes: WriteSet::new(),
-                reads: None,
-                exec: self.exec_opts(),
-                undo: None,
-            };
+            let mut ctx = Ctx { store: &guard.store, writes: WriteSet::new(), reads: None };
             f(&mut ctx)
         }
     }
@@ -408,39 +311,25 @@ impl Database {
         let start = g.version;
         *g.active.entry(start).or_insert(0) += 1;
         drop(g);
-        self.txn = Some(Txn {
-            writes: WriteSet::new(),
-            reads: ReadSet::default(),
-            start,
-        });
+        self.txn = Some(Txn { writes: WriteSet::new(), reads: ReadSet::default(), start });
         Ok(())
     }
 
     pub fn commit(&mut self) -> Result<()> {
-        let t = self
-            .txn
-            .take()
-            .ok_or_else(|| Error::Txn("no transaction is open".into()))?;
+        let t = self.txn.take().ok_or_else(|| Error::Txn("no transaction is open".into()))?;
         let mut g = self.write_lock();
-        let stale = g
-            .log
-            .iter()
-            .any(|(v, keys)| *v > t.start && keys.iter().any(|k| t.reads.touches(k)));
+        let stale = g.log.iter().any(|(v, keys)| *v > t.start && keys.iter().any(|k| t.reads.touches(k)));
         g.release(t.start);
         if stale {
             return Err(Error::Conflict(
-                "another session changed data this transaction read; nothing was written, retry it"
-                    .into(),
+                "another session changed data this transaction read; nothing was written, retry it".into(),
             ));
         }
         g.commit(t.writes)
     }
 
     pub fn rollback(&mut self) -> Result<()> {
-        let t = self
-            .txn
-            .take()
-            .ok_or_else(|| Error::Txn("no transaction is open".into()))?;
+        let t = self.txn.take().ok_or_else(|| Error::Txn("no transaction is open".into()))?;
         self.write_lock().release(t.start);
         Ok(())
     }
@@ -449,7 +338,8 @@ impl Database {
         self.txn.is_some()
     }
 
-    /// Fold the write-ahead log into a snapshot file.
+    /// Fold the write-ahead log into a snapshot file. Never required for
+    /// durability; it only shortens the log and the next start-up.
     pub fn checkpoint(&mut self) -> Result<()> {
         self.write_lock().store.checkpoint()
     }
@@ -461,64 +351,23 @@ impl Database {
 
     // ------------------------------------------------------------ typed API
 
-    /// Run a statement with `$1`, `$2`, ... bound to `params` (as values,
-    /// never spliced into the text). Statements without parameters run like
-    /// [`Database::execute`].
-    pub fn execute_params(
-        &mut self,
-        command: &str,
-        params: &[pbsql::parser::Param],
-    ) -> Result<Output> {
-        let wanted = pbsql::parser::param_count(command).unwrap_or(0);
-        if wanted == 0 && params.is_empty() {
-            return self.execute(command);
-        }
-        if params.len() < wanted {
+    /// Run one relational PBSQL statement (SELECT, INSERT, UPDATE, DELETE,
+    /// DDL, ANALYZE, EXPLAIN of those). Other kinds of statement are
+    /// refused; use [`Database::execute`] for those.
+    pub fn sql(&mut self, statement: &str) -> Result<Output> {
+        let stmt = pbsql::parse(statement)?;
+        let relational = match &stmt {
+            pbsql::ast::Statement::Sql(_) => true,
+            pbsql::ast::Statement::Explain { stmt, .. } => matches!(**stmt, pbsql::ast::Statement::Sql(_)),
+            _ => false,
+        };
+        if !relational {
             return Err(Error::Parse(format!(
-                "statement uses {wanted} parameter(s) but {} were bound",
-                params.len()
+                "sql() runs relational statements; this is a {} statement, use execute()",
+                stmt.kind()
             )));
         }
-        self.cancel
-            .store(false, std::sync::atomic::Ordering::SeqCst);
-        let st = pbsql::parser::parse_params(command.trim().trim_end_matches(';'), params)?;
-        let read = pbsql::exec::is_read_only_stmt(&st);
-        self.run(!read, |ctx| pbsql::exec::run_stmt(ctx, st))
-    }
-
-    /// Describe a statement without running it: how many `$n` parameters it
-    /// takes and, for statements that return rows, its column names.
-    pub fn describe(
-        &mut self,
-        command: &str,
-    ) -> Result<(usize, Option<Vec<(String, Option<pbsql::ast::Ty>)>>)> {
-        let n = pbsql::parser::param_count(command).unwrap_or(0);
-        let s = command.trim().trim_end_matches(';');
-        let try_with = |p: pbsql::parser::Param| pbsql::parser::parse_params(s, &vec![p; n]);
-        let st = try_with(pbsql::parser::Param::Typed(Value::Null))
-            .or_else(|_| try_with(pbsql::parser::Param::Untyped("1".into())));
-        let cols = match st {
-            Ok(st) => self.run(false, |ctx| Ok(pbsql::exec::describe(ctx, st)))?,
-            Err(_) => match first_word(s).as_str() {
-                // other commands (document, key-value, SHOW) return rows of unknown shape
-                "show" | "get" | "keys" | "exists" | "incr" | "db" => {
-                    Some(vec![("value".into(), None)])
-                }
-                _ => None,
-            },
-        };
-        Ok((n, cols))
-    }
-
-    /// Run one SQL statement.
-    pub fn sql(&mut self, statement: &str) -> Result<Output> {
-        self.pbsql(statement)
-    }
-
-    /// Run one PBSQL statement (SQL, document, key-value or cross-model).
-    pub fn pbsql(&mut self, statement: &str) -> Result<Output> {
-        let read = pbsql::exec::is_read_only(statement);
-        self.run(!read, |ctx| sql::execute(ctx, statement))
+        self.execute_statement(stmt)
     }
 
     pub fn kv_set(&mut self, key: &str, value: &[u8]) -> Result<()> {
@@ -526,24 +375,6 @@ impl Database {
             kv::set(ctx, key, value);
             Ok(())
         })
-    }
-
-    /// Set a key with an optional time-to-live in milliseconds.
-    pub fn kv_set_ttl(&mut self, key: &str, value: &[u8], ttl_ms: Option<i64>) -> Result<()> {
-        self.run(true, |ctx| {
-            kv::set_with_ttl(ctx, key, value, ttl_ms);
-            Ok(())
-        })
-    }
-
-    /// Give an existing key a time-to-live (`None` removes it); returns whether the key exists.
-    pub fn kv_expire(&mut self, key: &str, ttl_ms: Option<i64>) -> Result<bool> {
-        self.run(true, |ctx| Ok(kv::set_ttl(ctx, &keys::kv(key), ttl_ms)))
-    }
-
-    /// Remaining time-to-live in ms: `None` if the key does not exist, `Some(-1)` if it has none.
-    pub fn kv_ttl(&mut self, key: &str) -> Result<Option<i64>> {
-        self.run(false, |ctx| Ok(kv::ttl_left(ctx, &keys::kv(key))))
     }
 
     pub fn kv_get(&mut self, key: &str) -> Result<Option<Vec<u8>>> {
@@ -567,23 +398,42 @@ impl Database {
         self.run(true, |ctx| doc::insert(ctx, collection, doc))
     }
 
-    pub fn doc_find(
-        &mut self,
-        collection: &str,
-        filter: &Value,
-        opts: &FindOptions,
-    ) -> Result<Vec<Value>> {
+    /// Insert several documents atomically (all or none); returns their ids.
+    pub fn doc_insert_many(&mut self, collection: &str, docs: Vec<Value>) -> Result<Vec<Value>> {
+        self.run(true, |ctx| doc::insert_many(ctx, collection, docs))
+    }
+
+    pub fn doc_find(&mut self, collection: &str, filter: &Value, opts: &FindOptions) -> Result<Vec<Value>> {
         self.run(false, |ctx| doc::find(ctx, collection, filter, opts))
     }
 
-    /// Update every matching document; returns how many.
+    /// Number of documents matching `filter`.
+    pub fn doc_count(&mut self, collection: &str, filter: &Value) -> Result<u64> {
+        self.run(false, |ctx| doc::count(ctx, collection, filter))
+    }
+
+    /// Distinct values of `field` among matching documents, sorted.
+    pub fn doc_distinct(&mut self, collection: &str, field: &str, filter: &Value) -> Result<Vec<Value>> {
+        self.run(false, |ctx| doc::distinct(ctx, collection, field, filter))
+    }
+
+    /// The access path a filter uses and how many documents it reads.
+    pub fn doc_explain(&mut self, collection: &str, filter: &Value) -> Result<Value> {
+        self.run(false, |ctx| doc::explain(ctx, collection, filter))
+    }
+
+    /// Run an aggregation pipeline (see [`doc::aggregate`](crate::doc::aggregate) for the stages).
+    pub fn doc_aggregate(&mut self, collection: &str, pipeline: &[Value]) -> Result<Vec<Value>> {
+        self.run(false, |ctx| doc::aggregate(ctx, collection, pipeline))
+    }
+
+    /// Update every matching document; returns how many matched.
     pub fn doc_update(&mut self, collection: &str, filter: &Value, update: &Value) -> Result<u64> {
-        self.doc_update_with(collection, filter, update, true, false)
-            .map(|r| r.0)
+        self.doc_update_with(collection, filter, update, true, false).map(|r| r.0)
     }
 
     /// Update with control over `multi` (all matches vs first) and `upsert`.
-    /// Returns (documents updated, id of an upserted document).
+    /// Returns (documents matched, id of an upserted document).
     pub fn doc_update_with(
         &mut self,
         collection: &str,
@@ -592,9 +442,19 @@ impl Database {
         multi: bool,
         upsert: bool,
     ) -> Result<(u64, Option<Value>)> {
-        self.run(true, |ctx| {
-            doc::update(ctx, collection, filter, update, multi, upsert)
-        })
+        self.doc_update_full(collection, filter, update, multi, upsert).map(|r| (r.matched, r.upserted_id))
+    }
+
+    /// Update returning matched and modified counts and any upserted id.
+    pub fn doc_update_full(
+        &mut self,
+        collection: &str,
+        filter: &Value,
+        update: &Value,
+        multi: bool,
+        upsert: bool,
+    ) -> Result<doc::UpdateResult> {
+        self.run(true, |ctx| doc::update(ctx, collection, filter, update, multi, upsert))
     }
 
     /// Delete every matching document; returns how many.
@@ -603,50 +463,13 @@ impl Database {
     }
 
     /// Delete at most `limit` matching documents.
-    pub fn doc_delete_with(
-        &mut self,
-        collection: &str,
-        filter: &Value,
-        limit: Option<u64>,
-    ) -> Result<u64> {
+    pub fn doc_delete_with(&mut self, collection: &str, filter: &Value, limit: Option<u64>) -> Result<u64> {
         self.run(true, |ctx| doc::delete(ctx, collection, filter, limit))
     }
 
-    /// Create a single-field or compound document index (`fields` as (path, 1 | -1)).
-    pub fn doc_create_index_with(
-        &mut self,
-        collection: &str,
-        fields: Vec<(String, i64)>,
-        unique: bool,
-        name: Option<String>,
-    ) -> Result<bool> {
-        self.run(true, |ctx| {
-            doc::create_index_with(ctx, collection, fields, unique, name)
-        })
-    }
-
-    /// Drop a document index by name; returns whether it existed.
-    pub fn doc_drop_index(&mut self, collection: &str, name: &str) -> Result<bool> {
-        self.run(true, |ctx| doc::drop_index(ctx, collection, name))
-    }
-
-    pub fn doc_indexes(&mut self, collection: &str) -> Result<Vec<docindex::DocIndex>> {
-        self.run(false, |ctx| doc::indexes(ctx, collection))
-    }
-
-    /// Check every index of a collection against its documents; returns problems found.
-    pub fn doc_validate_indexes(&mut self, collection: &str) -> Result<Vec<String>> {
-        self.run(false, |ctx| docindex::validate(ctx, collection))
-    }
-
-    /// Rebuild every index of a collection.
-    pub fn doc_reindex(&mut self, collection: &str) -> Result<usize> {
-        self.run(true, |ctx| docindex::reindex(ctx, collection))
-    }
-
-    /// Run a MongoDB-style aggregation pipeline over a collection.
-    pub fn doc_aggregate(&mut self, collection: &str, pipeline: &[Value]) -> Result<Vec<Value>> {
-        self.run(false, |ctx| aggregate::aggregate(ctx, collection, pipeline))
+    /// Several write operations as one atomic unit (see [`doc::bulk_write`](crate::doc::bulk_write)).
+    pub fn doc_bulk_write(&mut self, collection: &str, ops: &[Value]) -> Result<Value> {
+        self.run(true, |ctx| doc::bulk_write(ctx, collection, ops))
     }
 
     pub fn doc_drop(&mut self, collection: &str) -> Result<bool> {
@@ -659,437 +482,76 @@ impl Database {
 
     /// Index a field of a collection; returns false if it was already indexed.
     pub fn doc_create_index(&mut self, collection: &str, field: &str) -> Result<bool> {
-        self.run(true, |ctx| doc::create_index(ctx, collection, field))
+        self.doc_create_index_on(collection, &[field], false)
+    }
+
+    /// Create a single-field or compound index, optionally unique.
+    pub fn doc_create_index_on(&mut self, collection: &str, fields: &[&str], unique: bool) -> Result<bool> {
+        let fields = fields.iter().map(|f| f.to_string()).collect();
+        self.run(true, |ctx| doc::create_index(ctx, collection, fields, unique))
+    }
+
+    /// Drop an index by name (`a_1_b_1`), field, or key spec.
+    pub fn doc_drop_index(&mut self, collection: &str, spec: &Value) -> Result<bool> {
+        self.run(true, |ctx| doc::drop_index(ctx, collection, spec))
+    }
+
+    pub fn doc_indexes(&mut self, collection: &str) -> Result<Vec<Value>> {
+        self.run(false, |ctx| doc::list_indexes(ctx, collection))
+    }
+
+    /// Set or clear (`null`) a collection's document schema.
+    pub fn doc_set_schema(&mut self, collection: &str, schema: &Value) -> Result<()> {
+        self.run(true, |ctx| doc::set_schema(ctx, collection, schema))
+    }
+
+    /// Consistency report for a collection's documents and index entries.
+    pub fn doc_validate(&mut self, collection: &str) -> Result<Value> {
+        self.run(false, |ctx| doc::validate(ctx, collection))
+    }
+
+    /// Rebuild a collection's index entries; returns how many were written.
+    pub fn doc_reindex(&mut self, collection: &str) -> Result<u64> {
+        self.run(true, |ctx| doc::reindex(ctx, collection))
     }
 
     // ---------------------------------------------------- unified commands
 
-    /// Run one command in any of the three languages:
+    /// Run one PBSQL statement (see `docs/PBSQL.md`):
     ///
-    /// * SQL / PBSQL: `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `CREATE TABLE|INDEX`, `DROP TABLE|INDEX`,
-    ///   `ALTER TABLE`, `EXPLAIN [ANALYZE]`, model-qualified names (`DOCUMENT.c`, `KV.ns`)
+    /// * relational: `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `CREATE TABLE|[UNIQUE] INDEX`,
+    ///   `DROP TABLE|INDEX`, `ALTER TABLE`, `TRUNCATE`, `ANALYZE`, `DESCRIBE`, `CHECK TABLE`,
+    ///   `REINDEX`; a FROM clause may also read `DOCUMENT(collection)` and `KV('prefix')`
     /// * documents: `db.<collection>.<method>(...)`
-    /// * key-value: `SET`, `GET`, `DEL`, `EXISTS`, `KEYS`, `INCR`
-    /// * control: `BEGIN`, `COMMIT`, `ROLLBACK`, `CHECKPOINT`, `SHOW TABLES`, `SHOW COLLECTIONS`
+    /// * key-value: `SET`, `GET`, `DEL`, `EXISTS`, `KEYS`, `INCR`, `DECR`
+    /// * control: `BEGIN`, `COMMIT`, `ROLLBACK`, `EXPLAIN [ANALYZE]`, `CHECKPOINT`,
+    ///   `SHOW TABLES`, `SHOW COLLECTIONS`
+    ///
+    /// The statement is lexed, parsed and semantically checked before it
+    /// touches any data; then it runs as one atomic unit (or inside the
+    /// session's open transaction).
     pub fn execute(&mut self, command: &str) -> Result<Output> {
-        self.cancel
-            .store(false, std::sync::atomic::Ordering::SeqCst);
-        let s = command.trim().trim_end_matches(';').trim_end();
-        if let Some(rest) = s.strip_prefix("db.") {
-            let method = rest
-                .split_once('.')
-                .map_or("", |(_, m)| m.split('(').next().unwrap_or(""))
-                .to_ascii_lowercase();
-            let read = matches!(
-                method.trim(),
-                "find"
-                    | "findone"
-                    | "count"
-                    | "countdocuments"
-                    | "aggregate"
-                    | "getindexes"
-                    | "validate"
-            );
-            return self.run(!read, |ctx| doc_command(ctx, s));
-        }
-        let (word, rest) = match s.find(char::is_whitespace) {
-            Some(i) => (&s[..i], s[i..].trim_start()),
-            None => (s, ""),
-        };
-        match word.to_ascii_lowercase().as_str() {
-            "" => Err(Error::Parse("empty command".into())),
-            "begin" => self.begin().map(|_| Output::Done("transaction started".into())),
-            "commit" => self.commit().map(|_| Output::Done("committed".into())),
-            "rollback" => self.rollback().map(|_| Output::Done("rolled back".into())),
-            "checkpoint" => self.checkpoint().map(|_| Output::Done("checkpoint written".into())),
-            "show" => {
-                let what = rest.to_ascii_lowercase();
-                let (header, names) = match what.as_str() {
-                    "tables" => ("table", self.run(false, |ctx| Ok(sql::tables(ctx)))?),
-                    "collections" => ("collection", self.run(false, |ctx| Ok(doc::collections(ctx)))?),
-                    _ => return Err(Error::Parse("use SHOW TABLES or SHOW COLLECTIONS".into())),
-                };
-                Ok(Output::Rows {
-                    columns: vec![header.to_string()],
-                    rows: names.into_iter().map(|n| vec![Value::Text(n)]).collect(),
-                })
-            }
-            // PBSQL key-value forms: GET FROM KV 'k', SET KV 'k' = v, EXISTS KV 'k'
-            "get" if first_word(rest) == "from" => self.pbsql(s),
-            "set" | "exists" if is_pbsql_kv(rest) => self.pbsql(s),
-            w @ ("get" | "exists" | "keys") => self.run(false, |ctx| kv_command(ctx, w, rest)),
-            w @ ("set" | "del" | "incr") => self.run(true, |ctx| kv_command(ctx, w, rest)),
-            "select" | "insert" | "update" | "delete" | "create" | "drop" | "alter" | "explain" | "increment" | "with" => {
-                self.pbsql(s)
-            }
-            _ if s.starts_with('(') => self.pbsql(s),
-            other => Err(Error::Parse(format!(
-                "unknown command '{other}': expected SQL, a db.<collection>.<method>(...) call, or SET/GET/DEL/EXISTS/KEYS/INCR"
-            ))),
-        }
+        let stmt = pbsql::parse(command)?;
+        self.execute_statement(stmt)
     }
-}
 
-/// `KV 'key' ...` / `KV.ns 'key' ...` after SET or EXISTS (legacy forms take a bare key).
-fn is_pbsql_kv(rest: &str) -> bool {
-    let r = rest.trim_start();
-    let Some(after) = r
-        .get(..2)
-        .filter(|p| p.eq_ignore_ascii_case("kv"))
-        .map(|_| &r[2..])
-    else {
-        return false;
-    };
-    let after = after.trim_start();
-    after.starts_with('\'') || after.starts_with('.')
-}
-
-fn first_word(s: &str) -> String {
-    s.trim_start()
-        .split(|c: char| !c.is_alphanumeric())
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase()
-}
-
-// ------------------------------------------------------- key-value commands
-
-/// Take one argument: a bare word, or a quoted string with backslash escapes.
-fn take_arg(s: &str) -> Result<(String, &str)> {
-    let s = s.trim_start();
-    let mut chars = s.char_indices();
-    match chars.next() {
-        None => Err(Error::Parse("missing argument".into())),
-        Some((_, q @ ('"' | '\''))) => {
-            let mut out = String::new();
-            let mut escaped = false;
-            for (i, c) in chars {
-                if escaped {
-                    out.push(match c {
-                        'n' => '\n',
-                        't' => '\t',
-                        other => other,
-                    });
-                    escaped = false;
-                } else if c == '\\' {
-                    escaped = true;
-                } else if c == q {
-                    return Ok((out, &s[i + 1..]));
-                } else {
-                    out.push(c);
-                }
-            }
-            Err(Error::Parse("unterminated quoted argument".into()))
-        }
-        Some(_) => {
-            let end = s.find(char::is_whitespace).unwrap_or(s.len());
-            Ok((s[..end].to_string(), &s[end..]))
-        }
-    }
-}
-
-fn no_more(rest: &str) -> Result<()> {
-    if rest.trim().is_empty() {
-        Ok(())
-    } else {
-        Err(Error::Parse(format!(
-            "unexpected extra argument '{}'",
-            rest.trim()
-        )))
-    }
-}
-
-fn kv_command(ctx: &mut Ctx, word: &str, rest: &str) -> Result<Output> {
-    if word == "keys" {
-        let prefix = if rest.trim().is_empty() {
-            String::new()
-        } else {
-            take_arg(rest)?.0
-        };
-        let rows = kv::keys(ctx, &prefix)
-            .into_iter()
-            .map(|k| vec![Value::Text(k)])
-            .collect();
-        return Ok(Output::Rows {
-            columns: vec!["key".into()],
-            rows,
-        });
-    }
-    let (key, rest) = take_arg(rest)?;
-    match word {
-        "set" => {
-            let rest = rest.trim();
-            if rest.is_empty() {
-                return Err(Error::Parse("SET needs a key and a value".into()));
-            }
-            // A quoted value is unescaped; anything else is taken verbatim to the end of the line.
-            let value = if rest.starts_with('"') || rest.starts_with('\'') {
-                let (v, tail) = take_arg(rest)?;
-                no_more(tail)?;
-                v
-            } else {
-                rest.to_string()
-            };
-            kv::set(ctx, &key, value.as_bytes());
-            Ok(Output::Done("OK".into()))
-        }
-        "get" => {
-            no_more(rest)?;
-            Ok(Output::Scalar(match kv::get(ctx, &key) {
-                Some(v) => Value::Text(String::from_utf8_lossy(&v).into_owned()),
-                None => Value::Null,
-            }))
-        }
-        "del" => {
-            no_more(rest)?;
-            Ok(Output::Scalar(Value::Int(kv::del(ctx, &key) as i64)))
-        }
-        "exists" => {
-            no_more(rest)?;
-            Ok(Output::Scalar(Value::Bool(kv::get(ctx, &key).is_some())))
-        }
-        _ => {
-            let by = if rest.trim().is_empty() {
-                1
-            } else {
-                rest.trim()
-                    .parse::<i64>()
-                    .map_err(|_| Error::Parse("INCR amount must be an integer".into()))?
-            };
-            Ok(Output::Scalar(Value::Int(kv::incr(ctx, &key, by)?)))
-        }
-    }
-}
-
-// -------------------------------------------------------- document commands
-
-/// Parse `method(args...).method(args...)` where each argument is JSON.
-fn parse_calls(s: &str) -> Result<Vec<(String, Vec<Value>)>> {
-    let b = s.as_bytes();
-    let mut pos = 0;
-    let mut calls = Vec::new();
-    let skip_ws = |pos: &mut usize| {
-        while *pos < b.len() && b[*pos].is_ascii_whitespace() {
-            *pos += 1;
-        }
-    };
-    loop {
-        let start = pos;
-        while pos < b.len() && (b[pos].is_ascii_alphanumeric() || b[pos] == b'_') {
-            pos += 1;
-        }
-        let name = s[start..pos].to_ascii_lowercase();
-        if name.is_empty() || b.get(pos) != Some(&b'(') {
-            return Err(Error::Parse(
-                "expected db.<collection>.<method>(...)".into(),
-            ));
-        }
-        pos += 1;
-        let mut args = Vec::new();
-        loop {
-            skip_ws(&mut pos);
-            match b.get(pos) {
-                None => return Err(Error::Parse("missing ')'".into())),
-                Some(b')') => {
-                    pos += 1;
-                    break;
-                }
-                Some(b',') => pos += 1,
-                Some(b'{')
-                    if args.is_empty() && matches!(name.as_str(), "sort" | "createindex") =>
-                {
-                    // key order matters for sorts and compound indexes: keep it
-                    let mut jp = JsonParser::at(s, pos);
-                    let pairs = jp.ordered_object()?;
-                    args.push(Value::Array(
-                        pairs
-                            .into_iter()
-                            .map(|(k, v)| Value::Array(vec![Value::Text(k), v]))
-                            .collect(),
-                    ));
-                    pos = jp.pos;
-                }
-                Some(_) => {
-                    let mut jp = JsonParser::at(s, pos);
-                    args.push(jp.value()?);
-                    pos = jp.pos;
-                }
-            }
-        }
-        calls.push((name, args));
-        skip_ws(&mut pos);
-        match b.get(pos) {
-            None => return Ok(calls),
-            Some(b'.') => pos += 1,
-            Some(_) => {
-                return Err(Error::Parse(format!(
-                    "unexpected text after ')': '{}'",
-                    &s[pos..]
-                )))
+    fn execute_statement(&mut self, stmt: pbsql::ast::Statement) -> Result<Output> {
+        use pbsql::ast::{Statement, TxnOp};
+        match stmt {
+            Statement::Txn(TxnOp::Begin) => self.begin().map(|_| Output::Done("transaction started".into())),
+            Statement::Txn(TxnOp::Commit) => self.commit().map(|_| Output::Done("committed".into())),
+            Statement::Txn(TxnOp::Rollback) => self.rollback().map(|_| Output::Done("rolled back".into())),
+            Statement::Checkpoint => self.checkpoint().map(|_| Output::Done("checkpoint written".into())),
+            stmt => {
+                let read = stmt.is_read_only();
+                self.run(!read, |ctx| pbsql::exec::execute(ctx, stmt))
             }
         }
     }
-}
 
-/// Index descriptions in MongoDB's listIndexes shape (the `_id` index first).
-pub fn index_docs(ixs: &[docindex::DocIndex]) -> Vec<Value> {
-    let mut out = vec![Value::Object(BTreeMap::from([
-        ("v".to_string(), Value::Int(2)),
-        (
-            "key".to_string(),
-            Value::Object(BTreeMap::from([("_id".to_string(), Value::Int(1))])),
-        ),
-        ("name".to_string(), Value::Text("_id_".into())),
-    ]))];
-    for ix in ixs {
-        let mut o = BTreeMap::from([
-            ("v".to_string(), Value::Int(2)),
-            ("key".to_string(), ix.key_doc()),
-            ("name".to_string(), Value::Text(ix.name.clone())),
-        ]);
-        if ix.unique {
-            o.insert("unique".to_string(), Value::Bool(true));
-        }
-        out.push(Value::Object(o));
-    }
-    out
-}
-
-fn doc_command(ctx: &mut Ctx, s: &str) -> Result<Output> {
-    let rest = &s[3..];
-    let mut dot = rest
-        .find('.')
-        .ok_or_else(|| Error::Parse("expected db.<collection>.<method>(...)".into()))?;
-    // db.<namespace>.<collection>.<method>(...): the segment after the first dot is not a call
-    let after = &rest[dot + 1..];
-    let seg_end = after
-        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
-        .unwrap_or(after.len());
-    if after[seg_end..].starts_with('.') {
-        dot += 1 + seg_end;
-    }
-    let coll = &rest[..dot];
-    let calls = parse_calls(&rest[dot + 1..])?;
-    let (method, args) = &calls[0];
-    let empty = Value::Object(Default::default());
-    let arg = |i: usize| args.get(i).unwrap_or(&empty);
-    let need = |i: usize, what: &str| {
-        args.get(i)
-            .ok_or_else(|| Error::Parse(format!("{method}() needs {what}")))
-    };
-    let as_count = |v: &Value| {
-        v.as_i64()
-            .filter(|n| *n >= 0)
-            .map(|n| n as usize)
-            .ok_or_else(|| Error::Parse("expected a non-negative integer".into()))
-    };
-
-    if method == "aggregate" {
-        let pipeline = match args.first() {
-            Some(Value::Array(p)) => p.clone(),
-            None => vec![],
-            Some(_) => return Err(Error::Parse("aggregate() takes an array of stages".into())),
-        };
-        return Ok(Output::Docs(aggregate::aggregate(ctx, coll, &pipeline)?));
-    }
-    let is_find = matches!(method.as_str(), "find" | "findone");
-    if !is_find && calls.len() > 1 {
-        return Err(Error::Parse(format!("{method}() cannot be chained")));
-    }
-    match method.as_str() {
-        "insert" | "insertone" | "insertmany" => match need(0, "a document")? {
-            Value::Array(docs) => {
-                let ids = doc::insert_many(ctx, coll, docs.clone())?;
-                Ok(Output::Scalar(Value::Array(ids)))
-            }
-            d => Ok(Output::Scalar(doc::insert(ctx, coll, d.clone())?)),
-        },
-        "find" | "findone" => {
-            let mut opts = FindOptions::default();
-            for (name, a) in &calls[1..] {
-                let first = a.first().ok_or_else(|| Error::Parse(format!("{name}() needs an argument")))?;
-                match name.as_str() {
-                    "sort" => opts.sort = Some(first.clone()),
-                    "limit" => opts.limit = Some(as_count(first)?),
-                    "skip" => opts.skip = as_count(first)?,
-                    _ => return Err(Error::Parse(format!("unknown modifier .{name}(); use sort, limit or skip"))),
-                }
-            }
-            if method == "findone" {
-                opts.limit = Some(1);
-            }
-            Ok(Output::Docs(doc::find(ctx, coll, arg(0), &opts)?))
-        }
-        "update" | "updatemany" | "updateone" => {
-            let multi = method != "updateone";
-            let (n, _) = doc::update(
-                ctx,
-                coll,
-                need(0, "a filter and an update")?,
-                need(1, "a filter and an update")?,
-                multi,
-                false,
-            )?;
-            Ok(Output::Done(format!("{n} document(s) updated")))
-        }
-        "delete" | "deletemany" | "deleteone" | "remove" => {
-            let limit = (method == "deleteone").then_some(1);
-            let n = doc::delete(ctx, coll, need(0, "a filter ({} deletes everything)")?, limit)?;
-            Ok(Output::Done(format!("{n} document(s) deleted")))
-        }
-        "createindex" => {
-            let fields: Vec<(String, i64)> = match need(0, "a key, e.g. createIndex({email: 1})")? {
-                Value::Text(f) => vec![(f.clone(), 1)],
-                v @ (Value::Object(_) | Value::Array(_)) => doc::sort_spec(v)?
-                    .into_iter()
-                    .map(|(k, desc)| (k, if desc { -1 } else { 1 }))
-                    .collect(),
-                _ => return Err(Error::Parse("createIndex takes a key: createIndex({a: 1, b: -1})".into())),
-            };
-            let opts = args.get(1);
-            let unique = opts.and_then(|o| o.get("unique")) == Some(&Value::Bool(true));
-            let name = opts.and_then(|o| o.get("name")).and_then(Value::as_str).map(String::from);
-            let shown = fields.iter().map(|(f, _)| f.as_str()).collect::<Vec<_>>().join(", ");
-            let created = doc::create_index_with(ctx, coll, fields, unique, name)?;
-            Ok(Output::Done(if created {
-                format!("{}index created on {coll}({shown})", if unique { "unique " } else { "" })
-            } else {
-                format!("{coll}({shown}) is already indexed")
-            }))
-        }
-        "dropindex" => {
-            let name = need(0, "an index name")?.as_str().ok_or_else(|| Error::Parse("dropIndex takes an index name".into()))?;
-            if doc::drop_index(ctx, coll, name)? {
-                Ok(Output::Done(format!("index '{name}' dropped")))
-            } else {
-                Err(Error::Schema(format!("no index '{name}' on collection '{coll}'")))
-            }
-        }
-        "getindexes" => Ok(Output::Docs(index_docs(&doc::indexes(ctx, coll)?))),
-        "reindex" => {
-            let n = docindex::reindex(ctx, coll)?;
-            Ok(Output::Done(format!("{n} index(es) rebuilt on '{coll}'")))
-        }
-        "validate" => {
-            let problems = docindex::validate(ctx, coll)?;
-            Ok(Output::Scalar(Value::Object(BTreeMap::from([
-                ("valid".to_string(), Value::Bool(problems.is_empty())),
-                ("errors".to_string(), Value::Array(problems.into_iter().map(Value::Text).collect())),
-            ]))))
-        }
-        "count" | "countdocuments" => {
-            Ok(Output::Scalar(Value::Int(doc::find(ctx, coll, arg(0), &FindOptions::default())?.len() as i64)))
-        }
-        "drop" => {
-            let existed = doc::drop(ctx, coll)?;
-            Ok(Output::Done(if existed {
-                format!("collection '{coll}' dropped")
-            } else {
-                format!("collection '{coll}' does not exist, nothing dropped")
-            }))
-        }
-        other => Err(Error::Parse(format!(
-            "unknown collection method '{other}': use insert, find, aggregate, update, delete, count, createIndex, dropIndex, getIndexes, reIndex, validate or drop"
-        ))),
+    /// Check a statement against this database's catalog without running it.
+    pub fn validate(&mut self, command: &str) -> Result<()> {
+        let stmt = pbsql::parse(command)?;
+        self.run(false, |ctx| pbsql::check(&stmt, Some(ctx)))
     }
 }

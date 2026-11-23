@@ -11,16 +11,16 @@ How to build, start, check, stop, back up and recover polydb. Commands are run f
   (one thread             \                    |              |               /
    per connection)         +-------------- one session per connection -------+
                                                    |
-  data models                    SQL (sql.rs) | documents (doc.rs) | key-value (kv.rs)
+  data models                    SQL (sql/) | documents (doc/) | key-value (kv.rs)
                                                    |
   transactions                 write overlay + read tracking, validated at commit
                                                    |
   storage (storage.rs)         ordered in-memory map + write-ahead log + snapshot
                                                    |
-  files in DIRECTORY                     data.wal            data.snap
+  files in DIRECTORY        data.wal   data.snap   polydb.format   LOCK
 ```
 
-One process, no external services. All four listeners share one in-memory ordered map. Each model stores its entries under its own key prefix, so a table, a collection and a key with the same name never collide. A commit is validated against concurrent commits, written to `data.wal` as one checksummed record, flushed to disk with `fsync`, then applied. `CHECKPOINT` (or a log over 64 MB) writes the whole map to `data.snap` and empties the log.
+One process, no external services. All four listeners share one in-memory ordered map. Each model stores its entries under its own key prefix, so a table, a collection and a key with the same name never collide. A commit is validated against concurrent commits, written to `data.wal` as a `BEGIN` / data / `COMMIT` group of LSN-numbered, checksummed records, flushed to disk with `fsync`, then applied. `CHECKPOINT` (or a log over 64 MB) writes the whole map to `data.snap` and empties the log; it is optional and never needed for durability. The full storage design is in [STORAGE.md](STORAGE.md).
 
 ## Packaging flow
 
@@ -29,7 +29,7 @@ source (src/, tests/, Cargo.toml, Cargo.lock)
    |  cargo build --release --locked
    v
 target/release/polydb            one self-contained executable, about 1.5 MB
-   |  cargo test --release --locked      46 Rust tests
+   |  cargo test --release --locked      89 Rust tests
    |  scripts/smoke.sh                   golden-output comparison
    |  scripts/driver_checks.sh           39 third-party driver checks (optional)
    v
@@ -130,6 +130,6 @@ If start-up fails with `corrupt data: snapshot ... failed its checksum`, the sna
 ## Operating limits to know
 
 - Memory use is roughly the size of the data; there is no limit setting.
-- One process per data directory. There is no lock file to stop a second one.
+- One process per data directory, enforced by an exclusive lock on `LOCK`.
 - No authentication on any port. See [README, External interfaces](../README.md#external-interfaces).
 - Input nesting is limited (SQL 32 levels and 100 operators per expression, JSON 128 levels, stored documents 100); deeper input is rejected with an error. See [REPRODUCIBILITY.md](REPRODUCIBILITY.md), DEFECT-01.

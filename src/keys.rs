@@ -6,8 +6,8 @@
 //! d \0 <coll>  \0 <id>       document         (JSON object)
 //! m \0 t \0 <table>          table schema
 //! m \0 c \0 <coll>           collection marker
-//! K \0 <ns> \0 <key>        key-value entry in a named namespace
 //! m \0 s \0 <name>           sequence counter (row ids, document ids)
+//! m \0 a \0 <table>          planner statistics of a table (written by ANALYZE)
 //! i \0 <owner> \0 <field> \0 <value><id>   secondary index entry (empty value)
 //! ```
 //! Table and collection names are plain identifiers and can never contain
@@ -39,22 +39,6 @@ pub const KV_PREFIX: &[u8] = b"k\0";
 pub const TABLE_META_PREFIX: &[u8] = b"m\0t\0";
 pub const COLL_META_PREFIX: &[u8] = b"m\0c\0";
 
-/// Prefix of a key-value namespace: the default keyspace ("") is the
-/// original `k\0` space; named namespaces live under `K\0<ns>\0`.
-pub fn kv_ns_prefix(ns: &str) -> Vec<u8> {
-    if ns.is_empty() {
-        KV_PREFIX.to_vec()
-    } else {
-        key(&[b"K", ns.as_bytes(), b""])
-    }
-}
-
-pub fn kv_ns(ns: &str, k: &str) -> Vec<u8> {
-    let mut out = kv_ns_prefix(ns);
-    out.extend_from_slice(k.as_bytes());
-    out
-}
-
 pub fn kv(k: &str) -> Vec<u8> {
     key(&[b"k", k.as_bytes()])
 }
@@ -63,6 +47,11 @@ pub fn table_meta(t: &str) -> Vec<u8> {
 }
 pub fn coll_meta(c: &str) -> Vec<u8> {
     key(&[b"m", b"c", c.as_bytes()])
+}
+/// Planner statistics of a table. Only a hint for plan choice: never needed
+/// for a correct answer, so a missing or stale entry is harmless.
+pub fn table_stats(t: &str) -> Vec<u8> {
+    key(&[b"m", b"a", t.as_bytes()])
 }
 pub fn seq(name: &str) -> Vec<u8> {
     key(&[b"m", b"s", name.as_bytes()])
@@ -92,20 +81,12 @@ pub fn encode_id(v: &Value) -> Result<Vec<u8>> {
             // MongoDB ObjectId, kept in extended-JSON form {"$oid": "<24 hex>"}
             Some(Value::Text(h)) if h.len() == 24 && h.bytes().all(|b| b.is_ascii_hexdigit()) => {
                 let mut out = vec![7u8];
-                out.extend(
-                    (0..12).map(|i| u8::from_str_radix(&h[i * 2..i * 2 + 2], 16).unwrap_or(0)),
-                );
+                out.extend((0..12).map(|i| u8::from_str_radix(&h[i * 2..i * 2 + 2], 16).unwrap_or(0)));
                 Ok(out)
             }
-            _ => Err(Error::Type(format!(
-                "keys must be integers, strings or ObjectIds, got {}",
-                v.to_json()
-            ))),
+            _ => Err(Error::Type(format!("keys must be integers, strings or ObjectIds, got {}", v.to_json()))),
         },
-        other => Err(Error::Type(format!(
-            "keys must be integers or strings, got {}",
-            other.to_json()
-        ))),
+        other => Err(Error::Type(format!("keys must be integers or strings, got {}", other.to_json()))),
     }
 }
 
@@ -130,11 +111,7 @@ pub fn encode_index_value(v: &Value) -> Option<Vec<u8>> {
             let f = v.as_f64()?;
             let f = if f == 0.0 { 0.0 } else { f };
             let bits = f.to_bits();
-            let ordered = if bits >> 63 == 1 {
-                !bits
-            } else {
-                bits ^ (1 << 63)
-            };
+            let ordered = if bits >> 63 == 1 { !bits } else { bits ^ (1 << 63) };
             let mut out = vec![2u8];
             out.extend_from_slice(&ordered.to_be_bytes());
             Some(out)

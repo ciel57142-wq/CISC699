@@ -135,7 +135,7 @@ impl Value {
         s
     }
 
-    fn write_json(&self, out: &mut String) {
+    pub(crate) fn write_json(&self, out: &mut String) {
         match self {
             Value::Null => out.push_str("null"),
             Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
@@ -195,10 +195,7 @@ impl Value {
         let v = p.value()?;
         p.ws();
         if p.pos != s.len() {
-            return Err(Error::Parse(format!(
-                "unexpected trailing text in JSON at byte {}",
-                p.pos
-            )));
+            return Err(Error::Parse(format!("unexpected trailing text in JSON at byte {}", p.pos)));
         }
         Ok(v)
     }
@@ -241,12 +238,7 @@ pub struct JsonParser<'a> {
 
 impl<'a> JsonParser<'a> {
     pub fn at(src: &'a str, pos: usize) -> Self {
-        JsonParser {
-            src,
-            s: src.as_bytes(),
-            pos,
-            depth: 0,
-        }
+        JsonParser { src, s: src.as_bytes(), pos, depth: 0 }
     }
 
     fn err<T>(&self, msg: &str) -> Result<T> {
@@ -256,41 +248,6 @@ impl<'a> JsonParser<'a> {
     pub fn ws(&mut self) {
         while self.pos < self.s.len() && self.s[self.pos].is_ascii_whitespace() {
             self.pos += 1;
-        }
-    }
-
-    /// Parse an object keeping its keys in written order, as `[[key, value], ...]`
-    /// pairs. Used where order is meaningful (index keys, sort specifications).
-    pub fn ordered_object(&mut self) -> Result<Vec<(String, Value)>> {
-        self.ws();
-        if self.s.get(self.pos) != Some(&b'{') {
-            return self.err("expected an object");
-        }
-        self.pos += 1;
-        let mut out: Vec<(String, Value)> = Vec::new();
-        loop {
-            self.ws();
-            match self.s.get(self.pos) {
-                Some(b'}') => {
-                    self.pos += 1;
-                    return Ok(out);
-                }
-                Some(b',') => {
-                    self.pos += 1;
-                    continue;
-                }
-                None => return self.err("unterminated object"),
-                _ => {}
-            }
-            let k = self.key()?;
-            self.ws();
-            if self.s.get(self.pos) != Some(&b':') {
-                return self.err("expected ':'");
-            }
-            self.pos += 1;
-            let v = self.value()?;
-            out.retain(|(x, _)| *x != k);
-            out.push((k, v));
         }
     }
 
@@ -362,11 +319,7 @@ impl<'a> JsonParser<'a> {
             b'"' | b'\'' => Ok(Value::Text(self.string()?)),
             b'-' | b'+' | b'0'..=b'9' | b'.' => self.number(),
             _ => {
-                for (word, v) in [
-                    ("true", Value::Bool(true)),
-                    ("false", Value::Bool(false)),
-                    ("null", Value::Null),
-                ] {
+                for (word, v) in [("true", Value::Bool(true)), ("false", Value::Bool(false)), ("null", Value::Null)] {
                     if self.src[self.pos..].starts_with(word) {
                         self.pos += word.len();
                         return Ok(v);
@@ -384,8 +337,7 @@ impl<'a> JsonParser<'a> {
                 let start = self.pos;
                 while self.pos < self.s.len() {
                     let c = self.s[self.pos];
-                    if c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || c == b'.' || c >= 0x80
-                    {
+                    if c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || c == b'.' || c >= 0x80 {
                         self.pos += 1;
                     } else {
                         break;
@@ -438,18 +390,34 @@ impl<'a> JsonParser<'a> {
     fn string(&mut self) -> Result<String> {
         let quote = self.s[self.pos];
         self.pos += 1;
+        // Fast path: no escapes. The bytes between two ASCII quotes of a
+        // `&str` are valid UTF-8 already, so copy them in one go.
+        let start = self.pos;
+        let run = self.s[start..].iter().position(|&c| c == quote || c == b'\\');
+        match run {
+            None => {
+                self.pos = self.s.len();
+                return self.err("unterminated string");
+            }
+            Some(n) if self.s[start + n] == quote => {
+                self.pos = start + n + 1;
+                return Ok(self.src[start..start + n].to_string());
+            }
+            Some(_) => {}
+        }
         let mut buf: Vec<u8> = Vec::new();
         loop {
+            // Copy the unescaped run up to the next quote or backslash.
+            let rest = &self.s[self.pos..];
+            let n = rest.iter().position(|&c| c == quote || c == b'\\').unwrap_or(rest.len());
+            buf.extend_from_slice(&rest[..n]);
+            self.pos += n;
             let Some(&c) = self.s.get(self.pos) else {
                 return self.err("unterminated string");
             };
             self.pos += 1;
             if c == quote {
                 break;
-            }
-            if c != b'\\' {
-                buf.push(c);
-                continue;
             }
             let Some(&e) = self.s.get(self.pos) else {
                 return self.err("unterminated escape");

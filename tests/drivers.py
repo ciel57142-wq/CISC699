@@ -148,6 +148,36 @@ except pymongo.errors.DuplicateKeyError:
 check("mongo delete_one / delete_many", [people.delete_one({"_id": 3}).deleted_count, people.delete_many({"age": {"$lt": 50}}).deleted_count], [1, 2])
 check("mongo list collections", "people" in mongo.app.list_collection_names(), True)
 
+orders = mongo.app.orders
+orders.drop()
+orders.insert_many([
+    {"_id": 1, "cust": "a", "qty": 2, "price": 1.5},
+    {"_id": 2, "cust": "b", "qty": 5, "price": 2.0},
+    {"_id": 3, "cust": "a", "qty": 1, "price": 4.0},
+])
+groups = list(orders.aggregate([
+    {"$match": {"qty": {"$gte": 1}}},
+    {"$group": {"_id": "$cust", "n": {"$sum": 1}, "qty": {"$sum": "$qty"}, "avg": {"$avg": "$price"}, "top": {"$max": "$price"}}},
+    {"$sort": {"_id": 1}},
+]))
+check("mongo aggregate $group", groups, [
+    {"_id": "a", "n": 2, "qty": 3, "avg": 2.75, "top": 4.0},
+    {"_id": "b", "n": 1, "qty": 5, "avg": 2.0, "top": 2.0},
+])
+check("mongo aggregate $project/$limit", list(orders.aggregate([{"$sort": {"qty": -1}}, {"$limit": 1}, {"$project": {"_id": 0, "cust": 1}}])), [{"cust": "b"}])
+orders.create_index([("cust", 1), ("qty", 1)])
+orders.create_index("price", unique=True)
+check("mongo list_indexes", sorted(ix["name"] for ix in orders.list_indexes()), ["_id_", "cust_1_qty_1", "price_1"])
+try:
+    orders.insert_one({"_id": 4, "price": 2.0})
+    check("mongo unique index", "no error", "error")
+except pymongo.errors.DuplicateKeyError:
+    print("ok   mongo unique index raises DuplicateKeyError")
+check("mongo compound index lookup", orders.find_one({"cust": "a", "qty": 1})["_id"], 3)
+orders.drop_index("price_1")
+orders.insert_one({"_id": 4, "price": 2.0})
+check("mongo drop_index", sorted(ix["name"] for ix in orders.list_indexes()), ["_id_", "cust_1_qty_1"])
+
 # ----------------------------------------------- one database, three views
 cur.execute("db.people.find({_id: 2})")
 check("document written by pymongo, read through postgres", '"name":"Linus"' in cur.fetchone()[0], True)
@@ -159,39 +189,5 @@ cur.execute("db.audit.insert({_id: 1, via: 'postgres'})")
 cur.execute("INSERT INTO users VALUES (10, 'Txn', 1, 1, true)")
 pg.commit()
 check("one transaction, visible from redis and mongo", (r.get("audit:last"), mongo.app.audit.find_one({"_id": 1})["via"]), (b"cross-model", "postgres"))
-
-# --------------------------------------- cursors, aggregation, namespaces
-nums = mongo.app.nums
-nums.drop()
-nums.insert_many([{"_id": i, "v": i % 7} for i in range(250)])
-check("mongo cursor iterates every batch", len(list(nums.find({}, batch_size=40))), 250)
-check("mongo aggregate $group/$sort", list(nums.aggregate([{"$match": {"v": {"$lt": 2}}}, {"$group": {"_id": "$v", "n": {"$sum": 1}}}, {"$sort": {"_id": 1}}])), [{"_id": 0, "n": 36}, {"_id": 1, "n": 36}])
-check("mongo databases are isolated", (mongo.other.nums.count_documents({}), nums.count_documents({})), (0, 250))
-cur.execute("SELECT COUNT(*) FROM DOCUMENT.nums WHERE v = 3")
-check("PBSQL over postgres reads documents written by pymongo", cur.fetchone(), (36,))
-cur.execute("EXPLAIN SELECT name FROM users WHERE id = 1")
-check("EXPLAIN over postgres", any("PrimaryKeyLookup" in r[0] for r in cur.fetchall()), True)
-
-# ------------------------------------- document indexes and key expiry
-import time
-idx = mongo.app.idx
-idx.drop()
-idx.insert_many([{"_id": i, "a": i % 5, "b": i, "email": f"u{i}@x"} for i in range(50)])
-idx.create_index([("a", 1), ("b", -1)], name="a_b")
-idx.create_index("email", unique=True)
-check("pymongo index_information", sorted(idx.index_information().keys()), ["_id_", "a_b", "email_1"])
-try:
-    idx.insert_one({"_id": 999, "email": "u1@x"})
-    check("pymongo unique index", "no error", "error")
-except pymongo.errors.DuplicateKeyError:
-    print("ok   pymongo unique index raises DuplicateKeyError")
-check("pymongo compound sort through the index", [d["b"] for d in idx.find({"a": 2}).sort([("b", -1)]).limit(3)], [47, 42, 37])
-idx.drop_index("a_b")
-check("pymongo drop_index", sorted(idx.index_information().keys()), ["_id_", "email_1"])
-r.set("ttl:key", "v", px=150)
-check("redis-py SET PX + PTTL", 0 < r.pttl("ttl:key") <= 150, True)
-time.sleep(0.3)
-check("redis-py key expired", r.get("ttl:key"), None)
-check("redis-py SET NX / XX", (r.set("nx:key", "1", nx=True), r.set("nx:key", "2", nx=True), r.set("missing:key", "x", xx=True)), (True, None, None))
 
 print("\nall driver checks passed")

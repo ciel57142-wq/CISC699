@@ -7,10 +7,13 @@ polydb is a multi-model database engine written in Rust. One engine and one tran
 | Relational | SQL | `SELECT name FROM users WHERE age > 40` |
 | Document | MongoDB-style calls | `db.events.find({type: 'login'})` |
 | Key-value | Redis-style commands | `SET session:42 abc` |
+| All three | cross-model SQL | `SELECT u.name, o.total FROM users u JOIN DOCUMENT(orders) o ON o.user = u.id` |
+
+All of these are one language, **PBSQL**, with one lexer, parser and semantic checker: statements are type-checked against the catalog before they run, syntax errors give a line and column, and a single query can join and filter tables, documents and keys through each model's own engine. The language reference is [docs/PBSQL.md](docs/PBSQL.md).
 
 It runs as an interactive shell, as a library inside a Rust program, or as a network server. The server speaks its own line protocol and, on separate ports, subsets of the Redis, PostgreSQL and MongoDB wire protocols, so `redis-cli`, `psql` and the standard Python drivers can connect unchanged.
 
-**Status:** version 0.2.0, a course capstone artifact. It is a working research prototype, not a production database: all data is held in memory, and there is no authentication. See [Known limits](#known-limits).
+**Status:** version 0.2.0, a course capstone artifact. It is a working research prototype, not a production database. Data written to a database directory (the default) is durable: every acknowledged commit is fsynced to a write-ahead log and survives the process exiting or being killed; `--memory` keeps nothing on disk. The working set is cached in memory and there is no authentication. See [Known limits](#known-limits) and [docs/STORAGE.md](docs/STORAGE.md).
 
 ## Prerequisites
 
@@ -41,15 +44,19 @@ bash scripts/smoke.sh              # 4. scripted session compared with stored ou
 
 ### Expected output
 
-Step 3 prints one `test result` line per test target. The three that matter are:
+Step 3 prints one `test result` line per test target. The ones that matter are:
 
 ```
+test result: ok. 24 passed; 0 failed; 0 ignored; ...     (tests/document.rs)
 test result: ok. 23 passed; 0 failed; 0 ignored; ...     (tests/hardening.rs)
 test result: ok. 22 passed; 0 failed; 0 ignored; ...     (tests/integration.rs)
+test result: ok. 15 passed; 0 failed; 0 ignored; ...     (tests/pbsql.rs)
+test result: ok. 13 passed; 0 failed; 0 ignored; ...     (tests/planner.rs)
+test result: ok. 37 passed; 0 failed; 0 ignored; ...     (tests/relational.rs)
 test result: ok. 1 passed; 0 failed; 0 ignored; ...      (Doc-tests polydb)
 ```
 
-Two more lines say `0 passed` for the library and the binary; that is normal, because all tests live in `tests/`.
+The library line says `31 passed` (6 unit tests that damage index entries on purpose, 25 PBSQL lexer, parser, normalizer and semantic-check tests) and the binary line `0 passed`.
 
 Step 4 ends with:
 
@@ -100,7 +107,7 @@ polydb serve [DIRECTORY] [--memory] [--host ADDR] [--port N] [--redis-port N] [-
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `DIRECTORY` | `polydb-data` | where `data.wal` and `data.snap` are stored |
+| `DIRECTORY` | `polydb-data` | the database directory (`data.wal`, `data.snap`, `polydb.format`, `LOCK`); created if missing or empty, refused if it holds other files |
 | `--memory` | off | keep nothing on disk |
 | `--host` | `127.0.0.1` | address to bind |
 | `--port` | `7878` | native protocol |
@@ -129,7 +136,7 @@ polydb calls no external service and needs no API key, token or account. It is i
 
 ## Driver check (optional)
 
-`tests/drivers.py` runs 39 checks through unmodified redis-py, psycopg2 and pymongo, including concurrent clients and one transaction read back through three protocols.
+`tests/drivers.py` runs 45 checks through unmodified redis-py, psycopg2 and pymongo, including concurrent clients and one transaction read back through three protocols.
 
 ```sh
 bash scripts/driver_checks.sh      # or: make drivers
@@ -152,9 +159,17 @@ The build compiles polydb, runs the Rust tests and the smoke comparison, and fai
 |---|---|---|
 | `cargo test --release --locked` | correct behaviour of all three models, transactions, recovery (`tests/integration.rs`) | 22 |
 | | failure paths: bad arguments, damaged files, port conflicts, garbage and deeply nested input on every port, killing the server (`tests/hardening.rs`) | 23 |
+| | SQL engine: constraints, foreign keys, joins, subqueries, indexes (`tests/relational.rs`) and storage unit tests | 37 + 6 |
+| | PBSQL front end: lexer, parser and syntax trees, precedence, normalization, semantic and type checks, invalid input (`src/pbsql/tests.rs`) | 25 |
+| | PBSQL against the real engines: cross-model joins, filters and writes, transactions and conflicts, durability, EXPLAIN [ANALYZE], NULL, identifier and escaping rules (`tests/pbsql.rs`) | 15 |
+| | SQL indexes, planner and `EXPLAIN` (`tests/planner.rs`) | 13 |
+| | document model: types, paths, every query/update operator, bulk writes, indexes checked against unindexed results, aggregation, schemas, transactions, restarts and torn logs (`tests/document.rs`) | 24 |
+| | durability across separate processes: all three models, schemas, indexes, kill -9, locking, safe initialisation, `--memory` writes nothing (`tests/persistence.rs`) | 19 |
+| | write-ahead log and crash recovery: LSNs, BEGIN/COMMIT groups, checkpoints, fail-point crash storm (`tests/wal_recovery.rs`) | 17 |
+| | randomised differential check of the SQL engine against a reference model (`tests/differential.rs`) | 1 |
 | | library example in `src/lib.rs` compiles | 1 |
 | `bash scripts/smoke.sh` | scripted session equals stored output | 64 lines |
-| `bash scripts/driver_checks.sh` | third-party drivers | 39 checks |
+| `bash scripts/driver_checks.sh` | third-party drivers | 45 checks |
 | `bash scripts/clean_run.sh` | all of the above in a fresh copy, with a log in `docs/evidence/` | |
 
 Tests are deterministic: fixed inputs, a fixed-seed byte generator for the garbage-input test, operating-system-assigned free ports, and no dependence on the clock.
@@ -175,6 +190,9 @@ polydb ships with **no dataset** and downloads none. Every test creates its own 
 | `cannot connect to 127.0.0.1:7878: Connection refused` from `polydb client` | no server is running | start one with `polydb serve` in another terminal |
 | `cannot open database at 'x': ...` | the path is a file, or not writable | give a directory you can write to |
 | `corrupt data: snapshot ... failed its checksum` | `data.snap` is damaged | restore the directory from a backup; polydb refuses to load a damaged snapshot |
+| `storage error: '...' is not empty and is not a polydb database` | the directory holds other files | give an empty or new directory |
+| `corrupt data: ... is missing from an initialised database` | `data.wal` or `data.snap` was deleted | restore the directory from a backup |
+| `... is locked by another process` | another polydb process has that directory | stop it, or use another directory |
 | Data missing after restart | the server was started with `--memory`, or from a different working directory (the default `polydb-data` is relative) | pass an absolute directory path |
 | `psql` shows `ERROR: polydb supports the simple query protocol only` | the client used prepared statements | use `psql`, psycopg2, or a driver's simple-query mode |
 | `python3 -m venv` fails with `ensurepip is not available` | Debian/Ubuntu split package | `sudo apt install python3-venv` |
@@ -185,35 +203,39 @@ polydb ships with **no dataset** and downloads none. Every test creates its own 
 
 ## Known limits
 
-- **All data is held in memory**; the disk is used for durability only. Startup time grows with data size.
+- **The working set is cached in memory**; the disk (write-ahead log + snapshot) is the durable copy and is read back at start-up, so data must fit in RAM and start-up time grows with data size. Remaining durability limits are listed in [docs/STORAGE.md](docs/STORAGE.md#remaining-durability-limitations).
 - **No authentication, TLS or replication.** Bind to localhost or a trusted network.
-- **Nesting limits.** A SQL expression may nest 32 levels (parentheses, `NOT`, unary minus, function calls) and contain 100 chained operators and nested sub-expressions in total. JSON text may nest 128 levels and a stored document 100. Anything deeper is an error. These limits are what fixed DEFECT-01, where deeply nested input overflowed the stack and stopped the process; see [docs/REPRODUCIBILITY.md](docs/REPRODUCIBILITY.md).
-- **Request limits:** every listener refuses requests larger than `--max-request-bytes` (default 64 MiB) before allocating them, and `--max-connections` caps clients per listener.
-- **Log damage:** a torn final record (the normal crash case) is dropped. Damage *followed by more log data* is reported as a `corrupt` error instead of silently dropping later commits; `Database::open_with(dir, &OpenOptions { salvage: true })` keeps the intact prefix (and saves the damaged log as `data.wal.corrupt`).
+- **Nesting limits.** A SQL expression may nest 32 levels (parentheses, `NOT`, unary minus, function calls, subqueries) and contain 100 chained operators and nested sub-expressions in total. JSON text may nest 128 levels and a stored document 100. Anything deeper is an error. These limits are what fixed DEFECT-01, where deeply nested input overflowed the stack and stopped the process; see [docs/REPRODUCIBILITY.md](docs/REPRODUCIBILITY.md).
+- **Large-message allocation (open):** the Redis and PostgreSQL listeners accept a declared message length of up to 512 MB and 256 MB and allocate it before reading.
+- **Log damage:** recovery stops at the first log record that fails its checksum. A torn final record (the normal crash case) is handled correctly; damage in the middle of the log also drops the commits after it.
 - Commits wait for their own `fsync`, so write throughput is bounded by the disk.
-- The planner is rule-based (no statistics). Execution streams; sorts, aggregations and hash joins spill to temporary files beyond the session memory limit (default 64 MiB); DISTINCT/UNION de-duplication fails with an error beyond it.
-- Expired key-value entries are hidden at once and removed by a background reaper (every 200 ms).
-- Object keys inside stored documents are kept in name order; order-sensitive specifications (index keys, sorts) are read in written order from the Mongo wire protocol and the shell.
-- A database directory is locked (`LOCK` file): a second process opening it gets an error.
+- Document-model indexes serve equality only. SQL indexes serve equality, ranges, IN lists and index joins, but no index-only scans, no ORDER BY by index order and no OR across columns; join reordering is greedy and only for inner joins; planner statistics are refreshed only by `ANALYZE` (see [docs/INDEXING.md](docs/INDEXING.md)).
+- SQL has no date/time types, views, CTEs (`WITH`), window functions, `RETURNING` or `ON ... SET DEFAULT`; these fail with an explicit "not supported" error. Foreign-key `NO ACTION` is checked immediately, like `RESTRICT`. Subqueries nest at most 6 deep.
+- A `DOCUMENT()` or `KV()` source is read in full unless the `WHERE` clause pins `_id`, an indexed field or a key; see [docs/PBSQL.md](docs/PBSQL.md#pushdown).
+- No lock file: do not open the same directory from two processes at once.
+- Object keys in documents are stored sorted, not in insertion order.
 
 ## Repository layout
 
 ```
 Cargo.toml, Cargo.lock      package manifest and lock file (no dependencies)
-src/                        the engine (about 5,600 lines)
+src/                        the engine (about 11,400 lines)
   storage.rs keys.rs          ordered map, write-ahead log, snapshot, key layout
-  rel.rs doc.rs kv.rs         the three data models (schemas/constraints, documents, keys)
-  pbsql/                      PBSQL lexer, AST, parser, statement execution (SQL is its subset)
-  query/                      shared planner, executor and expression evaluation; EXPLAIN
-  aggregate.rs                document aggregation pipelines
+  pbsql/                      PBSQL front end: lexer, statement parser, executor
+  sql/ doc/ kv.rs             the three data models (sql/ also holds the relational
+                              parser, semantic checker and cross-model sources)
   lib.rs value.rs error.rs    sessions, transactions, value type, errors
   server.rs resp.rs           native and Redis listeners
   pgwire.rs mongo.rs          PostgreSQL and MongoDB listeners
   main.rs                     command-line shell, server and client
 tests/
   integration.rs              22 behaviour tests
+  pbsql.rs                    15 PBSQL execution tests across the three engines
   hardening.rs                23 failure-path tests
-  drivers.py                  39 checks through third-party drivers
+  relational.rs               37 SQL engine tests
+  planner.rs                  13 index, planner and EXPLAIN tests
+  document.rs                 24 document-model tests
+  drivers.py                  45 checks through third-party drivers
   requirements-drivers.txt    pinned driver versions
   fixtures/                   smoke script and its expected output
 scripts/                    check_env, smoke, driver_checks, serve, clean_run
@@ -228,6 +250,7 @@ docs/
   AUDIT.md                    what the repository audit found and changed
   EVIDENCE.md                 file manifest with checksums
   REFERENCE.md                command syntax, library API, protocol subsets
+  INDEXING.md                 index audit, planner design, EXPLAIN, benchmarks
   WALKTHROUGH.md              script for the recorded walkthrough
   evidence/                   clean-run logs
 ```
