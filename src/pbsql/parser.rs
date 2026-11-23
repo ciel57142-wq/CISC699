@@ -24,8 +24,8 @@ use crate::value::{JsonParser, Value};
 
 const SQL_STARTS: &[&str] = &[
     "select", "insert", "update", "delete", "create", "drop", "alter", "truncate", "describe", "desc", "check",
-    "reindex", // recognised so that they fail with a precise "not supported" message:
-    "with", "merge", "grant", "revoke", "savepoint", "release", "vacuum", "analyze", "copy", "replace", "upsert",
+    "reindex", "analyze", // recognised so that they fail with a precise "not supported" message:
+    "with", "merge", "grant", "revoke", "savepoint", "release", "vacuum", "copy", "replace", "upsert",
 ];
 
 /// Parse one PBSQL statement.
@@ -117,7 +117,10 @@ fn check_explainable(stmt: &Statement, src: &str, at: usize) -> Result<()> {
     use crate::sql::ast::Stmt;
     let ok = match stmt {
         Statement::Sql(s) => matches!(s, Stmt::Query(_) | Stmt::Insert { .. } | Stmt::Update { .. } | Stmt::Delete { .. }),
-        Statement::Doc(d) => !matches!(d.op, DocOp::CreateIndex(_) | DocOp::Drop),
+        Statement::Doc(d) => matches!(
+            d.op,
+            DocOp::Insert(_) | DocOp::Find { end: None, .. } | DocOp::Count(_) | DocOp::Update { .. } | DocOp::Delete { .. }
+        ),
         Statement::Kv(_) => true,
         _ => false,
     };
@@ -334,6 +337,12 @@ fn doc_statement(lx: &mut Lexer) -> Result<Statement> {
         }
         Ok(())
     };
+    let array = |v: Value, what: &str| -> Result<Vec<Value>> {
+        match v {
+            Value::Array(a) => Ok(a),
+            _ => err_at(src, at, format!("{method}() takes an array of {what}")),
+        }
+    };
     let is_find = matches!(method.as_str(), "find" | "findone");
     if !is_find {
         if let Some((_, _, mat)) = mods.first() {
@@ -346,12 +355,29 @@ fn doc_statement(lx: &mut Lexer) -> Result<Statement> {
             DocOp::Insert(need(0, "a document")?)
         }
         "find" | "findone" => {
-            // A second argument (a projection) is accepted and ignored, as before.
             at_most(2)?;
-            let (mut sort, mut skip, mut limit) = (None, 0, None);
+            let mut spec = FindSpec { projection: args.get(1).cloned(), ..FindSpec::default() };
+            let mut end = None;
             for (name, a, mat) in &mods {
-                if !matches!(name.as_str(), "sort" | "limit" | "skip") {
-                    return err_at(src, *mat, format!("unknown modifier .{name}(); use sort, limit or skip"));
+                if end.is_some() {
+                    return err_at(src, *mat, format!(".{name}() cannot follow .count() or .explain()"));
+                }
+                match name.as_str() {
+                    "count" | "explain" => {
+                        if !a.is_empty() {
+                            return err_at(src, *mat, format!(".{name}() takes no arguments"));
+                        }
+                        end = Some(if name == "count" { FindEnd::Count } else { FindEnd::Explain });
+                        continue;
+                    }
+                    "sort" | "limit" | "skip" | "project" | "projection" => {}
+                    _ => {
+                        return err_at(
+                            src,
+                            *mat,
+                            format!("unknown modifier .{name}(); use sort, skip, limit, project, count or explain"),
+                        )
+                    }
                 }
                 let Some(first) = a.first() else {
                     return err_at(src, *mat, format!("{name}() needs an argument"));
@@ -367,51 +393,94 @@ fn doc_statement(lx: &mut Lexer) -> Result<Statement> {
                         .ok_or_else(|| Error::Parse(format!("expected a non-negative integer{}", position(src, *mat))))
                 };
                 match name.as_str() {
-                    "sort" => sort = Some(first.clone()),
-                    "limit" => limit = Some(count()?),
-                    _ => skip = count()?,
+                    "sort" => spec.sort = Some(first.clone()),
+                    "limit" => spec.limit = Some(count()?),
+                    "skip" => spec.skip = count()?,
+                    _ => spec.projection = Some(first.clone()),
                 }
             }
             let one = method == "findone";
             if one {
-                limit = Some(1);
+                spec.limit = Some(1);
             }
-            DocOp::Find { filter: arg(0), sort, skip, limit, one }
+            DocOp::Find { filter: arg(0), spec, one, end }
         }
-        "update" | "updatemany" | "updateone" => {
-            at_most(2)?;
+        "update" | "updatemany" | "updateone" | "replaceone" => {
+            at_most(3)?;
+            let what = "a filter and an update";
             DocOp::Update {
-                filter: need(0, "a filter and an update")?,
-                update: need(1, "a filter and an update")?,
-                multi: method != "updateone",
+                filter: need(0, what)?,
+                update: need(1, what)?,
+                method: match method.as_str() {
+                    "update" => UpdateMethod::Update,
+                    "updateone" => UpdateMethod::UpdateOne,
+                    "updatemany" => UpdateMethod::UpdateMany,
+                    _ => UpdateMethod::ReplaceOne,
+                },
+                options: args.get(2).cloned(),
             }
         }
         "delete" | "deletemany" | "deleteone" | "remove" => {
             at_most(1)?;
             DocOp::Delete { filter: need(0, "a filter ({} deletes everything)")?, one: method == "deleteone" }
         }
-        "createindex" => {
+        "bulkwrite" => {
             at_most(1)?;
-            let field = match need(0, "a field, e.g. createIndex({email: 1})")? {
-                Value::Text(f) => f,
-                Value::Object(o) if o.len() == 1 => o.keys().next().cloned().unwrap_or_default(),
-                _ => return err_at(src, at, "createIndex takes one field: createIndex({email: 1})"),
-            };
-            DocOp::CreateIndex(field)
+            DocOp::BulkWrite(array(need(0, "a list of operations")?, "operations")?)
+        }
+        "createindex" => {
+            at_most(2)?;
+            DocOp::CreateIndex { spec: need(0, "a key spec, e.g. createIndex({email: 1})")?, options: args.get(1).cloned() }
+        }
+        "dropindex" => {
+            at_most(1)?;
+            DocOp::DropIndex(need(0, "an index name or key spec")?)
+        }
+        "getindexes" => {
+            at_most(0)?;
+            DocOp::GetIndexes
         }
         "count" | "countdocuments" => {
             at_most(1)?;
             DocOp::Count(arg(0))
         }
-        "drop" => {
+        "distinct" => {
+            at_most(2)?;
+            let Value::Text(field) = need(0, "a field name")? else {
+                return err_at(src, at, "distinct() takes a field name string");
+            };
+            DocOp::Distinct { field, filter: arg(1) }
+        }
+        "aggregate" => {
+            at_most(1)?;
+            DocOp::Aggregate(array(need(0, "a pipeline array")?, "stages")?)
+        }
+        "explain" => {
+            at_most(1)?;
+            DocOp::Explain(arg(0))
+        }
+        "setschema" => {
+            at_most(1)?;
+            DocOp::SetSchema(need(0, "a schema (or null to remove it)")?)
+        }
+        "getschema" | "validate" | "reindex" | "drop" => {
             at_most(0)?;
-            DocOp::Drop
+            match method.as_str() {
+                "getschema" => DocOp::GetSchema,
+                "validate" => DocOp::Validate,
+                "reindex" => DocOp::Reindex,
+                _ => DocOp::Drop,
+            }
         }
         other => {
             return err_at(
                 src,
                 at,
-                format!("unknown collection method '{other}': use insert, find, update, delete, count, createIndex or drop"),
+                format!(
+                    "unknown collection method '{other}': use insert, find, findOne, update, replaceOne, delete, \
+                     bulkWrite, count, distinct, aggregate, explain, createIndex, dropIndex, getIndexes, setSchema, \
+                     getSchema, validate, reindex or drop"
+                ),
             )
         }
     };

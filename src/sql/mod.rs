@@ -11,23 +11,29 @@
 //! | `sema.rs`    | name resolution, type checking, aggregate and shape rules   |
 //! | `printer.rs` | canonical statement text (query normalization)              |
 //! | `walk.rs`    | syntax-tree traversal                                       |
+//! | `sources.rs` | DOCUMENT() and KV() sources: the cross-model interface      |
 //! | `catalog.rs` | schemas, row and index-entry layout                         |
-//! | `sources.rs` | common interface to relational, document and KV storage     |
 //! | `eval.rs`    | expression evaluation, functions, aggregates, subqueries    |
-//! | `query.rs`   | access-path selection, joins, grouping, set operations      |
+//! | `access.rs`  | predicates, access paths (key / index / range / scan), probes |
+//! | `stats.rs`   | ANALYZE statistics, selectivity and cardinality estimates   |
+//! | `query.rs`   | pushdown, join order and algorithms, grouping, set ops      |
+//! | `plan.rs`    | operator tree for EXPLAIN and EXPLAIN ANALYZE               |
 //! | `dml.rs`     | INSERT / UPDATE / DELETE and constraint enforcement         |
 //! | `ddl.rs`     | CREATE / DROP / ALTER, indexes, CHECK TABLE, REINDEX        |
 
+mod access;
 pub(crate) mod ast;
 mod catalog;
 mod ddl;
 mod dml;
 mod eval;
 pub(crate) mod parser;
+mod plan;
 pub(crate) mod printer;
 mod query;
 pub(crate) mod sema;
 pub(crate) mod sources;
+mod stats;
 #[cfg(test)]
 mod tests;
 pub(crate) mod walk;
@@ -41,10 +47,16 @@ use eval::QCtx;
 use std::time::Instant;
 
 pub use catalog::tables;
+pub use ddl::{repair_indexes, RepairReport};
 
 /// Does this statement only read? (Read-only statements take the shared lock.)
 pub(crate) fn is_read_only(stmt: &Stmt) -> bool {
-    matches!(stmt, Stmt::Query(_) | Stmt::Explain(_) | Stmt::Describe(_) | Stmt::CheckTable(_))
+    match stmt {
+        Stmt::Query(_) | Stmt::Describe(_) | Stmt::CheckTable(_) => true,
+        // EXPLAIN ANALYZE of a query only reads too
+        Stmt::Explain { .. } => true,
+        _ => false,
+    }
 }
 
 /// Parse, check and run one relational statement.
@@ -77,7 +89,8 @@ fn run(ctx: &mut Ctx, stmt: Stmt) -> Result<Output> {
             let (columns, rows) = query::run_query(&q, &query, None, 0)?;
             Ok(Output::Rows { columns, rows })
         }
-        Stmt::Explain(query) => explain(ctx, Stmt::Query(query), false),
+        Stmt::Explain { query, analyze } => Ok(plan_output(query_plan(ctx, &query, analyze)?)),
+        Stmt::Analyze(table) => ddl::analyze(ctx, table.as_deref()),
         Stmt::Describe(table) => ddl::describe(ctx, &table),
         Stmt::CheckTable(table) => ddl::check_tables(ctx, table.as_deref()),
         Stmt::Reindex(table) => ddl::reindex(ctx, table.as_deref()),
@@ -88,17 +101,17 @@ fn plan_output(lines: Vec<String>) -> Output {
     Output::Rows { columns: vec!["plan".into()], rows: lines.into_iter().map(|l| vec![Value::Text(l)]).collect() }
 }
 
-/// The access paths a query uses (and, with `analyze`, what it read and returned).
-fn query_plan(ctx: &Ctx, query: &ast::Query, analyze: bool) -> Result<(Vec<String>, usize)> {
-    let mut q = QCtx::new(ctx);
-    q.explain = true;
-    q.analyze = analyze;
-    let (_, rows) = query::run_query(&q, query, None, 0)?;
-    Ok((q.plan.into_inner(), rows.len()))
-}
-
-fn elapsed(start: Instant) -> String {
-    format!("execution time: {:.3} ms", start.elapsed().as_secs_f64() * 1000.0)
+/// The operator tree of a query (with `analyze`: run, with actual rows and times).
+fn query_plan(ctx: &Ctx, query: &ast::Query, analyze: bool) -> Result<Vec<String>> {
+    let mut q = QCtx::explaining(ctx, analyze);
+    let start = Instant::now();
+    let out = query::run_query_node(&q, query, None, 0)?;
+    let elapsed = start.elapsed();
+    let mut prof = q.prof.take().expect("explaining").into_inner();
+    if analyze {
+        prof.note(format!("Execution time: {:.3} ms ({} row(s) returned)", elapsed.as_secs_f64() * 1e3, out.rows.len()));
+    }
+    Ok(prof.render())
 }
 
 /// `EXPLAIN [ANALYZE] statement`. Plain EXPLAIN never changes data. EXPLAIN
@@ -107,6 +120,7 @@ fn elapsed(start: Instant) -> String {
 pub(crate) fn explain(ctx: &mut Ctx, stmt: Stmt, analyze: bool) -> Result<Output> {
     sema::Analyzer::new(Some(ctx)).statement(&stmt)?;
     let start = Instant::now();
+    // How UPDATE and DELETE find their rows: the plan of the equivalent SELECT.
     let where_plan = |ctx: &Ctx, table: &str, filter: &Option<ast::Expr>| -> Result<Vec<String>> {
         let select = ast::Query {
             head: ast::Select {
@@ -126,21 +140,15 @@ pub(crate) fn explain(ctx: &mut Ctx, stmt: Stmt, analyze: bool) -> Result<Output
             limit: None,
             offset: 0,
         };
-        Ok(query_plan(ctx, &select, false)?.0)
+        query_plan(ctx, &select, false)
     };
     let mut lines = Vec::new();
     match stmt {
-        Stmt::Query(query) | Stmt::Explain(query) => {
-            let (plan, n) = query_plan(ctx, &query, analyze)?;
-            lines = plan;
-            if analyze {
-                lines.push(format!("actual: {n} row(s) returned"));
-            }
-        }
+        Stmt::Query(query) | Stmt::Explain { query, .. } => return Ok(plan_output(query_plan(ctx, &query, analyze)?)),
         stmt @ (Stmt::Update { .. } | Stmt::Delete { .. }) => {
             let (verb, table, filter) = match &stmt {
-                Stmt::Update { table, filter, .. } => ("update", table.clone(), filter.clone()),
-                Stmt::Delete { table, filter } => ("delete from", table.clone(), filter.clone()),
+                Stmt::Update { table, filter, .. } => ("Update on", table.clone(), filter.clone()),
+                Stmt::Delete { table, filter } => ("Delete on", table.clone(), filter.clone()),
                 _ => unreachable!(),
             };
             lines.push(format!("{verb} {table}"));
@@ -150,12 +158,12 @@ pub(crate) fn explain(ctx: &mut Ctx, stmt: Stmt, analyze: bool) -> Result<Output
             }
         }
         Stmt::Insert { table, cols, source } => {
-            lines.push(format!("insert into {table}"));
+            lines.push(format!("Insert on {table}"));
             match &source {
                 InsertSource::Values(rows) => lines.push(format!("  {} row(s) from VALUES", rows.len())),
                 InsertSource::DefaultValues => lines.push("  1 row of defaults".into()),
                 InsertSource::Query(q) => {
-                    lines.extend(query_plan(ctx, q, false)?.0.into_iter().map(|l| format!("  {l}")));
+                    lines.extend(query_plan(ctx, q, false)?.into_iter().map(|l| format!("  {l}")));
                 }
             }
             if analyze {
@@ -165,7 +173,7 @@ pub(crate) fn explain(ctx: &mut Ctx, stmt: Stmt, analyze: bool) -> Result<Output
         _ => return Err(Error::Parse("EXPLAIN supports SELECT, INSERT, UPDATE and DELETE".into())),
     }
     if analyze {
-        lines.push(elapsed(start));
+        lines.push(format!("Execution time: {:.3} ms", start.elapsed().as_secs_f64() * 1e3));
     }
     Ok(plan_output(lines))
 }

@@ -439,7 +439,9 @@ pub(crate) fn stmt(s: &Stmt) -> String {
             }
         }
         Stmt::Query(q) => query(q),
-        Stmt::Explain(q) => format!("EXPLAIN {}", query(q)),
+        Stmt::Explain { query: q, analyze } => format!("EXPLAIN {}{}", if *analyze { "ANALYZE " } else { "" }, query(q)),
+        Stmt::Analyze(None) => "ANALYZE".into(),
+        Stmt::Analyze(Some(t)) => format!("ANALYZE TABLE {}", ident(t)),
         Stmt::Update { table, sets, filter } => {
             let sets: Vec<String> = sets
                 .iter()

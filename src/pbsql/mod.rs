@@ -67,18 +67,15 @@ fn is_object(v: &Value) -> bool {
     matches!(v, Value::Object(_))
 }
 
-/// Shape rules for document commands.
+/// Shape rules for document commands. Filters and updates are compiled by
+/// the document engine's own compilers, so PBSQL accepts exactly what the
+/// engine accepts and rejects a bad one before any document is read.
 pub(crate) fn check_document(d: &DocStmt) -> Result<()> {
+    use crate::doc;
     if !crate::keys::valid_name(&d.collection) {
         return Err(Error::Schema(format!("invalid collection name '{}'", d.collection)));
     }
-    let filter = |f: &Value| -> Result<()> {
-        if is_object(f) {
-            Ok(())
-        } else {
-            Err(Error::Type(format!("a filter must be a JSON object, got {}", f.to_json())))
-        }
-    };
+    let filter = |f: &Value| doc::filter::compile(f).map(|_| ());
     match &d.op {
         DocOp::Insert(Value::Array(docs)) => {
             if let Some(bad) = docs.iter().find(|d| !is_object(d)) {
@@ -86,37 +83,47 @@ pub(crate) fn check_document(d: &DocStmt) -> Result<()> {
             }
             Ok(())
         }
-        DocOp::Insert(doc) if !is_object(doc) => {
-            Err(Error::Type(format!("insert() needs a document (an object), got {}", doc.to_json())))
+        DocOp::Insert(d) if !is_object(d) => {
+            Err(Error::Type(format!("insert() needs a document (an object), got {}", d.to_json())))
         }
-        DocOp::Insert(_) | DocOp::Drop => Ok(()),
-        DocOp::Find { filter: f, sort, .. } => {
+        DocOp::Find { filter: f, spec, .. } => {
             filter(f)?;
-            match sort {
-                Some(Value::Object(spec)) => {
-                    if let Some((k, v)) = spec.iter().find(|(_, v)| v.as_f64().map_or(true, |n| n != 1.0 && n != -1.0)) {
-                        return Err(Error::Type(format!("sort direction for '{k}' must be 1 or -1, got {}", v.to_json())));
-                    }
-                    Ok(())
+            if let Some(s) = &spec.sort {
+                doc::aggregate::parse_sort(s)?;
+            }
+            Ok(())
+        }
+        DocOp::Count(f) | DocOp::Delete { filter: f, .. } | DocOp::Explain(f) => filter(f),
+        DocOp::Distinct { field, filter: f } => {
+            doc::path::validate_path(field)?;
+            filter(f)
+        }
+        DocOp::Update { filter: f, update, method, .. } => {
+            filter(f)?;
+            let replacement = doc::update::is_replacement(update)?;
+            match method {
+                UpdateMethod::ReplaceOne if !replacement => {
+                    Err(Error::Parse("replaceOne takes a document without operators".into()))
                 }
-                Some(other) => Err(Error::Type(format!("sort must be an object like {{\"field\": 1}}, got {}", other.to_json()))),
-                None => Ok(()),
+                UpdateMethod::UpdateOne | UpdateMethod::UpdateMany if replacement => Err(Error::Parse(format!(
+                    "{}() takes update operators such as $set; use replaceOne",
+                    if *method == UpdateMethod::UpdateOne { "updateone" } else { "updatemany" }
+                ))),
+                _ if !replacement => doc::update::validate(update),
+                _ => Ok(()),
             }
         }
-        DocOp::Count(f) | DocOp::Delete { filter: f, .. } => filter(f),
-        DocOp::Update { filter: f, update, .. } => {
-            filter(f)?;
-            if !is_object(update) {
-                return Err(Error::Type(format!("an update must be a JSON object, got {}", update.to_json())));
-            }
-            Ok(())
-        }
-        DocOp::CreateIndex(field) => {
-            if field.is_empty() || field.starts_with('$') {
-                return Err(Error::Schema(format!("cannot index field '{field}'")));
-            }
-            Ok(())
-        }
+        DocOp::CreateIndex { spec, .. } => doc::index_fields(spec).map(|_| ()),
+        DocOp::Insert(_)
+        | DocOp::Aggregate(_)
+        | DocOp::BulkWrite(_)
+        | DocOp::DropIndex(_)
+        | DocOp::GetIndexes
+        | DocOp::SetSchema(_)
+        | DocOp::GetSchema
+        | DocOp::Validate
+        | DocOp::Reindex
+        | DocOp::Drop => Ok(()),
     }
 }
 
@@ -207,36 +214,57 @@ pub(crate) fn print(stmt: &Statement) -> String {
         },
         Statement::Doc(d) => {
             let c = &d.collection;
+            let j = |v: &Value| v.to_json();
+            let opt = |o: &Option<Value>| o.as_ref().map_or(String::new(), |v| format!(", {}", v.to_json()));
+            let list = |a: &[Value]| Value::Array(a.to_vec()).to_json();
             match &d.op {
-                DocOp::Insert(v) => format!("db.{c}.insert({})", v.to_json()),
-                DocOp::Find { filter, sort, skip, limit, one } => {
-                    let mut s = format!("db.{c}.{}({})", if *one { "findOne" } else { "find" }, filter.to_json());
-                    if let Some(so) = sort {
-                        s += &format!(".sort({})", so.to_json());
+                DocOp::Insert(v) => format!("db.{c}.insert({})", j(v)),
+                DocOp::Find { filter, spec, one, end } => {
+                    let mut s = format!("db.{c}.{}({})", if *one { "findOne" } else { "find" }, j(filter));
+                    if let Some(p) = &spec.projection {
+                        s += &format!(".project({})", j(p));
                     }
-                    if *skip > 0 {
-                        s += &format!(".skip({skip})");
+                    if let Some(so) = &spec.sort {
+                        s += &format!(".sort({})", j(so));
                     }
-                    if let (Some(n), false) = (limit, *one) {
+                    if spec.skip > 0 {
+                        s += &format!(".skip({})", spec.skip);
+                    }
+                    if let (Some(n), false) = (spec.limit, *one) {
                         s += &format!(".limit({n})");
                     }
-                    s
+                    match end {
+                        Some(FindEnd::Count) => s + ".count()",
+                        Some(FindEnd::Explain) => s + ".explain()",
+                        None => s,
+                    }
                 }
-                DocOp::Count(f) => format!("db.{c}.count({})", f.to_json()),
-                DocOp::Update { filter, update, multi } => format!(
-                    "db.{c}.{}({}, {})",
-                    if *multi { "updateMany" } else { "updateOne" },
-                    filter.to_json(),
-                    update.to_json()
-                ),
+                DocOp::Count(f) => format!("db.{c}.count({})", j(f)),
+                DocOp::Distinct { field, filter } => {
+                    format!("db.{c}.distinct({}, {})", j(&Value::Text(field.clone())), j(filter))
+                }
+                DocOp::Aggregate(stages) => format!("db.{c}.aggregate({})", list(stages)),
+                DocOp::Explain(f) => format!("db.{c}.explain({})", j(f)),
+                DocOp::Update { filter, update, method, options } => {
+                    let m = match method {
+                        UpdateMethod::Update => "update",
+                        UpdateMethod::UpdateOne => "updateOne",
+                        UpdateMethod::UpdateMany => "updateMany",
+                        UpdateMethod::ReplaceOne => "replaceOne",
+                    };
+                    format!("db.{c}.{m}({}, {}{})", j(filter), j(update), opt(options))
+                }
                 DocOp::Delete { filter, one } => {
-                    format!("db.{c}.{}({})", if *one { "deleteOne" } else { "deleteMany" }, filter.to_json())
+                    format!("db.{c}.{}({})", if *one { "deleteOne" } else { "deleteMany" }, j(filter))
                 }
-                DocOp::CreateIndex(f) => {
-                    let mut o = std::collections::BTreeMap::new();
-                    o.insert(f.clone(), Value::Int(1));
-                    format!("db.{c}.createIndex({})", Value::Object(o).to_json())
-                }
+                DocOp::BulkWrite(ops) => format!("db.{c}.bulkWrite({})", list(ops)),
+                DocOp::CreateIndex { spec, options } => format!("db.{c}.createIndex({}{})", j(spec), opt(options)),
+                DocOp::DropIndex(spec) => format!("db.{c}.dropIndex({})", j(spec)),
+                DocOp::GetIndexes => format!("db.{c}.getIndexes()"),
+                DocOp::SetSchema(v) => format!("db.{c}.setSchema({})", j(v)),
+                DocOp::GetSchema => format!("db.{c}.getSchema()"),
+                DocOp::Validate => format!("db.{c}.validate()"),
+                DocOp::Reindex => format!("db.{c}.reindex()"),
                 DocOp::Drop => format!("db.{c}.drop()"),
             }
         }

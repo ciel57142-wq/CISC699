@@ -53,37 +53,66 @@ pub(crate) fn execute(ctx: &mut Ctx, stmt: Statement) -> Result<Output> {
 
 fn document(ctx: &mut Ctx, d: DocStmt) -> Result<Output> {
     let coll = d.collection.as_str();
+    let flag = |o: &Option<Value>, key: &str| o.as_ref().and_then(|o| o.get(key)) == Some(&Value::Bool(true));
     match d.op {
-        DocOp::Insert(Value::Array(docs)) => {
-            let mut ids = Vec::with_capacity(docs.len());
-            for doc in docs {
-                ids.push(doc::insert(ctx, coll, doc)?);
-            }
-            Ok(Output::Scalar(Value::Array(ids)))
-        }
+        DocOp::Insert(Value::Array(docs)) => Ok(Output::Scalar(Value::Array(doc::insert_many(ctx, coll, docs)?))),
         DocOp::Insert(doc) => Ok(Output::Scalar(doc::insert(ctx, coll, doc)?)),
-        DocOp::Find { filter, sort, skip, limit, .. } => {
-            Ok(Output::Docs(doc::find(ctx, coll, &filter, &FindOptions { sort, skip, limit })?))
-        }
-        DocOp::Count(filter) => {
-            Ok(Output::Scalar(Value::Int(doc::find(ctx, coll, &filter, &FindOptions::default())?.len() as i64)))
-        }
-        DocOp::Update { filter, update, multi } => {
-            let (n, _) = doc::update(ctx, coll, &filter, &update, multi, false)?;
-            Ok(Output::Done(format!("{n} document(s) updated")))
+        DocOp::Find { filter, spec, end, .. } => match end {
+            Some(FindEnd::Count) => Ok(Output::Scalar(Value::Int(doc::count(ctx, coll, &filter)? as i64))),
+            Some(FindEnd::Explain) => Ok(Output::Scalar(doc::explain(ctx, coll, &filter)?)),
+            None => {
+                let opts = FindOptions { sort: spec.sort, skip: spec.skip, limit: spec.limit, projection: spec.projection };
+                Ok(Output::Docs(doc::find(ctx, coll, &filter, &opts)?))
+            }
+        },
+        DocOp::Count(filter) => Ok(Output::Scalar(Value::Int(doc::count(ctx, coll, &filter)? as i64))),
+        DocOp::Distinct { field, filter } => Ok(Output::Scalar(Value::Array(doc::distinct(ctx, coll, &field, &filter)?))),
+        DocOp::Aggregate(stages) => Ok(Output::Docs(doc::aggregate(ctx, coll, &stages)?)),
+        DocOp::Explain(filter) => Ok(Output::Scalar(doc::explain(ctx, coll, &filter)?)),
+        DocOp::Update { filter, update, method, options } => {
+            // Plain update() changes every match unless given {multi: false}.
+            let multi = match method {
+                UpdateMethod::UpdateMany => true,
+                UpdateMethod::Update => {
+                    options.as_ref().and_then(|o| o.get("multi")).map_or(true, |m| *m == Value::Bool(true))
+                }
+                UpdateMethod::UpdateOne | UpdateMethod::ReplaceOne => false,
+            };
+            let r = doc::update(ctx, coll, &filter, &update, multi, flag(&options, "upsert"))?;
+            let mut msg = format!("{} document(s) matched, {} modified", r.matched, r.modified);
+            if let Some(id) = r.upserted_id {
+                msg.push_str(&format!(", upserted _id {}", id.to_json()));
+            }
+            Ok(Output::Done(msg))
         }
         DocOp::Delete { filter, one } => {
             let n = doc::delete(ctx, coll, &filter, one.then_some(1))?;
             Ok(Output::Done(format!("{n} document(s) deleted")))
         }
-        DocOp::CreateIndex(field) => {
-            let created = doc::create_index(ctx, coll, &field)?;
+        DocOp::BulkWrite(ops) => Ok(Output::Scalar(doc::bulk_write(ctx, coll, &ops)?)),
+        DocOp::CreateIndex { spec, options } => {
+            let fields = doc::index_fields(&spec)?;
+            let unique = flag(&options, "unique");
+            let created = doc::create_index(ctx, coll, fields.clone(), unique)?;
+            let label = fields.join(", ");
             Ok(Output::Done(if created {
-                format!("index created on {coll}.{field}")
+                format!("{}index created on {coll}({label})", if unique { "unique " } else { "" })
             } else {
-                format!("{coll}.{field} is already indexed")
+                format!("{coll}({label}) is already indexed")
             }))
         }
+        DocOp::DropIndex(spec) => {
+            let dropped = doc::drop_index(ctx, coll, &spec)?;
+            Ok(Output::Done(if dropped { "index dropped".into() } else { "no such index, nothing dropped".into() }))
+        }
+        DocOp::GetIndexes => Ok(Output::Docs(doc::list_indexes(ctx, coll)?)),
+        DocOp::SetSchema(schema) => {
+            doc::set_schema(ctx, coll, &schema)?;
+            Ok(Output::Done(format!("schema of '{coll}' updated")))
+        }
+        DocOp::GetSchema => Ok(Output::Scalar(doc::get_schema(ctx, coll)?)),
+        DocOp::Validate => Ok(Output::Scalar(doc::validate(ctx, coll)?)),
+        DocOp::Reindex => Ok(Output::Done(format!("{} index entr(y/ies) rebuilt", doc::reindex(ctx, coll)?))),
         DocOp::Drop => {
             let existed = doc::drop(ctx, coll)?;
             Ok(Output::Done(if existed {
@@ -139,27 +168,29 @@ fn explain(ctx: &mut Ctx, stmt: Statement, analyze: bool) -> Result<Output> {
                 DocOp::Count(_) => "count",
                 DocOp::Update { .. } => "update",
                 DocOp::Delete { .. } => "delete",
-                DocOp::Insert(_) => "insert",
-                DocOp::CreateIndex(_) | DocOp::Drop => unreachable!("rejected by the parser"),
+                _ => "insert",
             };
+            let mut examined = 0;
             if let DocOp::Insert(v) = &d.op {
                 let n = if let Value::Array(a) = v { a.len() } else { 1 };
                 lines.push(format!("insert into collection {coll}: {n} document(s)"));
             } else {
-                lines.push(format!("{verb}: {}", doc::describe_access(ctx, &coll, &filter)?));
+                let (path, n) = crate::sql::sources::doc_access(ctx, &coll, &filter)?;
+                examined = n;
+                lines.push(format!("{verb}: collection {coll}: {path}"));
                 lines.push(format!("  filter {}", filter.to_json()));
             }
-            if let DocOp::Find { sort, skip, limit, .. } = &d.op {
-                if let Some(s) = sort {
+            if let DocOp::Find { spec, .. } = &d.op {
+                if let Some(s) = &spec.sort {
                     lines.push(format!("  sort {}", s.to_json()));
                 }
-                if *skip > 0 || limit.is_some() {
-                    lines.push(format!("  skip {skip}, limit {}", limit.map_or("none".into(), |n| n.to_string())));
+                if spec.skip > 0 || spec.limit.is_some() {
+                    lines.push(format!("  skip {}, limit {}", spec.skip, spec.limit.map_or("none".into(), |n| n.to_string())));
                 }
             }
             if analyze {
-                if !matches!(d.op, DocOp::Insert(_)) {
-                    lines.push(format!("  candidates examined: {}", doc::candidate_count(ctx, &coll, &filter)?));
+                if verb != "insert" {
+                    lines.push(format!("  candidates examined: {examined}"));
                 }
                 let out = document(ctx, d)?;
                 lines.push(match out {
@@ -193,7 +224,7 @@ fn explain(ctx: &mut Ctx, stmt: Statement, analyze: bool) -> Result<Output> {
         }
     }
     if analyze {
-        lines.push(format!("execution time: {:.3} ms", start.elapsed().as_secs_f64() * 1000.0));
+        lines.push(format!("Execution time: {:.3} ms", start.elapsed().as_secs_f64() * 1000.0));
     }
     Ok(plan(lines))
 }

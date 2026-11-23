@@ -308,7 +308,10 @@ pub(crate) enum Stmt {
     Truncate(String),
     Insert { table: String, cols: Option<Vec<String>>, source: InsertSource },
     Query(Query),
-    Explain(Query),
+    /// `EXPLAIN [ANALYZE] SELECT ...`
+    Explain { query: Query, analyze: bool },
+    /// `ANALYZE [TABLE] [name]`
+    Analyze(Option<String>),
     /// `SET col = expr`, `None` is DEFAULT.
     Update { table: String, sets: Vec<(String, Option<Expr>)>, filter: Option<Expr> },
     Delete { table: String, filter: Option<Expr> },

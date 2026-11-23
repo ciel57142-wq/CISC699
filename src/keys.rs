@@ -7,6 +7,7 @@
 //! m \0 t \0 <table>          table schema
 //! m \0 c \0 <coll>           collection marker
 //! m \0 s \0 <name>           sequence counter (row ids, document ids)
+//! m \0 a \0 <table>          planner statistics of a table (written by ANALYZE)
 //! i \0 <owner> \0 <field> \0 <value><id>   secondary index entry (empty value)
 //! ```
 //! Table and collection names are plain identifiers and can never contain
@@ -46,6 +47,11 @@ pub fn table_meta(t: &str) -> Vec<u8> {
 }
 pub fn coll_meta(c: &str) -> Vec<u8> {
     key(&[b"m", b"c", c.as_bytes()])
+}
+/// Planner statistics of a table. Only a hint for plan choice: never needed
+/// for a correct answer, so a missing or stale entry is harmless.
+pub fn table_stats(t: &str) -> Vec<u8> {
+    key(&[b"m", b"a", t.as_bytes()])
 }
 pub fn seq(name: &str) -> Vec<u8> {
     key(&[b"m", b"s", name.as_bytes()])

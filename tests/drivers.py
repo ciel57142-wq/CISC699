@@ -148,6 +148,36 @@ except pymongo.errors.DuplicateKeyError:
 check("mongo delete_one / delete_many", [people.delete_one({"_id": 3}).deleted_count, people.delete_many({"age": {"$lt": 50}}).deleted_count], [1, 2])
 check("mongo list collections", "people" in mongo.app.list_collection_names(), True)
 
+orders = mongo.app.orders
+orders.drop()
+orders.insert_many([
+    {"_id": 1, "cust": "a", "qty": 2, "price": 1.5},
+    {"_id": 2, "cust": "b", "qty": 5, "price": 2.0},
+    {"_id": 3, "cust": "a", "qty": 1, "price": 4.0},
+])
+groups = list(orders.aggregate([
+    {"$match": {"qty": {"$gte": 1}}},
+    {"$group": {"_id": "$cust", "n": {"$sum": 1}, "qty": {"$sum": "$qty"}, "avg": {"$avg": "$price"}, "top": {"$max": "$price"}}},
+    {"$sort": {"_id": 1}},
+]))
+check("mongo aggregate $group", groups, [
+    {"_id": "a", "n": 2, "qty": 3, "avg": 2.75, "top": 4.0},
+    {"_id": "b", "n": 1, "qty": 5, "avg": 2.0, "top": 2.0},
+])
+check("mongo aggregate $project/$limit", list(orders.aggregate([{"$sort": {"qty": -1}}, {"$limit": 1}, {"$project": {"_id": 0, "cust": 1}}])), [{"cust": "b"}])
+orders.create_index([("cust", 1), ("qty", 1)])
+orders.create_index("price", unique=True)
+check("mongo list_indexes", sorted(ix["name"] for ix in orders.list_indexes()), ["_id_", "cust_1_qty_1", "price_1"])
+try:
+    orders.insert_one({"_id": 4, "price": 2.0})
+    check("mongo unique index", "no error", "error")
+except pymongo.errors.DuplicateKeyError:
+    print("ok   mongo unique index raises DuplicateKeyError")
+check("mongo compound index lookup", orders.find_one({"cust": "a", "qty": 1})["_id"], 3)
+orders.drop_index("price_1")
+orders.insert_one({"_id": 4, "price": 2.0})
+check("mongo drop_index", sorted(ix["name"] for ix in orders.list_indexes()), ["_id_", "cust_1_qty_1"])
+
 # ----------------------------------------------- one database, three views
 cur.execute("db.people.find({_id: 2})")
 check("document written by pymongo, read through postgres", '"name":"Linus"' in cur.fetchone()[0], True)

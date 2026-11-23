@@ -5,7 +5,7 @@
 help:
 	@echo "make check-env   show tool versions and what is missing"
 	@echo "make build       cargo build --release --locked"
-	@echo "make test        Rust tests: 29 unit + 22 integration + 15 pbsql + 37 relational + 23 hardening + 1 doc"
+	@echo "make test        Rust tests: 31 unit + 22 integration + 15 pbsql + 13 planner + 24 document + 6 document-storage + 37 relational + 23 hardening + 1 doc"
 	@echo "make smoke       scripted run compared with tests/fixtures/smoke.expected"
 	@echo "make drivers     optional: 39 checks through redis-py, psycopg2, pymongo"
 	@echo "make lint        clippy and rustfmt report (advisory, does not fail)"

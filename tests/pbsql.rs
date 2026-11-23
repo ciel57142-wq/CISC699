@@ -256,7 +256,8 @@ fn explain_shows_each_engine_choosing_its_access_path() {
     seed(&mut db);
     // the WHERE clause is pushed into the document engine, which uses its index
     let p = plan(&mut db, "EXPLAIN SELECT o._id FROM DOCUMENT(orders) o WHERE o.user = 1 AND o.total > 1");
-    assert!(p.contains("collection orders: index on user") && p.contains(r#"filter {"user":1} pushed down"#), "{p}");
+    assert!(p.contains("Document Scan on orders AS o") && p.contains("collection orders: index user_1"), "{p}");
+    assert!(p.contains(r#"Pushed Filter: {"user":1}"#) && p.contains("Filter on o"), "{p}");
     // _id goes straight to the document
     assert!(plan(&mut db, "EXPLAIN SELECT * FROM DOCUMENT(orders) o WHERE o._id = 12").contains("_id lookup"));
     // range predicates are not pushed (they compare across types differently)
@@ -265,10 +266,10 @@ fn explain_shows_each_engine_choosing_its_access_path() {
     assert!(plan(&mut db, "EXPLAIN SELECT * FROM KV() k WHERE k.key = 'pref:1'").contains("key lookup"));
     assert!(plan(&mut db, "EXPLAIN SELECT * FROM KV('pref') k WHERE k.key LIKE 'pref:2%'").contains("prefix scan 'pref:2'"));
     // relational access paths are unchanged
-    assert!(plan(&mut db, "EXPLAIN SELECT * FROM users WHERE id = 2").contains("primary key lookup"));
+    assert!(plan(&mut db, "EXPLAIN SELECT * FROM users WHERE id = 2").contains("Primary Key Lookup on users"));
     // document and key-value commands can be explained too
     let p = plan(&mut db, "EXPLAIN db.orders.find({user: 2}).sort({total: -1})");
-    assert!(p.contains("index on user") && p.contains("sort"), "{p}");
+    assert!(p.contains("index user_1") && p.contains("sort"), "{p}");
     assert!(plan(&mut db, "EXPLAIN KEYS pref:").contains("prefix scan 'pref:'"));
 }
 
@@ -278,16 +279,17 @@ fn explain_never_writes_and_explain_analyze_runs_for_real() {
     seed(&mut db);
     let before = db.entry_count();
     let p = plan(&mut db, "EXPLAIN DELETE FROM users WHERE id = 1");
-    assert!(p.contains("delete from users") && p.contains("primary key lookup"), "{p}");
+    assert!(p.contains("Delete on users") && p.contains("Primary Key Lookup on users"), "{p}");
     plan(&mut db, "EXPLAIN db.orders.deleteMany({})");
     plan(&mut db, "EXPLAIN INSERT INTO users VALUES (9, 'x', NULL)");
     assert_eq!(db.entry_count(), before, "plain EXPLAIN changed data");
 
-    // EXPLAIN ANALYZE of a cross-model join reports rows read per engine
+    // EXPLAIN ANALYZE of a cross-model join: each engine's input is a plan
+    // node with its actual rows, and the planner may probe the table's key
     let p = plan(&mut db, "EXPLAIN ANALYZE SELECT u.name FROM users u JOIN DOCUMENT(orders) o ON o.user = u.id");
-    assert!(p.contains("u: 3 row(s) read from relational storage"), "{p}");
-    assert!(p.contains("o: 4 row(s) read from document storage"), "{p}");
-    assert!(p.contains("actual: 3 row(s) returned") && p.contains("execution time:"), "{p}");
+    assert!(p.lines().any(|l| l.contains("Document Scan on orders AS o") && l.contains("actual rows=4")), "{p}");
+    assert!(p.contains("users AS u"), "{p}");
+    assert!(p.contains("Execution time:") && p.contains("(3 row(s) returned)"), "{p}");
     // and of a write: it happens
     let p = plan(&mut db, "EXPLAIN ANALYZE db.orders.deleteOne({user: 9})");
     assert!(p.contains("candidates examined: 1") && p.contains("actual: 1 document(s) deleted"), "{p}");
@@ -368,7 +370,7 @@ fn validation_uses_the_live_catalog_and_runs_nothing() {
     // errors are found even though no row would ever reach the bad expression
     assert!(matches!(db.validate("SELECT label * 2 FROM empty"), Err(Error::Type(_))));
     assert!(matches!(db.execute("SELECT label * 2 FROM empty"), Err(Error::Type(_))));
-    assert!(matches!(db.validate("DELETE FROM empty WHERE id = 'one'"), Err(Error::Type(_))));
+    assert!(matches!(db.validate("DELETE FROM empty WHERE label LIKE id"), Err(Error::Type(_))));
     assert!(matches!(db.validate("SELECT nope FROM users"), Err(Error::Schema(_))));
     assert!(matches!(db.validate("SELECT * FROM missing"), Err(Error::Schema(_))));
     assert!(matches!(db.validate("SELECT name FROM users u JOIN empty e ON e.id = u.id WHERE id = 1"), Err(Error::Schema(m)) if m.contains("ambiguous")));
@@ -407,7 +409,7 @@ fn every_statement_kind_runs_through_the_unified_entry_point() {
     assert_eq!(rows(&mut db, "SHOW TABLES"), vec![vec![t("users")]]);
     assert_eq!(rows(&mut db, "SHOW COLLECTIONS"), vec![vec![t("orders")]]);
     assert_eq!(ok(&mut db, "db.orders.count({user: 1})"), Output::Scalar(i(2)));
-    assert_eq!(ok(&mut db, "db.orders.updateMany({user: 1}, {$inc: {total: 1}})").to_string(), "2 document(s) updated");
+    assert_eq!(ok(&mut db, "db.orders.updateMany({user: 1}, {$inc: {total: 1}})").to_string(), "2 document(s) matched, 2 modified");
     assert_eq!(ok(&mut db, "INCR hits 5"), Output::Scalar(i(5)));
     assert_eq!(ok(&mut db, "DECR hits 2"), Output::Scalar(i(3)));
     assert_eq!(ok(&mut db, "EXISTS hits"), Output::Scalar(Value::Bool(true)));

@@ -3,6 +3,7 @@
 
 use super::ast::*;
 use super::catalog::{group_key, Scope};
+use super::plan::{NodeId, Profile, Running, Work};
 use super::query::run_query;
 use crate::error::{Error, Result};
 use crate::keys;
@@ -12,9 +13,10 @@ use std::cell::{Cell, OnceCell, RefCell};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::time::Instant;
 
 /// Per-statement query state: the data view, the subquery cache and, for
-/// EXPLAIN, the access paths chosen.
+/// EXPLAIN / EXPLAIN ANALYZE, the operator tree being recorded.
 pub(super) struct QCtx<'a> {
     pub ctx: &'a Ctx<'a>,
     cache: RefCell<HashMap<usize, Rc<SubResult>>>,
@@ -22,31 +24,100 @@ pub(super) struct QCtx<'a> {
     /// A subquery that reads nothing from an enclosing level is uncorrelated,
     /// and its result is cached for the rest of the statement.
     min_level: Cell<usize>,
-    pub explain: bool,
-    /// EXPLAIN ANALYZE: the plan also records how many rows each source produced.
-    pub analyze: bool,
-    pub plan: RefCell<Vec<String>>,
+    /// Present while the statement is being explained.
+    pub prof: Option<RefCell<Profile>>,
 }
 
 impl<'a> QCtx<'a> {
     pub fn new(ctx: &'a Ctx<'a>) -> QCtx<'a> {
-        QCtx {
-            ctx,
-            cache: RefCell::new(HashMap::new()),
-            min_level: Cell::new(usize::MAX),
-            explain: false,
-            analyze: false,
-            plan: RefCell::new(Vec::new()),
+        QCtx { ctx, cache: RefCell::new(HashMap::new()), min_level: Cell::new(usize::MAX), prof: None }
+    }
+
+    /// A context that records the plan; `analyze` also times every operator.
+    pub fn explaining(ctx: &'a Ctx<'a>, analyze: bool) -> QCtx<'a> {
+        let mut q = QCtx::new(ctx);
+        q.prof = Some(RefCell::new(Profile { analyze, ..Profile::default() }));
+        q
+    }
+
+    /// Is the plan being recorded (EXPLAIN)?
+    pub fn recording(&self) -> bool {
+        self.prof.is_some()
+    }
+
+    /// Register an operator node without running it (see `begin`).
+    pub fn register(&self, label: impl FnOnce() -> String, est: f64, inputs: &[Option<NodeId>]) -> Option<NodeId> {
+        let p = self.prof.as_ref()?;
+        let label = label();
+        let inputs = inputs.iter().flatten().copied().collect();
+        Some(p.borrow_mut().node(label.clone(), label, Some(est), inputs))
+    }
+
+    /// Start an operator: registers its node and makes it the parent of any
+    /// subquery that runs until `done`.
+    pub fn begin(&self, label: impl FnOnce() -> String, est: f64, inputs: &[Option<NodeId>]) -> Running {
+        let id = self.register(label, est, inputs);
+        self.push(id)
+    }
+
+    pub fn push_node(&self, id: Option<NodeId>) -> Running {
+        self.push(id)
+    }
+
+    fn push(&self, id: Option<NodeId>) -> Running {
+        let Some(p) = &self.prof else {
+            return Running { id: None, start: None };
+        };
+        let mut p = p.borrow_mut();
+        if let Some(id) = id {
+            p.started(id);
+            p.stack.push(id);
+        }
+        Running { id, start: p.analyze.then(Instant::now) }
+    }
+
+    pub fn done(&self, r: Running, rows: usize, work: Work) -> Option<NodeId> {
+        let id = r.id?;
+        let p = self.prof.as_ref()?;
+        let mut p = p.borrow_mut();
+        if let Some(at) = p.stack.iter().rposition(|&x| x == id) {
+            p.stack.truncate(at);
+        }
+        p.finish(id, rows, work, r.start.map(|s| s.elapsed()));
+        Some(id)
+    }
+
+    /// Record one execution of a registered node that has no `begin` (index probes).
+    pub fn record(&self, id: Option<NodeId>, rows: usize, work: Work, start: Option<Instant>) {
+        if let (Some(id), Some(p)) = (id, &self.prof) {
+            p.borrow_mut().finish(id, rows, work, start.map(|s| s.elapsed()));
         }
     }
 
-    pub fn note(&self, line: impl FnOnce() -> String) {
-        if self.explain {
-            let line = line();
-            let mut p = self.plan.borrow_mut();
-            if !p.contains(&line) {
-                p.push(line);
-            }
+    /// A timer, only when EXPLAIN ANALYZE is measuring.
+    pub fn timer(&self) -> Option<Instant> {
+        match &self.prof {
+            Some(p) if p.borrow().analyze => Some(Instant::now()),
+            _ => None,
+        }
+    }
+
+    pub fn detail(&self, id: Option<NodeId>, line: impl FnOnce() -> String) {
+        if let (Some(id), Some(p)) = (id, &self.prof) {
+            p.borrow_mut().detail(id, line());
+        }
+    }
+
+    pub fn set_label(&self, id: Option<NodeId>, label: String) {
+        if let (Some(id), Some(p)) = (id, &self.prof) {
+            p.borrow_mut().nodes[id].label = label;
+        }
+    }
+
+    /// Remember that a table was planned, and whether it had statistics.
+    pub fn table_stats(&self, table: &str, analyzed_rows: Option<f64>) {
+        if let Some(p) = &self.prof {
+            p.borrow_mut().tables.insert(table.to_string(), analyzed_rows);
         }
     }
 }
@@ -60,7 +131,7 @@ pub(super) struct SubResult {
 
 #[derive(Clone, Copy)]
 pub(super) struct Env<'a> {
-    pub scope: &'a Scope,
+    pub scope: &'a [(String, String)],
     pub row: &'a [Value],
     /// Rows of the current group when evaluating aggregates.
     pub group: Option<&'a [Vec<Value>]>,
@@ -72,7 +143,7 @@ pub(super) struct Env<'a> {
 }
 
 impl<'a> Env<'a> {
-    pub fn new(q: &'a QCtx<'a>, scope: &'a Scope, row: &'a [Value], outer: Option<&'a Env<'a>>, level: usize) -> Env<'a> {
+    pub fn new(q: &'a QCtx<'a>, scope: &'a [(String, String)], row: &'a [Value], outer: Option<&'a Env<'a>>, level: usize) -> Env<'a> {
         Env { scope, row, group: None, q, outer, level }
     }
 }
@@ -360,17 +431,26 @@ fn subquery(sq: &SubQ, env: &Env) -> Result<Rc<SubResult>> {
     if let Some(r) = env.q.cache.borrow().get(&sq.id) {
         return Ok(r.clone());
     }
+    // The subquery's operators hang under this node, which hangs under the
+    // operator evaluating the expression.
+    let node = env.q.prof.as_ref().map(|p| {
+        p.borrow_mut().repeated_node(format!("subplan {}", sq.id), "SubPlan".into())
+    });
+    let run = env.q.push_node(node);
     let saved = env.q.min_level.replace(usize::MAX);
     let res = run_query(env.q, &sq.q, Some(env), env.level + 1);
     let reached = env.q.min_level.get();
     env.q.min_level.set(saved.min(reached));
+    let correlated = reached <= env.level;
+    env.q.set_label(
+        node,
+        if correlated { "SubPlan (correlated, evaluated per row)" } else { "SubPlan (uncorrelated, evaluated once)" }.into(),
+    );
+    env.q.done(run, res.as_ref().map_or(0, |r| r.1.len()), Work::default());
     let (cols, rows) = res?;
     let r = Rc::new(SubResult { cols: cols.len(), rows, set: OnceCell::new() });
-    if reached > env.level {
+    if !correlated {
         env.q.cache.borrow_mut().insert(sq.id, r.clone());
-        env.q.note(|| "subquery: uncorrelated, evaluated once".into());
-    } else {
-        env.q.note(|| "subquery: correlated, evaluated per row".into());
     }
     Ok(r)
 }

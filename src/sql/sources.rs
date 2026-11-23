@@ -1,15 +1,18 @@
 //! The common execution interface between PBSQL queries and the three
 //! storage models.
 //!
-//! Every base FROM item – a table, `DOCUMENT(collection)` or `KV('prefix')` –
-//! is opened as a [`Relation`]. The query executor (joins, filtering,
-//! grouping, ordering) only ever sees the rows a relation hands back, so
-//! one SELECT can join and filter across models.
+//! A FROM item over another model – `DOCUMENT(collection)` or
+//! `KV('prefix')` – is opened as a [`Relation`] and enters the relational
+//! planner (`query.rs`) as a materialised input, like a derived table: it
+//! takes part in join ordering, hash joins, filtering, grouping and
+//! EXPLAIN [ANALYZE] like any other input. (Tables are planned by the
+//! cost-based planner itself, with statistics and index nested-loop joins;
+//! `Model::Relational` names them in plans.)
 //!
 //! Each relation reads *through its own storage engine* using the
-//! statement's [`Ctx`](crate::storage::Ctx): tables through the relational
-//! access-path planner and catalog, documents through `doc::find` (so `_id`
-//! and field indexes are used), keys through the key-value module. Reads
+//! statement's [`Ctx`](crate::storage::Ctx): documents through `doc::find`
+//! (so `_id` lookups and field indexes are used), keys through the
+//! key-value module. Reads
 //! therefore join the session's transaction read set and are validated at
 //! COMMIT exactly like reads made through any other interface; nothing in
 //! this layer touches raw keys of another model.
@@ -20,37 +23,42 @@
 //! complete predicate to every row.
 
 use super::ast::*;
-use super::catalog::Schema;
 use super::eval::{const_eval, is_const, QCtx};
-use super::query::fetch;
 use crate::doc::{self, FindOptions};
 use crate::error::Result;
 use crate::kv;
+use crate::storage::Ctx;
 use crate::value::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Which storage model a relation reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Model {
-    Relational,
     Document,
     KeyValue,
 }
 
 impl Model {
-    pub(crate) fn name(self) -> &'static str {
+    /// Plan-node label prefix.
+    pub(crate) fn scan_name(self) -> &'static str {
         match self {
-            Model::Relational => "relational",
-            Model::Document => "document",
-            Model::KeyValue => "key-value",
+            Model::Document => "Document Scan",
+            Model::KeyValue => "Key-Value Scan",
         }
     }
 }
 
-/// Rows produced by a relation, with one column name per value.
+/// Rows produced by a relation, with one column name per value, and what
+/// reading them took (for EXPLAIN).
 pub(super) struct RowSet {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<Value>>,
+    /// The access path taken, in words.
+    pub access: String,
+    /// The pushed-down filter, if any.
+    pub pushed: Option<String>,
+    /// Entries read from storage before filtering.
+    pub examined: u64,
 }
 
 /// A base relation of one storage model.
@@ -70,30 +78,23 @@ pub(super) trait Relation {
 /// names in the hint can only mean its columns.
 pub(super) fn open<'a>(item: &'a FromItem, fields: Vec<String>, sole: bool) -> Option<Box<dyn Relation + 'a>> {
     match &item.src {
-        Source::Table(name) => Some(Box::new(TableRelation { name, alias: &item.alias })),
         Source::Collection(coll) => Some(Box::new(DocRelation { coll, alias: &item.alias, fields, sole })),
         Source::Kv(prefix) => Some(Box::new(KvRelation { prefix, alias: &item.alias, sole })),
-        Source::Derived(_) => None,
+        Source::Table(_) | Source::Derived(_) => None,
     }
 }
 
-// --------------------------------------------------------------- relational
-
-struct TableRelation<'a> {
-    name: &'a str,
-    alias: &'a str,
-}
-
-impl Relation for TableRelation<'_> {
-    fn model(&self) -> Model {
-        Model::Relational
-    }
-
-    fn read(&self, q: &QCtx, hint: Option<&Expr>) -> Result<RowSet> {
-        let s = Schema::load(q.ctx, self.name)?;
-        let rows = fetch(q, &s, self.alias, hint)?.into_iter().map(|(_, r)| r).collect();
-        Ok(RowSet { columns: s.cols.iter().map(|c| c.name.clone()).collect(), rows })
-    }
+/// The access path the document engine chooses for a filter, in words,
+/// and how many documents it examines.
+pub(crate) fn doc_access(ctx: &Ctx, coll: &str, filter: &Value) -> Result<(String, u64)> {
+    let plan = doc::explain(ctx, coll, filter)?;
+    let examined = plan.get("docsExamined").and_then(Value::as_i64).unwrap_or(0).max(0) as u64;
+    let path = match plan.get("access").and_then(Value::as_str) {
+        Some("id_lookup") => "_id lookup".to_string(),
+        Some("index_scan") => format!("index {}", plan.get("index").and_then(Value::as_str).unwrap_or("?")),
+        _ => "full scan".to_string(),
+    };
+    Ok((path, examined))
 }
 
 // ----------------------------------------------------------------- pushdown
@@ -190,15 +191,12 @@ impl Relation for DocRelation<'_> {
 
     fn read(&self, q: &QCtx, hint: Option<&Expr>) -> Result<RowSet> {
         let filter = self.filter(hint, q);
-        q.note(|| {
-            let path = doc::describe_access(q.ctx, self.coll, &filter).unwrap_or_else(|e| e.to_string());
-            let pushed = if filter.get("_id").is_some() || matches!(&filter, Value::Object(o) if !o.is_empty()) {
-                format!(", filter {} pushed down", filter.to_json())
-            } else {
-                String::new()
-            };
-            format!("{} AS {}: {path}{pushed}", self.coll, self.alias)
-        });
+        let (access, examined) = if q.recording() {
+            doc_access(q.ctx, self.coll, &filter)?
+        } else {
+            (String::new(), 0)
+        };
+        let pushed = matches!(&filter, Value::Object(o) if !o.is_empty()).then(|| filter.to_json());
         let docs = doc::find(q.ctx, self.coll, &filter, &FindOptions::default())?;
         // Columns: _id, every top-level field present, then fields the query
         // names that no document has.
@@ -219,7 +217,7 @@ impl Relation for DocRelation<'_> {
             .into_iter()
             .map(|d| columns.iter().map(|c| d.get(c).cloned().unwrap_or(Value::Null)).collect())
             .collect();
-        Ok(RowSet { columns, rows })
+        Ok(RowSet { columns, rows, access: format!("collection {}: {access}", self.coll), pushed, examined })
     }
 }
 
@@ -258,12 +256,12 @@ impl Relation for KvRelation<'_> {
                     _ => None,
                 };
                 if let Some(Value::Text(k)) = k {
-                    q.note(|| format!("kv AS {}: key lookup", self.alias));
-                    let rows = match kv::get(q.ctx, &k) {
-                        Some(v) if k.starts_with(self.prefix) => vec![vec![Value::Text(k), text(v)]],
+                    let rows: Vec<Vec<Value>> = match kv::get(q.ctx, &k) {
+                        Some(v) if k.starts_with(self.prefix) => vec![vec![Value::Text(k.clone()), text(v)]],
                         _ => vec![],
                     };
-                    return Ok(RowSet { columns, rows });
+                    let examined = rows.len() as u64;
+                    return Ok(RowSet { columns, rows, access: format!("key lookup '{k}'"), pushed: None, examined });
                 }
             }
         }
@@ -277,14 +275,15 @@ impl Relation for KvRelation<'_> {
                         prefix = lp.to_string();
                     } else if !prefix.starts_with(lp) {
                         // the two prefixes are disjoint: nothing can match
-                        q.note(|| format!("kv AS {}: empty (LIKE prefix outside the scanned prefix)", self.alias));
-                        return Ok(RowSet { columns, rows: vec![] });
+                        let access = "empty (LIKE prefix outside the scanned prefix)".to_string();
+                        return Ok(RowSet { columns, rows: vec![], access, pushed: None, examined: 0 });
                     }
                 }
             }
         }
-        q.note(|| format!("kv AS {}: prefix scan '{prefix}'", self.alias));
-        let rows = kv::scan(q.ctx, &prefix).into_iter().map(|(k, v)| vec![Value::Text(k), text(v)]).collect();
-        Ok(RowSet { columns, rows })
+        let rows: Vec<Vec<Value>> =
+            kv::scan(q.ctx, &prefix).into_iter().map(|(k, v)| vec![Value::Text(k), text(v)]).collect();
+        let examined = rows.len() as u64;
+        Ok(RowSet { columns, rows, access: format!("prefix scan '{prefix}'"), pushed: None, examined })
     }
 }

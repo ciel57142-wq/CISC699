@@ -9,6 +9,7 @@ polydb - relational, document and key-value data in one engine
 USAGE
   polydb [DIRECTORY]            local shell on a database directory (default ./polydb-data)
   polydb --memory               local shell, nothing touches disk
+  polydb --verify-indexes [DIR] check every index against its rows on open, rebuild damaged ones
   polydb serve [DIRECTORY]      network server for many clients (see SERVER below)
   polydb client [HOST:PORT]     shell connected to a server (default 127.0.0.1:7878)
 
@@ -20,17 +21,20 @@ RELATIONAL (SQL)
   INSERT INTO users VALUES (1, 'Ada', 36), (2, 'Linus', 54)
   SELECT name, age FROM users WHERE age > 40 ORDER BY age DESC LIMIT 10
   SELECT u.name, COUNT(*) FROM users u JOIN orders o ON o.user_id = u.id GROUP BY u.name
+  ANALYZE                       gather statistics for the query planner
+  EXPLAIN [ANALYZE] SELECT ...  show the plan (ANALYZE: run it and measure each step)
   UPDATE users SET age = age + 1 WHERE id = 1
   DELETE FROM users WHERE id = 2
   DROP TABLE users
 
 DOCUMENT (NoSQL)
   db.events.insert({user: 1, type: 'login', tags: ['web']})
-  db.events.createIndex({type: 1})
-  db.events.find({type: 'login', user: {$gte: 1}}).sort({user: -1}).limit(5)
-  db.events.update({user: 1}, {$set: {seen: true}, $inc: {visits: 1}})
-  db.events.delete({type: 'login'})
-  db.events.count({})      db.events.drop()
+  db.events.createIndex({type: 1})      db.events.createIndex(['user', 'type'], {unique: true})
+  db.events.find({type: 'login', user: {$gte: 1}}, {type: 1}).sort({user: -1}).limit(5)
+  db.events.update({user: 1}, {$set: {seen: true}, $inc: {visits: 1}}, {upsert: true})
+  db.events.aggregate([{$match: {}}, {$group: {_id: '$type', n: {$sum: 1}}}])
+  db.events.delete({type: 'login'})     db.events.explain({type: 'login'})
+  db.events.count({})      db.events.distinct('type')      db.events.drop()
 
 KEY-VALUE
   SET session:42 some value      GET session:42      DEL session:42
@@ -43,7 +47,7 @@ OTHER
   SHOW TABLES   SHOW COLLECTIONS   CHECKPOINT   .help   .exit
 
 SERVER
-  polydb serve [DIRECTORY] [--memory] [--host ADDR]
+  polydb serve [DIRECTORY] [--memory] [--verify-indexes] [--host ADDR]
                [--port N] [--redis-port N] [--pg-port N] [--mongo-port N]
   Defaults: host 127.0.0.1, native 7878, Redis 6380, PostgreSQL 5433, MongoDB 27018.
   A port of 'off' disables that listener. There is no authentication:
@@ -55,12 +59,24 @@ fn die(msg: &str) -> ! {
     std::process::exit(1);
 }
 
-fn open(path: Option<&str>, memory: bool) -> Database {
+fn open(path: Option<&str>, memory: bool, verify: bool) -> Database {
     if memory {
         return Database::in_memory();
     }
     let path = path.unwrap_or("polydb-data");
-    Database::open(path).unwrap_or_else(|e| die(&format!("cannot open database at '{path}': {e}")))
+    let fail = |e: polydb::Error| -> ! { die(&format!("cannot open database at '{path}': {e}")) };
+    if !verify {
+        return Database::open(path).unwrap_or_else(|e| fail(e));
+    }
+    let (db, report) = Database::open_verified(path).unwrap_or_else(|e| fail(e));
+    eprintln!("verified the indexes of {} table(s)", report.tables_checked);
+    for p in &report.problems {
+        eprintln!("  index problem: {p}");
+    }
+    if !report.rebuilt.is_empty() {
+        eprintln!("  rebuilt the indexes of: {}", report.rebuilt.join(", "));
+    }
+    db
 }
 
 /// Read commands from stdin, hand each to `run`, print what comes back.
@@ -108,6 +124,7 @@ fn main() {
         let mut cfg = Config::default();
         let mut dir = None;
         let mut memory = false;
+        let mut verify = false;
         let mut it = args[1..].iter();
         while let Some(a) = it.next() {
             let mut value = |name: &str| it.next().cloned().unwrap_or_else(|| die(&format!("{name} needs a value")));
@@ -120,6 +137,7 @@ fn main() {
             };
             match a.as_str() {
                 "--memory" => memory = true,
+                "--verify-indexes" => verify = true,
                 "--host" => cfg.host = value("--host"),
                 "--port" => cfg.native = port(value("--port")),
                 "--redis-port" => cfg.redis = port(value("--redis-port")),
@@ -129,7 +147,7 @@ fn main() {
                 other => dir = Some(other.to_string()),
             }
         }
-        let db = open(dir.as_deref(), memory);
+        let db = open(dir.as_deref(), memory, verify);
         println!("polydb {} serving {}", env!("CARGO_PKG_VERSION"), if memory { "an in-memory database".into() } else { format!("'{}'", dir.as_deref().unwrap_or("polydb-data")) });
         if let Err(e) = server::serve(&db, &cfg) {
             die(&format!("{e}"));
@@ -154,7 +172,10 @@ fn main() {
         return;
     }
 
-    let db = std::cell::RefCell::new(open(first.filter(|a| *a != "--memory"), first == Some("--memory")));
+    let memory = args.iter().any(|a| a == "--memory");
+    let verify = args.iter().any(|a| a == "--verify-indexes");
+    let dir = args.iter().map(String::as_str).find(|a| !a.starts_with("--"));
+    let db = std::cell::RefCell::new(open(dir, memory, verify));
     repl(&mut || if db.borrow().in_transaction() { "polydb*> " } else { "polydb> " }, &mut |cmd| {
         db.borrow_mut().execute(cmd).map(|o| o.to_string()).map_err(|e| e.to_string())
     });

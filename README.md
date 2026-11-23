@@ -44,16 +44,19 @@ bash scripts/smoke.sh              # 4. scripted session compared with stored ou
 
 ### Expected output
 
-Step 3 prints one `test result` line per test target. The three that matter are:
+Step 3 prints one `test result` line per test target. The ones that matter are:
 
 ```
+test result: ok. 24 passed; 0 failed; 0 ignored; ...     (tests/document.rs)
 test result: ok. 23 passed; 0 failed; 0 ignored; ...     (tests/hardening.rs)
 test result: ok. 22 passed; 0 failed; 0 ignored; ...     (tests/integration.rs)
+test result: ok. 15 passed; 0 failed; 0 ignored; ...     (tests/pbsql.rs)
+test result: ok. 13 passed; 0 failed; 0 ignored; ...     (tests/planner.rs)
 test result: ok. 37 passed; 0 failed; 0 ignored; ...     (tests/relational.rs)
 test result: ok. 1 passed; 0 failed; 0 ignored; ...      (Doc-tests polydb)
 ```
 
-The library line says `6 passed` (unit tests that damage index entries on purpose) and the binary line `0 passed`.
+The library line says `31 passed` (6 unit tests that damage index entries on purpose, 25 PBSQL lexer, parser, normalizer and semantic-check tests) and the binary line `0 passed`.
 
 Step 4 ends with:
 
@@ -133,7 +136,7 @@ polydb calls no external service and needs no API key, token or account. It is i
 
 ## Driver check (optional)
 
-`tests/drivers.py` runs 39 checks through unmodified redis-py, psycopg2 and pymongo, including concurrent clients and one transaction read back through three protocols.
+`tests/drivers.py` runs 45 checks through unmodified redis-py, psycopg2 and pymongo, including concurrent clients and one transaction read back through three protocols.
 
 ```sh
 bash scripts/driver_checks.sh      # or: make drivers
@@ -156,9 +159,14 @@ The build compiles polydb, runs the Rust tests and the smoke comparison, and fai
 |---|---|---|
 | `cargo test --release --locked` | correct behaviour of all three models, transactions, recovery (`tests/integration.rs`) | 22 |
 | | failure paths: bad arguments, damaged files, port conflicts, garbage and deeply nested input on every port, killing the server (`tests/hardening.rs`) | 23 |
+| | SQL engine: constraints, foreign keys, joins, subqueries, indexes (`tests/relational.rs`) and storage unit tests | 37 + 6 |
+| | PBSQL front end: lexer, parser and syntax trees, precedence, normalization, semantic and type checks, invalid input (`src/pbsql/tests.rs`) | 25 |
+| | PBSQL against the real engines: cross-model joins, filters and writes, transactions and conflicts, durability, EXPLAIN [ANALYZE], NULL, identifier and escaping rules (`tests/pbsql.rs`) | 15 |
+| | SQL indexes, planner and `EXPLAIN` (`tests/planner.rs`) | 13 |
+| | document model: types, paths, every query/update operator, bulk writes, indexes checked against unindexed results, aggregation, schemas, transactions, restarts and torn logs (`tests/document.rs`) | 24 |
 | | library example in `src/lib.rs` compiles | 1 |
 | `bash scripts/smoke.sh` | scripted session equals stored output | 64 lines |
-| `bash scripts/driver_checks.sh` | third-party drivers | 39 checks |
+| `bash scripts/driver_checks.sh` | third-party drivers | 45 checks |
 | `bash scripts/clean_run.sh` | all of the above in a fresh copy, with a log in `docs/evidence/` | |
 
 Tests are deterministic: fixed inputs, a fixed-seed byte generator for the garbage-input test, operating-system-assigned free ports, and no dependence on the clock.
@@ -195,9 +203,9 @@ polydb ships with **no dataset** and downloads none. Every test creates its own 
 - **Large-message allocation (open):** the Redis and PostgreSQL listeners accept a declared message length of up to 512 MB and 256 MB and allocate it before reading.
 - **Log damage:** recovery stops at the first log record that fails its checksum. A torn final record (the normal crash case) is handled correctly; damage in the middle of the log also drops the commits after it.
 - Commits wait for their own `fsync`, so write throughput is bounded by the disk.
-- Indexes serve equality only; range queries and joins scan.
+- Document-model indexes serve equality only. SQL indexes serve equality, ranges, IN lists and index joins, but no index-only scans, no ORDER BY by index order and no OR across columns; join reordering is greedy and only for inner joins; planner statistics are refreshed only by `ANALYZE` (see [docs/INDEXING.md](docs/INDEXING.md)).
 - SQL has no date/time types, views, CTEs (`WITH`), window functions, `RETURNING` or `ON ... SET DEFAULT`; these fail with an explicit "not supported" error. Foreign-key `NO ACTION` is checked immediately, like `RESTRICT`. Subqueries nest at most 6 deep.
-- Cross-model joins read a document or key-value source in full unless the `WHERE` clause pins `_id`, an indexed field or a key; see [docs/PBSQL.md](docs/PBSQL.md#pushdown).
+- A `DOCUMENT()` or `KV()` source is read in full unless the `WHERE` clause pins `_id`, an indexed field or a key; see [docs/PBSQL.md](docs/PBSQL.md#pushdown).
 - No lock file: do not open the same directory from two processes at once.
 - Object keys in documents are stored sorted, not in insertion order.
 
@@ -205,10 +213,10 @@ polydb ships with **no dataset** and downloads none. Every test creates its own 
 
 ```
 Cargo.toml, Cargo.lock      package manifest and lock file (no dependencies)
-src/                        the engine (about 5,600 lines)
+src/                        the engine (about 11,400 lines)
   storage.rs keys.rs          ordered map, write-ahead log, snapshot, key layout
   pbsql/                      PBSQL front end: lexer, statement parser, executor
-  sql/ doc.rs kv.rs           the three data models (sql/ also holds the relational
+  sql/ doc/ kv.rs             the three data models (sql/ also holds the relational
                               parser, semantic checker and cross-model sources)
   lib.rs value.rs error.rs    sessions, transactions, value type, errors
   server.rs resp.rs           native and Redis listeners
@@ -218,7 +226,10 @@ tests/
   integration.rs              22 behaviour tests
   pbsql.rs                    15 PBSQL execution tests across the three engines
   hardening.rs                23 failure-path tests
-  drivers.py                  39 checks through third-party drivers
+  relational.rs               37 SQL engine tests
+  planner.rs                  13 index, planner and EXPLAIN tests
+  document.rs                 24 document-model tests
+  drivers.py                  45 checks through third-party drivers
   requirements-drivers.txt    pinned driver versions
   fixtures/                   smoke script and its expected output
 scripts/                    check_env, smoke, driver_checks, serve, clean_run
@@ -233,6 +244,7 @@ docs/
   AUDIT.md                    what the repository audit found and changed
   EVIDENCE.md                 file manifest with checksums
   REFERENCE.md                command syntax, library API, protocol subsets
+  INDEXING.md                 index audit, planner design, EXPLAIN, benchmarks
   WALKTHROUGH.md              script for the recorded walkthrough
   evidence/                   clean-run logs
 ```

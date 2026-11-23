@@ -201,8 +201,18 @@ impl P {
             return self.query().map(Stmt::Query);
         }
         if self.kw("explain") {
+            let analyze = self.kw("analyze");
             self.expect_kw("select")?;
-            return self.query().map(Stmt::Explain);
+            return self.query().map(|query| Stmt::Explain { query, analyze });
+        }
+        if self.kw("analyze") {
+            if self.kw("table") {
+                return Ok(Stmt::Analyze(Some(self.ident()?)));
+            }
+            if self.peek().is_none() {
+                return Ok(Stmt::Analyze(None));
+            }
+            return Ok(Stmt::Analyze(Some(self.ident()?)));
         }
         if self.kw("insert") {
             return self.insert();
@@ -307,7 +317,7 @@ impl P {
                 "merge" => Some("MERGE"),
                 "grant" | "revoke" => Some("GRANT / REVOKE (access control)"),
                 "savepoint" | "release" => Some("SAVEPOINT"),
-                "vacuum" | "analyze" => Some("VACUUM / ANALYZE"),
+                "vacuum" => Some("VACUUM"),
                 "copy" => Some("COPY"),
                 "upsert" | "replace" => Some("REPLACE / UPSERT"),
                 _ => None,
@@ -1233,7 +1243,10 @@ pub(super) fn to_sql(e: &Expr) -> String {
             if *neg { "NOT " } else { "" },
             list.iter().map(to_sql).collect::<Vec<_>>().join(", ")
         ),
-        Expr::InSub(..) | Expr::Exists(..) | Expr::Subquery(..) => "(subquery)".into(),
+        // display only: CHECK constraints, the one stored use, cannot hold subqueries
+        Expr::InSub(a, _, neg) => format!("({} {}IN (SELECT ...))", to_sql(a), if *neg { "NOT " } else { "" }),
+        Expr::Exists(..) => "EXISTS (SELECT ...)".into(),
+        Expr::Subquery(..) => "(SELECT ...)".into(),
         Expr::Agg(f, arg, distinct) => format!(
             "{}({}{})",
             f.name(),

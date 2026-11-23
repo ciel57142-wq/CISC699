@@ -76,9 +76,12 @@ kv          = "SET" key value | "GET" key | "DEL" key | "EXISTS" key
             | "KEYS" [ prefix ] | "INCR" key [ integer ] | "DECR" key [ integer ] ;
 
 document    = "db" "." collection "." method "(" [ json { "," json } ] ")" { "." modifier "(" json ")" } ;
-method      = insert | insertOne | insertMany | find | findOne | update | updateOne | updateMany
-            | delete | deleteOne | deleteMany | remove | count | countDocuments | createIndex | drop ;
-modifier    = sort | skip | limit ;                              (* find / findOne only *)
+method      = insert | insertOne | insertMany | find | findOne | update | updateOne | updateMany | replaceOne
+            | delete | deleteOne | deleteMany | remove | bulkWrite | count | countDocuments | distinct
+            | aggregate | explain | createIndex | dropIndex | getIndexes | setSchema | getSchema
+            | validate | reindex | drop ;
+modifier    = sort | skip | limit | project | projection        (* find / findOne only, any order *)
+            | count | explain ;                                  (* last, no argument *)
 
 sql         = query | insert | update | delete | ddl | utility_sql ;
 query       = select { ( "UNION" | "INTERSECT" | "EXCEPT" ) [ "ALL" | "DISTINCT" ] select }
@@ -105,12 +108,15 @@ ddl         = create_table | "DROP" "TABLE" [ "IF" "EXISTS" ] name [ "CASCADE" |
             | "CREATE" [ "UNIQUE" ] "INDEX" [ "IF" "NOT" "EXISTS" ] name "ON" name "(" name { "," name } ")"
             | "DROP" "INDEX" [ "IF" "EXISTS" ] name [ "ON" name ]
             | "ALTER" "TABLE" name action { "," action } | "TRUNCATE" [ "TABLE" ] name ;
-utility_sql = ( "DESCRIBE" | "DESC" ) [ "TABLE" ] name | "CHECK" ( "TABLES" | "TABLE" name ) | "REINDEX" [ [ "TABLE" ] name ] ;
+utility_sql = ( "DESCRIBE" | "DESC" ) [ "TABLE" ] name | "CHECK" ( "TABLES" | "TABLE" name ) | "REINDEX" [ [ "TABLE" ] name ]
+            | "ANALYZE" [ [ "TABLE" ] name ] ;                    (* collect planner statistics *)
 ```
 
 `create_table`, the column types and the `ALTER TABLE` actions are listed in [REFERENCE.md](REFERENCE.md#relational); they are unchanged.
 
-`EXPLAIN` applies to `SELECT`, `INSERT`, `UPDATE`, `DELETE`, the document commands that read or change documents, and the key-value commands.
+`EXPLAIN` applies to `SELECT`, `INSERT`, `UPDATE`, `DELETE`, the document commands `insert`, `find` (without `.count()`/`.explain()`), `count`, the `update` family and the `delete` family, and the key-value commands.
+
+The document methods behave as described in [REFERENCE.md](REFERENCE.md#document). In PBSQL each becomes a typed operation; its filter, update, sort and index arguments are compiled by the document engine's own compilers during semantic analysis, so a bad filter or update is rejected before any document is read, also on an empty collection.
 
 ## Expressions and operator precedence
 
@@ -144,8 +150,6 @@ Static types: `INT`, `REAL`, `TEXT`, `BOOL`, `JSON` (arrays and objects from doc
 | `AND`, `OR`, `NOT` need booleans | `1 AND TRUE` |
 | `WHERE`, `ON`, `HAVING`, `CASE WHEN`, `CHECK` must be boolean | `WHERE 5` |
 | `LIKE` needs text on both sides | `id LIKE '1%'` (INT) |
-| values of different scalar classes (number, text, boolean) are not compared | `id = 'x'` (INT vs TEXT); use `CAST` |
-| an `IN` list does not mix classes | `x IN (1, 'a')` |
 | function names and argument counts are checked; text functions need text, numeric ones numbers | `LOWER(id)`, `LOWER('a', 'b')`, `NOPE(1)` |
 | `SUM` / `AVG` need numbers | `SUM(name)` |
 | aggregates only in the select list, `HAVING`, `ORDER BY`; never nested | `WHERE COUNT(*) > 1`, `MAX(COUNT(*))` |
@@ -155,6 +159,8 @@ Static types: `INT`, `REAL`, `TEXT`, `BOOL`, `JSON` (arrays and objects from doc
 | names resolve and are not ambiguous | `SELECT nope FROM t` |
 
 `NULL` and `ANY` pass every static rule. The evaluator checks `ANY` values again at run time with the same rules. `||` accepts any operands and yields text.
+
+**Comparisons** (`=`, `<`, `IN`, `CASE x WHEN`, `ORDER BY`, `MIN`/`MAX`) are defined between any two non-NULL values: values of different types follow the total order `BOOL < number < TEXT < array < object` (INT and REAL compare by numeric value). A comparison with `NULL` is `NULL`; see [NULL semantics](#null-semantics). So `id = 'x'` on an INT column is simply false for every row, never an error; use `CAST` when a conversion is meant. The planner relies on this: an index lookup returns exactly what a full scan would.
 
 ## NULL semantics
 
@@ -199,18 +205,18 @@ UPDATE users SET vip = TRUE WHERE id IN (SELECT CAST(SUBSTR(k.key, 7) AS INT) FR
 
 ### The common execution interface
 
-Every base source is opened as a `Relation` (`src/sql/sources.rs`):
+At statement level, every PBSQL statement is executed by `pbsql::exec` against the session's transaction context (`Ctx`), routed to the engine of its model. At query level, a source of another model is opened as a `Relation` (`src/sql/sources.rs`):
 
 ```rust
 trait Relation {
-    fn model(&self) -> Model;                                       // Relational | Document | KeyValue
-    fn read(&self, q: &QCtx, hint: Option<&Expr>) -> Result<RowSet>; // columns + rows
+    fn model(&self) -> Model;                                       // Document | KeyValue
+    fn read(&self, q: &QCtx, hint: Option<&Expr>) -> Result<RowSet>; // columns, rows, access path, work
 }
 ```
 
-Joins, filtering, grouping, ordering and set operations run above this interface and see only rows. Each relation reads through its own engine, with the statement's transaction context:
+The rows a relation returns enter the relational planner (`src/sql/query.rs`) as a materialised input, like a derived table. Join ordering, the join algorithm (hash join, index nested-loop join probing a table's key or index for each document), filtering, grouping, ordering and set operations all run above it. Each source reads through its own engine, with the statement's transaction context:
 
-- tables through the relational access-path planner (primary-key and index lookups, range scans);
+- tables through the cost-based relational planner (primary-key and index lookups, range scans, statistics from `ANALYZE`);
 - documents through `doc::find`, which uses `_id` lookups and field indexes;
 - keys through the key-value module.
 
@@ -241,18 +247,21 @@ Inside a transaction, a statement that fails is undone on its own; the transacti
 
 ## EXPLAIN and EXPLAIN ANALYZE
 
-- `EXPLAIN <statement>` lists the access path each source uses: for tables the chosen index or scan, for documents `_id lookup`, `index on <field>` or `full scan` plus the pushed filter, for key-value `key lookup` or `prefix scan`, and the join strategy (hash or nested loop). **It never writes.** For `UPDATE` and `DELETE` it shows how the target rows are found.
-- `EXPLAIN ANALYZE <statement>` **runs the statement for real** (atomically, or inside the open transaction, where `ROLLBACK` undoes it). It adds the rows each source read from which engine, the rows returned or changed, documents examined, and the execution time.
+- `EXPLAIN <statement>` shows the plan. For a query it is the planner's operator tree with row estimates; a `DOCUMENT()` source is a `Document Scan` node and a `KV()` source a `Key-Value Scan` node, each with the access path its engine chose (`_id lookup`, `index <name>`, `full scan`, `key lookup`, `prefix scan`) and the filter pushed into it. For `UPDATE` and `DELETE` it shows how the target rows are found; for document and key-value commands, the engine's access path. **It never writes.**
+- `EXPLAIN ANALYZE <statement>` **runs the statement for real** (atomically, or inside the open transaction, where `ROLLBACK` undoes it). It adds actual rows, loops, entries examined and time per operator, the rows returned or changed, and the total execution time.
 
 ```
 EXPLAIN ANALYZE SELECT u.name FROM users u JOIN DOCUMENT(orders) o ON o.user = u.id
- users AS u: full scan
- u: 3 row(s) read from relational storage
- orders AS o: collection orders: full scan
- o: 4 row(s) read from document storage
- o: hash inner join
- actual: 3 row(s) returned
- execution time: 0.084 ms
+ Project  (est. rows=4)  (actual rows=3 loops=1 time=0.011 ms examined=3)
+   Output: name
+    -> Index Nested Loop (inner)  (est. rows=4)  (actual rows=3 loops=1 time=0.037 ms examined=3)
+         Join Filter: o.user = u.id
+       -> Document Scan on orders AS o  (est. rows=4)  (actual rows=4 loops=1 time=0.115 ms examined=4)
+            Access: collection orders: full scan
+       -> Index Probe on users AS u using primary key  (est. rows=1)  (actual rows=3 loops=4 time=0.025 ms examined=3)
+            Index Cond: id = o.user
+ Statistics: users (not analyzed: default estimates)
+ Execution time: 0.354 ms (3 row(s) returned)
 ```
 
 ## Normalization
@@ -278,7 +287,7 @@ SELECT a FROM t t WHERE ((a)) <> 1    ─┴─►  SELECT a FROM t WHERE a <> 1
 | `constraint violation` | primary key, unique, NOT NULL, CHECK, foreign key |
 | `transaction error` / `serialization conflict` | misuse of `BEGIN`/`COMMIT`; a stale read at `COMMIT` |
 
-Unsupported statements fail with a message naming the feature instead of being misread: `WITH` (CTEs), `CREATE VIEW|TRIGGER|SCHEMA|DATABASE|SEQUENCE|FUNCTION|PROCEDURE|TYPE|ROLE|USER`, `MERGE`, `GRANT`/`REVOKE`, `SAVEPOINT`/`RELEASE`, `VACUUM`/`ANALYZE`, `COPY`, `REPLACE`/`UPSERT`, `ON ... SET DEFAULT`, nested `EXPLAIN`, `EXPLAIN` of DDL or transaction control. Only one statement is accepted per command.
+Unsupported statements fail with a message naming the feature instead of being misread: `WITH` (CTEs), `CREATE VIEW|TRIGGER|SCHEMA|DATABASE|SEQUENCE|FUNCTION|PROCEDURE|TYPE|ROLE|USER`, `MERGE`, `GRANT`/`REVOKE`, `SAVEPOINT`/`RELEASE`, `VACUUM`, `COPY`, `REPLACE`/`UPSERT`, `ON ... SET DEFAULT`, nested `EXPLAIN`, `EXPLAIN` of DDL or transaction control. Only one statement is accepted per command.
 
 ## Implementation map
 
@@ -292,7 +301,8 @@ Unsupported statements fail with a message naming the feature instead of being m
 | `src/sql/parser.rs` | relational grammar, including `DOCUMENT()` / `KV()` sources and dotted paths |
 | `src/sql/sema.rs` | name resolution, type inference and checking, aggregate and shape rules |
 | `src/sql/printer.rs` | canonical text of relational statements |
-| `src/sql/sources.rs` | the `Relation` interface and its relational, document and key-value implementations |
+| `src/sql/sources.rs` | the `Relation` interface and its document and key-value implementations |
+| `src/sql/query.rs` | the planner; `DOCUMENT()` / `KV()` inputs enter it in `from_clause` |
 | `src/sql/walk.rs` | syntax-tree traversal |
 
 Tests: `src/pbsql/tests.rs` (lexer, parser and tree shapes, precedence, normalization, semantic rules, invalid syntax) and `tests/pbsql.rs` (execution against real storage: cross-model joins and filters, cross-model writes under constraints, transactions and conflicts, durability across reopen, EXPLAIN / EXPLAIN ANALYZE, NULL, identifier and escaping rules).

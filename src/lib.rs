@@ -180,6 +180,24 @@ impl Database {
         Ok(Database::from_store(Store::open(path)?))
     }
 
+    /// Open a durable database and, after recovery, verify every relational
+    /// index entry against the rows, rebuilding the indexes of any table
+    /// where they disagree. Costs one pass over the data; returns what it
+    /// found. Rows and index entries are written in the same atomic commit,
+    /// so on an undamaged database this finds nothing; it is the repair path
+    /// for data written by other tools or damaged outside the engine.
+    pub fn open_verified(path: impl AsRef<Path>) -> Result<(Database, sql::RepairReport)> {
+        let mut db = Database::open(path)?;
+        let report = db.repair_indexes()?;
+        Ok((db, report))
+    }
+
+    /// Verify every relational index against its rows and rebuild the
+    /// indexes of tables where they disagree, as one atomic commit.
+    pub fn repair_indexes(&mut self) -> Result<sql::RepairReport> {
+        self.run(true, sql::repair_indexes)
+    }
+
     /// A database that lives only in memory.
     pub fn in_memory() -> Database {
         Database::from_store(Store::memory())
@@ -285,8 +303,8 @@ impl Database {
     // ------------------------------------------------------------ typed API
 
     /// Run one relational PBSQL statement (SELECT, INSERT, UPDATE, DELETE,
-    /// DDL, EXPLAIN of those). Other kinds of statement are refused; use
-    /// [`Database::execute`] for those.
+    /// DDL, ANALYZE, EXPLAIN of those). Other kinds of statement are
+    /// refused; use [`Database::execute`] for those.
     pub fn sql(&mut self, statement: &str) -> Result<Output> {
         let stmt = pbsql::parse(statement)?;
         let relational = match &stmt {
@@ -331,17 +349,42 @@ impl Database {
         self.run(true, |ctx| doc::insert(ctx, collection, doc))
     }
 
+    /// Insert several documents atomically (all or none); returns their ids.
+    pub fn doc_insert_many(&mut self, collection: &str, docs: Vec<Value>) -> Result<Vec<Value>> {
+        self.run(true, |ctx| doc::insert_many(ctx, collection, docs))
+    }
+
     pub fn doc_find(&mut self, collection: &str, filter: &Value, opts: &FindOptions) -> Result<Vec<Value>> {
         self.run(false, |ctx| doc::find(ctx, collection, filter, opts))
     }
 
-    /// Update every matching document; returns how many.
+    /// Number of documents matching `filter`.
+    pub fn doc_count(&mut self, collection: &str, filter: &Value) -> Result<u64> {
+        self.run(false, |ctx| doc::count(ctx, collection, filter))
+    }
+
+    /// Distinct values of `field` among matching documents, sorted.
+    pub fn doc_distinct(&mut self, collection: &str, field: &str, filter: &Value) -> Result<Vec<Value>> {
+        self.run(false, |ctx| doc::distinct(ctx, collection, field, filter))
+    }
+
+    /// The access path a filter uses and how many documents it reads.
+    pub fn doc_explain(&mut self, collection: &str, filter: &Value) -> Result<Value> {
+        self.run(false, |ctx| doc::explain(ctx, collection, filter))
+    }
+
+    /// Run an aggregation pipeline (see [`doc::aggregate`](crate::doc::aggregate) for the stages).
+    pub fn doc_aggregate(&mut self, collection: &str, pipeline: &[Value]) -> Result<Vec<Value>> {
+        self.run(false, |ctx| doc::aggregate(ctx, collection, pipeline))
+    }
+
+    /// Update every matching document; returns how many matched.
     pub fn doc_update(&mut self, collection: &str, filter: &Value, update: &Value) -> Result<u64> {
         self.doc_update_with(collection, filter, update, true, false).map(|r| r.0)
     }
 
     /// Update with control over `multi` (all matches vs first) and `upsert`.
-    /// Returns (documents updated, id of an upserted document).
+    /// Returns (documents matched, id of an upserted document).
     pub fn doc_update_with(
         &mut self,
         collection: &str,
@@ -350,6 +393,18 @@ impl Database {
         multi: bool,
         upsert: bool,
     ) -> Result<(u64, Option<Value>)> {
+        self.doc_update_full(collection, filter, update, multi, upsert).map(|r| (r.matched, r.upserted_id))
+    }
+
+    /// Update returning matched and modified counts and any upserted id.
+    pub fn doc_update_full(
+        &mut self,
+        collection: &str,
+        filter: &Value,
+        update: &Value,
+        multi: bool,
+        upsert: bool,
+    ) -> Result<doc::UpdateResult> {
         self.run(true, |ctx| doc::update(ctx, collection, filter, update, multi, upsert))
     }
 
@@ -363,6 +418,11 @@ impl Database {
         self.run(true, |ctx| doc::delete(ctx, collection, filter, limit))
     }
 
+    /// Several write operations as one atomic unit (see [`doc::bulk_write`](crate::doc::bulk_write)).
+    pub fn doc_bulk_write(&mut self, collection: &str, ops: &[Value]) -> Result<Value> {
+        self.run(true, |ctx| doc::bulk_write(ctx, collection, ops))
+    }
+
     pub fn doc_drop(&mut self, collection: &str) -> Result<bool> {
         self.run(true, |ctx| doc::drop(ctx, collection))
     }
@@ -373,7 +433,37 @@ impl Database {
 
     /// Index a field of a collection; returns false if it was already indexed.
     pub fn doc_create_index(&mut self, collection: &str, field: &str) -> Result<bool> {
-        self.run(true, |ctx| doc::create_index(ctx, collection, field))
+        self.doc_create_index_on(collection, &[field], false)
+    }
+
+    /// Create a single-field or compound index, optionally unique.
+    pub fn doc_create_index_on(&mut self, collection: &str, fields: &[&str], unique: bool) -> Result<bool> {
+        let fields = fields.iter().map(|f| f.to_string()).collect();
+        self.run(true, |ctx| doc::create_index(ctx, collection, fields, unique))
+    }
+
+    /// Drop an index by name (`a_1_b_1`), field, or key spec.
+    pub fn doc_drop_index(&mut self, collection: &str, spec: &Value) -> Result<bool> {
+        self.run(true, |ctx| doc::drop_index(ctx, collection, spec))
+    }
+
+    pub fn doc_indexes(&mut self, collection: &str) -> Result<Vec<Value>> {
+        self.run(false, |ctx| doc::list_indexes(ctx, collection))
+    }
+
+    /// Set or clear (`null`) a collection's document schema.
+    pub fn doc_set_schema(&mut self, collection: &str, schema: &Value) -> Result<()> {
+        self.run(true, |ctx| doc::set_schema(ctx, collection, schema))
+    }
+
+    /// Consistency report for a collection's documents and index entries.
+    pub fn doc_validate(&mut self, collection: &str) -> Result<Value> {
+        self.run(false, |ctx| doc::validate(ctx, collection))
+    }
+
+    /// Rebuild a collection's index entries; returns how many were written.
+    pub fn doc_reindex(&mut self, collection: &str) -> Result<u64> {
+        self.run(true, |ctx| doc::reindex(ctx, collection))
     }
 
     // ---------------------------------------------------- unified commands
@@ -381,8 +471,8 @@ impl Database {
     /// Run one PBSQL statement (see `docs/PBSQL.md`):
     ///
     /// * relational: `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `CREATE TABLE|[UNIQUE] INDEX`,
-    ///   `DROP TABLE|INDEX`, `ALTER TABLE`, `TRUNCATE`, `DESCRIBE`, `CHECK TABLE`, `REINDEX`;
-    ///   a FROM clause may also read `DOCUMENT(collection)` and `KV('prefix')`
+    ///   `DROP TABLE|INDEX`, `ALTER TABLE`, `TRUNCATE`, `ANALYZE`, `DESCRIBE`, `CHECK TABLE`,
+    ///   `REINDEX`; a FROM clause may also read `DOCUMENT(collection)` and `KV('prefix')`
     /// * documents: `db.<collection>.<method>(...)`
     /// * key-value: `SET`, `GET`, `DEL`, `EXISTS`, `KEYS`, `INCR`, `DECR`
     /// * control: `BEGIN`, `COMMIT`, `ROLLBACK`, `EXPLAIN [ANALYZE]`, `CHECKPOINT`,

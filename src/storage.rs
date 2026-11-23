@@ -297,6 +297,16 @@ impl<'a> Ctx<'a> {
         self.store.get(key).cloned()
     }
 
+    /// Like `get`, but not recorded in a transaction's read set. Only for
+    /// data that cannot change a statement's result (planner statistics),
+    /// so that refreshing it never makes a concurrent transaction conflict.
+    pub fn get_untracked(&self, key: &[u8]) -> Option<Vec<u8>> {
+        if let Some(v) = self.writes.get(key) {
+            return v.clone();
+        }
+        self.store.get(key).cloned()
+    }
+
     pub fn put(&mut self, key: Vec<u8>, value: Vec<u8>) {
         self.writes.insert(key, Some(value));
     }
@@ -305,30 +315,76 @@ impl<'a> Ctx<'a> {
         self.writes.insert(key, None);
     }
 
-    /// All live entries whose key starts with `prefix`, in key order.
-    pub fn scan(&self, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    /// The live value of `key`, borrowed: no copy of the stored bytes.
+    pub fn get_ref(&self, key: &[u8]) -> Option<&[u8]> {
+        if let Some(v) = self.writes.get(key) {
+            return v.as_deref();
+        }
+        if let Some(r) = &self.reads {
+            r.borrow_mut().keys.insert(key.to_vec());
+        }
+        self.store.get(key).map(Vec::as_slice)
+    }
+
+    fn note_prefix_read(&self, prefix: &[u8]) {
         if let Some(r) = &self.reads {
             let mut r = r.borrow_mut();
             if !r.prefixes.iter().any(|p| prefix.starts_with(p)) {
                 r.prefixes.push(prefix.to_vec());
             }
         }
-        let mut out: BTreeMap<Vec<u8>, Vec<u8>> =
-            self.store.scan(prefix).map(|(k, v)| (k.clone(), v.clone())).collect();
-        for (k, v) in self.writes.range::<[u8], _>((Bound::Included(prefix), Bound::Unbounded)) {
-            if !k.starts_with(prefix) {
+    }
+
+    /// Live entries whose key starts with `prefix`, is `>= start` and, when
+    /// `end` is given, `< end`, merged from the store and this statement's
+    /// uncommitted writes and borrowed from both: nothing is copied. Ascending
+    /// key order, or descending when `rev`. Inside a transaction the whole
+    /// prefix is recorded as read.
+    pub fn iter_range<'s>(&'s self, prefix: &[u8], start: &[u8], end: Option<&[u8]>, rev: bool) -> Merged<'s> {
+        self.note_prefix_read(prefix);
+        let start = if start < prefix { prefix.to_vec() } else { start.to_vec() };
+        // The first key past every key starting with `prefix`.
+        let mut pend = prefix.to_vec();
+        while let Some(&last) = pend.last() {
+            if last == 0xff {
+                pend.pop();
+            } else {
+                *pend.last_mut().unwrap() += 1;
                 break;
             }
-            match v {
-                Some(v) => {
-                    out.insert(k.clone(), v.clone());
-                }
-                None => {
-                    out.remove(k);
-                }
-            }
         }
-        out.into_iter().collect()
+        let end: Option<Vec<u8>> = match (end, pend.is_empty()) {
+            (Some(e), false) => Some(e.min(pend.as_slice()).to_vec()),
+            (Some(e), true) => Some(e.to_vec()),
+            (None, false) => Some(pend),
+            (None, true) => None,
+        };
+        let hi = match &end {
+            Some(e) => Bound::Excluded(e.as_slice()),
+            None => Bound::Unbounded,
+        };
+        if end.as_deref().map_or(false, |e| e <= start.as_slice()) {
+            return Merged { store: Box::new(std::iter::empty()), writes: Box::new(std::iter::empty()), sh: None, wh: None, rev };
+        }
+        let lo = Bound::Included(start.as_slice());
+        let s = self.store.map.range::<[u8], _>((lo, hi)).map(|(k, v)| (k.as_slice(), v.as_slice()));
+        let w = self.writes.range::<[u8], _>((lo, hi)).map(|(k, v)| (k.as_slice(), v.as_deref()));
+        let (store, writes): (Box<dyn Iterator<Item = _> + 's>, Box<dyn Iterator<Item = _> + 's>) =
+            if rev { (Box::new(s.rev()), Box::new(w.rev())) } else { (Box::new(s), Box::new(w)) };
+        let mut m = Merged { store, writes, sh: None, wh: None, rev };
+        m.sh = m.store.next();
+        m.wh = m.writes.next();
+        m
+    }
+
+    /// [`Ctx::iter_range`] over a whole prefix, ascending.
+    pub fn iter_prefix<'s>(&'s self, prefix: &[u8]) -> Merged<'s> {
+        self.iter_range(prefix, prefix, None, false)
+    }
+
+    /// All live entries whose key starts with `prefix`, in key order.
+    pub fn scan(&self, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+        self.iter_prefix(prefix).map(|(k, v)| (k.to_vec(), v.to_vec())).collect()
     }
 
     /// Live entries whose key starts with `prefix`, is `>= start` and, when
@@ -336,33 +392,57 @@ impl<'a> Ctx<'a> {
     /// `prefix`. Inside a transaction the whole prefix is recorded as read,
     /// which is conservative but keeps conflict detection simple and sound.
     pub fn scan_range(&self, prefix: &[u8], start: &[u8], end: Option<&[u8]>) -> Vec<(Vec<u8>, Vec<u8>)> {
-        if let Some(r) = &self.reads {
-            let mut r = r.borrow_mut();
-            if !r.prefixes.iter().any(|p| prefix.starts_with(p)) {
-                r.prefixes.push(prefix.to_vec());
+        self.iter_range(prefix, start, end, false).map(|(k, v)| (k.to_vec(), v.to_vec())).collect()
+    }
+}
+
+type StoreIter<'s> = Box<dyn Iterator<Item = (&'s [u8], &'s [u8])> + 's>;
+type WriteIter<'s> = Box<dyn Iterator<Item = (&'s [u8], Option<&'s [u8]>)> + 's>;
+
+/// Committed entries overlaid with a write set, merged in key order.
+pub struct Merged<'s> {
+    store: StoreIter<'s>,
+    writes: WriteIter<'s>,
+    sh: Option<(&'s [u8], &'s [u8])>,
+    wh: Option<(&'s [u8], Option<&'s [u8]>)>,
+    rev: bool,
+}
+
+impl<'s> Iterator for Merged<'s> {
+    type Item = (&'s [u8], &'s [u8]);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let order = match (self.sh, self.wh) {
+                (None, None) => return None,
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (Some((sk, _)), Some((wk, _))) => {
+                    let o = sk.cmp(wk);
+                    if self.rev {
+                        o.reverse()
+                    } else {
+                        o
+                    }
+                }
+            };
+            match order {
+                std::cmp::Ordering::Less => {
+                    let out = self.sh;
+                    self.sh = self.store.next();
+                    return out;
+                }
+                std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => {
+                    if order == std::cmp::Ordering::Equal {
+                        self.sh = self.store.next(); // shadowed by the write
+                    }
+                    let (k, v) = self.wh.expect("checked above");
+                    self.wh = self.writes.next();
+                    if let Some(v) = v {
+                        return Some((k, v));
+                    }
+                }
             }
         }
-        let start = if start < prefix { prefix } else { start };
-        let in_range = |k: &[u8]| k.starts_with(prefix) && end.map_or(true, |e| k < e);
-        let mut out: BTreeMap<Vec<u8>, Vec<u8>> = self
-            .store
-            .range_from(start)
-            .take_while(|(k, _)| in_range(k))
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        for (k, v) in self.writes.range::<[u8], _>((Bound::Included(start), Bound::Unbounded)) {
-            if !in_range(k) {
-                break;
-            }
-            match v {
-                Some(v) => {
-                    out.insert(k.clone(), v.clone());
-                }
-                None => {
-                    out.remove(k);
-                }
-            }
-        }
-        out.into_iter().collect()
     }
 }

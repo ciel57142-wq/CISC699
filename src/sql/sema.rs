@@ -10,8 +10,8 @@
 //!   name is not ambiguous;
 //! * types: arithmetic and unary minus need numbers, AND / OR / NOT and
 //!   every condition (WHERE, ON, HAVING, CASE WHEN, CHECK) need booleans,
-//!   LIKE needs text, two values of different scalar classes (number, text,
-//!   boolean) are not compared, function arguments have the right kind;
+//!   LIKE needs text, function arguments have the right kind (comparisons
+//!   are defined between any two values, by the cross-type total order);
 //! * functions: the name is known and the argument count is right;
 //! * aggregates: not in WHERE, ON, GROUP BY, UPDATE or DELETE; not nested;
 //! * shapes: a scalar or IN subquery returns one column, both sides of a
@@ -86,16 +86,6 @@ impl SqlType {
 
     fn textual(self) -> bool {
         matches!(self, SqlType::Text | SqlType::Null | SqlType::Any)
-    }
-
-    /// Scalar class for comparison: values of different classes are not compared.
-    fn class(self) -> Option<u8> {
-        match self {
-            SqlType::Int | SqlType::Float => Some(1),
-            SqlType::Text => Some(2),
-            SqlType::Bool => Some(3),
-            _ => None,
-        }
     }
 
     /// The type of a value that may come from either branch.
@@ -212,7 +202,7 @@ impl<'c, 'a> Analyzer<'c, 'a> {
     /// Check one statement.
     pub(crate) fn statement(&self, s: &Stmt) -> Result<()> {
         match s {
-            Stmt::Query(q) | Stmt::Explain(q) => self.query(q, &[]).map(|_| ()),
+            Stmt::Query(q) | Stmt::Explain { query: q, .. } => self.query(q, &[]).map(|_| ()),
             Stmt::Insert { table, cols, source } => self.insert(table, cols.as_deref(), source),
             Stmt::Update { table, sets, filter } => {
                 let rel = self.table_rel(table, table)?;
@@ -285,6 +275,7 @@ impl<'c, 'a> Analyzer<'c, 'a> {
             Stmt::DropTable { .. }
             | Stmt::DropIndex { .. }
             | Stmt::Truncate(_)
+            | Stmt::Analyze(_)
             | Stmt::Describe(_)
             | Stmt::CheckTable(_)
             | Stmt::Reindex(_) => Ok(()),
@@ -556,19 +547,10 @@ impl<'c, 'a> Analyzer<'c, 'a> {
                         }
                     }
                     Op::Concat => SqlType::Text,
-                    Op::Eq | Op::Ne | Op::Lt | Op::Le | Op::Gt | Op::Ge => {
-                        if let (Some(x), Some(y)) = (l.class(), r.class()) {
-                            if x != y {
-                                return type_err(format!(
-                                    "cannot compare {} with {} in `{}`; use CAST to convert one side",
-                                    l.name(),
-                                    r.name(),
-                                    show()
-                                ));
-                            }
-                        }
-                        SqlType::Bool
-                    }
+                    // Comparisons are defined between any two values: values of
+                    // different types follow the total order
+                    // null < bool < number < text < array < object (docs/PBSQL.md).
+                    Op::Eq | Op::Ne | Op::Lt | Op::Le | Op::Gt | Op::Ge => SqlType::Bool,
                 }
             }
             Expr::Not(a) => {
@@ -603,19 +585,9 @@ impl<'c, 'a> Analyzer<'c, 'a> {
                 SqlType::Bool
             }
             Expr::In(a, list, _) => {
-                let l = self.expr(a, levels, clause)?;
+                self.expr(a, levels, clause)?;
                 for x in list {
-                    let t = self.expr(x, levels, clause)?;
-                    if let (Some(c1), Some(c2)) = (l.class(), t.class()) {
-                        if c1 != c2 {
-                            return type_err(format!(
-                                "IN list mixes {} with {} in `{}`",
-                                l.name(),
-                                t.name(),
-                                show()
-                            ));
-                        }
-                    }
+                    self.expr(x, levels, clause)?;
                 }
                 SqlType::Bool
             }
@@ -703,27 +675,12 @@ impl<'c, 'a> Analyzer<'c, 'a> {
                 let mut out = SqlType::Null;
                 for (w, t) in whens {
                     let wt = self.expr(w, levels, clause)?;
-                    match base {
-                        None if !wt.boolean() => {
-                            return type_err(format!(
-                                "CASE WHEN needs a boolean condition, but `{}` is {}",
-                                printer::expr(w),
-                                wt.name()
-                            ))
-                        }
-                        Some(b) => {
-                            if let (Some(x), Some(y)) = (b.class(), wt.class()) {
-                                if x != y {
-                                    return type_err(format!(
-                                        "CASE compares {} with {} in `{}`",
-                                        b.name(),
-                                        wt.name(),
-                                        show()
-                                    ));
-                                }
-                            }
-                        }
-                        _ => {}
+                    if base.is_none() && !wt.boolean() {
+                        return type_err(format!(
+                            "CASE WHEN needs a boolean condition, but `{}` is {}",
+                            printer::expr(w),
+                            wt.name()
+                        ));
                     }
                     out = out.unify(self.expr(t, levels, clause)?);
                 }

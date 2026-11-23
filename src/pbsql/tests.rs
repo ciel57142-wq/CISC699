@@ -251,20 +251,32 @@ fn document_commands_parse_into_typed_operations() {
     };
     assert_eq!(d.collection, "Events", "collection names keep their case");
     match d.op {
-        DocOp::Find { filter, sort, skip, limit, one } => {
+        DocOp::Find { filter, spec, one, end } => {
             assert_eq!(filter.get("type"), Some(&Value::Text("login".into())));
             assert!(filter.get("n").and_then(|n| n.get("$gt")).is_some());
-            assert_eq!(sort.unwrap().get("ts"), Some(&Value::Int(-1)));
-            assert_eq!((skip, limit, one), (5, Some(10), false));
+            assert_eq!(spec.sort.unwrap().get("ts"), Some(&Value::Int(-1)));
+            assert_eq!((spec.skip, spec.limit, one, end), (5, Some(10), false, None));
         }
         other => panic!("{other:?}"),
     }
-    assert!(matches!(parse("db.c.findOne()").unwrap(), Statement::Doc(DocStmt { op: DocOp::Find { limit: Some(1), one: true, .. }, .. })));
-    assert!(matches!(parse("db.c.insertMany([{a: 1}, {a: 2}])").unwrap(), Statement::Doc(DocStmt { op: DocOp::Insert(Value::Array(a)), .. }) if a.len() == 2));
-    assert!(matches!(parse("db.c.updateOne({a: 1}, {$set: {b: 2}})").unwrap(), Statement::Doc(DocStmt { op: DocOp::Update { multi: false, .. }, .. })));
-    assert!(matches!(parse("db.c.deleteOne({})").unwrap(), Statement::Doc(DocStmt { op: DocOp::Delete { one: true, .. }, .. })));
-    assert!(matches!(parse("db.c.createIndex({email: 1})").unwrap(), Statement::Doc(DocStmt { op: DocOp::CreateIndex(f), .. }) if f == "email"));
-    assert!(matches!(parse("db.c.drop();").unwrap(), Statement::Doc(DocStmt { op: DocOp::Drop, .. })));
+    let op = |s: &str| match parse(s).unwrap_or_else(|e| panic!("{s}: {e}")) {
+        Statement::Doc(d) => d.op,
+        other => panic!("{other:?}"),
+    };
+    assert!(matches!(op("db.c.findOne()"), DocOp::Find { spec: FindSpec { limit: Some(1), .. }, one: true, .. }));
+    assert!(matches!(op("db.c.find({}, {a: 1}).count()"), DocOp::Find { spec: FindSpec { projection: Some(_), .. }, end: Some(FindEnd::Count), .. }));
+    assert!(matches!(op("db.c.find({a: 1}).explain()"), DocOp::Find { end: Some(FindEnd::Explain), .. }));
+    assert!(matches!(op("db.c.insertMany([{a: 1}, {a: 2}])"), DocOp::Insert(Value::Array(a)) if a.len() == 2));
+    assert!(matches!(op("db.c.updateOne({a: 1}, {$set: {b: 2}})"), DocOp::Update { method: UpdateMethod::UpdateOne, options: None, .. }));
+    assert!(matches!(op("db.c.update({}, {$set: {b: 2}}, {multi: false, upsert: true})"), DocOp::Update { method: UpdateMethod::Update, options: Some(_), .. }));
+    assert!(matches!(op("db.c.replaceOne({_id: 1}, {b: 2})"), DocOp::Update { method: UpdateMethod::ReplaceOne, .. }));
+    assert!(matches!(op("db.c.deleteOne({})"), DocOp::Delete { one: true, .. }));
+    assert!(matches!(op("db.c.createIndex({email: 1}, {unique: true})"), DocOp::CreateIndex { options: Some(_), .. }));
+    assert!(matches!(op("db.c.distinct('city', {age: {$gt: 1}})"), DocOp::Distinct { field, .. } if field == "city"));
+    assert!(matches!(op("db.c.aggregate([{$match: {}}, {$count: 'n'}])"), DocOp::Aggregate(st) if st.len() == 2));
+    assert!(matches!(op("db.c.bulkWrite([])"), DocOp::BulkWrite(_)));
+    assert!(matches!(op("db.c.getIndexes()"), DocOp::GetIndexes));
+    assert!(matches!(op("db.c.drop();"), DocOp::Drop));
 }
 
 #[test]
@@ -367,6 +379,9 @@ fn normalization_produces_one_canonical_spelling() {
         ("drop table if exists t cascade", "DROP TABLE IF EXISTS t CASCADE"),
         ("db.c.find({b: 2, a: 1}).limit(3)", "db.c.find({\"a\":1,\"b\":2}).limit(3)"),
         ("db.c.remove({})", "db.c.deleteMany({})"),
+        ("db.c.find({}, {a: 1}).sort({b: -1}).count()", "db.c.find({}).project({\"a\":1}).sort({\"b\":-1}).count()"),
+        ("db.c.update({a: 1}, {$inc: {n: 1}}, {upsert: true})", "db.c.update({\"a\":1}, {\"$inc\":{\"n\":1}}, {\"upsert\":true})"),
+        ("db.c.createIndex({b: 1, a: -1})", "db.c.createIndex({\"a\":-1,\"b\":1})"),
         ("db.c.findOne({a: 1})", "db.c.findOne({\"a\":1})"),
         ("set k  hello world ", "SET k hello world"),
         ("set k 'two\nlines'", "SET k 'two\\nlines'"),
@@ -424,9 +439,6 @@ fn semantic_errors_are_reported_before_execution() {
         ("SELECT 1 AND TRUE", |e| matches!(e, Error::Type(_)), "AND needs boolean operands"),
         ("SELECT NOT 1", |e| matches!(e, Error::Type(_)), "NOT needs a boolean"),
         ("SELECT 1 LIKE 'a'", |e| matches!(e, Error::Type(_)), "LIKE needs text"),
-        ("SELECT 1 = 'a'", |e| matches!(e, Error::Type(_)), "cannot compare INT with TEXT"),
-        ("SELECT TRUE < 2", |e| matches!(e, Error::Type(_)), "cannot compare BOOL with INT"),
-        ("SELECT 1 IN (1, 'a')", |e| matches!(e, Error::Type(_)), "IN list mixes INT with TEXT"),
         ("SELECT CASE WHEN 1 THEN 2 END", |e| matches!(e, Error::Type(_)), "CASE WHEN needs a boolean"),
         ("SELECT LOWER(1)", |e| matches!(e, Error::Type(_)), "lower() cannot take INT"),
         ("SELECT SUM('x')", |e| matches!(e, Error::Type(_)), "SUM needs numbers"),
@@ -450,11 +462,13 @@ fn semantic_errors_are_reported_before_execution() {
         ("CREATE TABLE t (a INT CHECK (a + 1))", |e| matches!(e, Error::Type(_)), "a CHECK constraint must be a boolean"),
         ("CREATE INDEX i ON t (a, a)", |e| matches!(e, Error::Schema(_)), "appears twice"),
         ("INSERT INTO t (a, b) VALUES (1)", |e| matches!(e, Error::Parse(_)), "expected 2 value(s) per row, got 1"),
-        ("db.c.find(5)", |e| matches!(e, Error::Type(_)), "a filter must be a JSON object, got 5"),
-        ("db.c.find({}).sort({a: 2})", |e| matches!(e, Error::Type(_)), "sort direction for 'a' must be 1 or -1"),
+        ("db.c.find(5)", |e| matches!(e, Error::Type(_)), "a filter must be a JSON object"),
+        ("db.c.find({}).sort('a')", |e| matches!(e, Error::Type(_) | Error::Parse(_)), "sort"),
+        ("db.c.find({a: {$bogus: 1}})", |e| matches!(e, Error::Parse(_) | Error::Type(_)), "$bogus"),
+        ("db.c.updateOne({}, {b: 2})", |e| matches!(e, Error::Parse(_)), "use replaceOne"),
+        ("db.c.replaceOne({}, {$set: {b: 2}})", |e| matches!(e, Error::Parse(_)), "replaceOne takes a document without operators"),
         ("db.c.insert([{a: 1}, 2])", |e| matches!(e, Error::Type(_)), "insert() needs documents"),
-        ("db.c.update({}, 3)", |e| matches!(e, Error::Type(_)), "an update must be a JSON object"),
-        ("db.c.createIndex({$x: 1})", |e| matches!(e, Error::Schema(_)), "cannot index field '$x'"),
+        ("db.c.createIndex(5)", |e| matches!(e, Error::Parse(_) | Error::Type(_)), ""),
         ("SET '' v", |e| matches!(e, Error::Parse(_)), "a key cannot be empty"),
     ];
     for (src, kind, fragment) in cases {
@@ -476,6 +490,7 @@ fn valid_complex_statements_pass_semantic_analysis() {
         "INSERT INTO t SELECT o._id, o.name FROM DOCUMENT(people) o",
         "UPDATE t SET n = n + 1 WHERE id IN (SELECT CAST(k.value AS INT) FROM KV('ids:') k)",
         "SELECT NULL = 1, NULL + 1, 1 IN (NULL), CASE 1 WHEN 1 THEN 'a' END",
+        "SELECT 1 = 'a', TRUE < 2, 1 IN (1, 'a')", // cross-type comparisons follow the total order
         "db.c.find({a: {$in: [1, 2]}}).sort({a: -1, b: 1})",
         "EXPLAIN ANALYZE db.c.count({x: 1})",
     ] {
@@ -511,6 +526,9 @@ fn syntax_errors_say_what_and_where() {
         ("db.c.find({a: 1}", "expected ',' or ')', found end of statement", ""),
         ("db.c.find({a: })", "JSON: unexpected character", "(at line 1, column 15)"),
         ("db.c.find({}).sort({a: 1}).explode()", "unknown modifier .explode()", "(at line 1, column 28)"),
+        ("db.c.find({}).count().limit(1)", "cannot follow .count() or .explain()", "(at line 1, column 23)"),
+        ("db.c.distinct(5)", "distinct() takes a field name string", ""),
+        ("db.c.aggregate({})", "aggregate() takes an array of stages", ""),
         ("db.c.insert({a: 1}).limit(1)", "insert() cannot be chained", "(at line 1, column 21)"),
         ("db.c.frobnicate({})", "unknown collection method 'frobnicate'", "(at line 1, column 6)"),
         ("db.c.find({}, {}, {})", "find() takes at most 2 argument(s), got 3", ""),
