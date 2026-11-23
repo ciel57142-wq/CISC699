@@ -183,7 +183,7 @@ impl IndexDef {
                 continue;
             }
             let full = [prefix.as_slice(), p].concat();
-            if ctx.scan(&full).iter().any(|(k, _)| &k[full.len()..] != id) {
+            if ctx.iter_prefix(&full).any(|(k, _)| &k[full.len()..] != id) {
                 return Err(Error::Constraint(format!(
                     "duplicate key for unique index {} on collection '{coll}'",
                     self.name()

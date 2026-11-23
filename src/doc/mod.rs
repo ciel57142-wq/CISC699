@@ -220,6 +220,40 @@ fn write_doc(ctx: &mut Ctx, coll: &str, meta: &mut Meta, key: Vec<u8>, doc: &Val
     Ok(())
 }
 
+/// Replace a stored document: validate the new version, then delete only the
+/// index entries the old version had and the new one lacks, and add only the
+/// new ones (unchanged entries already belong to this document, so the
+/// unique check only needs the added keys).
+fn rewrite_doc(ctx: &mut Ctx, coll: &str, meta: &mut Meta, key: Vec<u8>, old: &Value, new: &Value) -> Result<()> {
+    path::validate_doc(new)?;
+    if let Some(s) = &meta.schema {
+        s.check(new)?;
+    }
+    let id = key[keys::doc_prefix(coll).len()..].to_vec();
+    let mut meta_changed = false;
+    for ix in &mut meta.indexes {
+        // A stored document always produced valid entries when written.
+        let before: BTreeSet<Vec<u8>> = ix.key_parts(old).unwrap_or_default().into_iter().collect();
+        let (parts, multi) = ix.analyze(new)?;
+        let after: BTreeSet<Vec<u8>> = parts.into_iter().collect();
+        let added: Vec<Vec<u8>> = after.difference(&before).cloned().collect();
+        ix.check_unique(ctx, coll, &added, &id)?;
+        meta_changed |= ix.note_multikey(&multi);
+        let prefix = ix.prefix(coll);
+        for p in before.difference(&after) {
+            ctx.delete([prefix.as_slice(), p, &id].concat());
+        }
+        for p in added {
+            ctx.put([prefix.as_slice(), &p, &id].concat(), Vec::new());
+        }
+    }
+    if meta_changed {
+        save_meta(ctx, coll, meta);
+    }
+    ctx.put(key, codec::encode(new));
+    Ok(())
+}
+
 fn remove_doc(ctx: &mut Ctx, coll: &str, meta: &Meta, key: Vec<u8>, doc: &Value) {
     let id = key[keys::doc_prefix(coll).len()..].to_vec();
     for ix in &meta.indexes {
@@ -597,8 +631,7 @@ pub fn update(ctx: &mut Ctx, coll: &str, filter: &Value, upd: &Value, multi: boo
             return Err(Error::Constraint("_id cannot be changed".into()));
         }
         if new != old {
-            remove_doc(ctx, coll, &meta, key.clone(), &old);
-            write_doc(ctx, coll, &mut meta, key, &new)?;
+            rewrite_doc(ctx, coll, &mut meta, key, &old, &new)?;
             res.modified += 1;
         }
         if !multi {
